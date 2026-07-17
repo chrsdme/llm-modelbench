@@ -1,0 +1,19 @@
+{
+  "model": "deepseek-coder-v2:16b",
+  "kv_type": "current",
+  "score": 100.0,
+  "coverage": 1.0,
+  "max_verified_ctx": 64773,
+  "probes": [
+    {"size": 4000, "num_ctx": 4320, "vram_peak_mb": 10176.0, "offload_fraction": 0.0},
+    {"size": 16000, "num_ctx": 16172, "vram_peak_mb": 13754.0, "offload_fraction": 0.0},
+    {"size": 32000, "num_ctx": 31971, "vram_peak_mb": 15278.0, "offload_fraction": 0.364},
+    {"size": 65536, "num_ctx": 65093, "vram_peak_mb": 15526.0, "offload_fraction": 0.523}
+  ],
+  "expected": {
+    "gpu_slope_valid_4k_to_16k": true,
+    "gpu_slope_valid_16k_to_32k": false,
+    "gpu_slope_valid_32k_to_65k": false,
+    "successful_65k_overrides_projection": true
+  }
+}

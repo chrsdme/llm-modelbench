@@ -1,0 +1,33 @@
+# LLM ModelBench config (YAML). Copy to config.yaml and pass with --config config.yaml.
+# Every field is optional; unset fields use built-in defaults. Needs the [yaml] extra.
+
+ollama_url: "http://127.0.0.1:11434"
+seed: 42                 # fixed for reproducibility
+temperature: 0.0         # deterministic scoring
+vram_budget_gb: 0        # 0 = auto-detect from your GPU (total minus headroom)
+judge_model: "qwen2.5:14b"
+embed_model: "nomic-embed-text"
+samples: 1               # runs per test, median taken; raise to 3 for finalists
+max_reflections: 2       # agentic retry attempts on coding tasks
+temp_pause_c: 85.0       # pause if the GPU reaches this temperature (NVIDIA only)
+temp_resume_c: 75.0
+request_timeout: 300
+
+# Partial weight maps are merged over the defaults. Unknown categories and invalid
+# values are rejected so configuration drift cannot silently change score semantics.
+weights:
+  coding_python: 0.18
+  coding_web: 0.05
+  coding_js: 0.05
+  ocr: 0.12
+  pdf: 0.05
+  long_context: 0.10
+  tech_writing: 0.12
+  knowledge_base: 0.08
+  text_ops: 0.08
+  git: 0.07
+  file_ops: 0.07
+  agentic: 0.04
+  agentic_tool: 0.08
+  retrieval: 0.05
+  reasoning: 0.05

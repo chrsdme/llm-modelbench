@@ -1,0 +1,5 @@
+# Core needs nothing beyond the Python standard library.
+# Optional extras (install what you want):
+pillow>=10.0    # OCR/PDF image rendering (vision tasks)
+pypdf>=4.0      # real PDF text-extraction task
+pyyaml>=6.0     # YAML config files (JSON works without this)
