@@ -10,60 +10,110 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.9", "3.11", "3.13"]
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Show runtime versions
+        run: |
+          python --version
+          node --version
+          npm --version
+
       - name: Install
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[all]" build ruff bandit
+
       - name: Release hygiene
         run: python tools/release_check.py
+
       - name: Static and security checks
         run: |
-          ruff check --select F401,F601,F811,F821,F822,F823,F841,E741,E731 llm_modelbench tests tools
+          ruff check \
+            --select F401,F601,F811,F821,F822,F823,F841,E741,E731 \
+            llm_modelbench tests tools
           bandit -q -r llm_modelbench tools -x tests -ll
+
       - name: Compile and test
         run: |
           python -m compileall -q llm_modelbench tests tools
           python -m pytest -q
           python -m llm_modelbench selftest
+
       - name: Build distributions
         run: python -m build
+
       - name: Installed-wheel smoke test
         shell: bash
         run: |
           python -m venv /tmp/llmb-wheel-test
           /tmp/llmb-wheel-test/bin/python -m pip install --upgrade pip
           /tmp/llmb-wheel-test/bin/python -m pip install --no-deps dist/*.whl
+
           /tmp/llmb-wheel-test/bin/llm-modelbench --version
           /tmp/llmb-wheel-test/bin/llm-modelbench selftest
+
           /tmp/llmb-wheel-test/bin/python - <<'PY'
           from llm_modelbench import media
           from llm_modelbench.tasks import TASKS
-          resources = [task.meta["image_path"] for task in TASKS if task.meta.get("image_path")]
+
+          resources = [
+              task.meta["image_path"]
+              for task in TASKS
+              if task.meta.get("image_path")
+          ]
+
           assert resources
+
           for resource in resources:
               assert media.load_image_file(resource)["data"]
+
           print(f"packaged resources: {len(resources)}")
           PY
-          /tmp/llmb-wheel-test/bin/llm-modelbench run --mock \
-            --models 'qwen2.5-vl:7b' --level short --no-auto-probe \
+
+          /tmp/llmb-wheel-test/bin/llm-modelbench run \
+            --mock \
+            --models 'qwen2.5-vl:7b' \
+            --level short \
+            --no-auto-probe \
             --tasks ocr_receipt_total,ocr_table_cell,ocr_form_code,ocr_noisy_label \
-            --run-id wheel-resource-smoke --out /tmp/llmb-wheel-runs --yes \
-            --live-ui off --no-ranking-update
+            --run-id wheel-resource-smoke \
+            --out /tmp/llmb-wheel-runs \
+            --yes \
+            --live-ui off \
+            --no-ranking-update
+
           /tmp/llmb-wheel-test/bin/python - <<'PY'
           import json
           from pathlib import Path
-          data = json.loads(Path('/tmp/llmb-wheel-runs/wheel-resource-smoke/run_validity.json').read_text())
-          assert data['status'] == 'valid'
-          assert data['harness_error_rows'] == 0
-          print('installed wheel OCR resource run: valid')
+
+          validity_path = Path(
+              "/tmp/llmb-wheel-runs/"
+              "wheel-resource-smoke/"
+              "run_validity.json"
+          )
+          data = json.loads(validity_path.read_text())
+
+          assert data["status"] == "valid"
+          assert data["harness_error_rows"] == 0
+
+          print("installed wheel OCR resource run: valid")
           PY

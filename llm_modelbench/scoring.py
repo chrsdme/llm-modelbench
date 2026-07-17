@@ -606,6 +606,10 @@ try {
         return None, "HARNESS_ERROR: node unavailable"
     if cp.returncode == 124:
         return None, "HARNESS_ERROR: debounce check timed out"
+    if cp.returncode != 0:
+        stderr_lines = (cp.stderr or "").strip().splitlines()
+        detail = " | ".join(stderr_lines[-3:]) if stderr_lines else "no stderr"
+        return None, f"HARNESS_ERROR: node exited {cp.returncode}: {detail[:300]}"
     out = (cp.stdout or "").strip().splitlines()[-1:]
     if not out:
         return 0.0, "no debounce check output"

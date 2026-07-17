@@ -45,7 +45,8 @@ def test_js_debounce_executes_not_token_greps():
     score, reason = scoring.score_js_debounce(comment, {})
     assert score == 0.0, reason
     good = "function debounce(fn,delay){let t;return (...args)=>{clearTimeout(t);t=setTimeout(()=>fn(...args),delay)}}"
-    assert scoring.score_js_debounce(good, {})[0] == 100.0
+    good_score, good_reason = scoring.score_js_debounce(good, {})
+    assert good_score == 100.0, good_reason
 
 
 def test_needle_partial_coverage_has_no_row_score():

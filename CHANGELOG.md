@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.0rc17
+
+### CI and Node harness portability
+
+- Pin GitHub Actions to Node 24-compatible action releases and explicitly
+  install Node.js 24 in the CI matrix.
+- Allow current Node/V8 builds sufficient virtual address space while
+  retaining the 128 MiB JavaScript heap limit and existing execution guards.
+- Report abnormal Node exits as harness errors instead of incorrect model
+  scores.
+- Include the debounce scorer reason in regression-test failures.
+
 ## 1.0.0rc16
 
 - Allow harmless trailing sentence punctuation (`.`, `!`, `?`, and Unicode ellipsis)

@@ -49,7 +49,12 @@ def _scrubbed_env(work_dir: str) -> dict[str, str]:
     return env
 
 
-def _linux_limits(timeout: int, *, limit_processes: bool = True):
+def _linux_limits(
+    timeout: int,
+    *,
+    limit_processes: bool = True,
+    address_space_mb: int | None = 768,
+):
     """Create a Linux pre-exec limiter. Cross-platform support is intentionally out of scope."""
     def apply_limits() -> None:
         try:
@@ -57,7 +62,12 @@ def _linux_limits(timeout: int, *, limit_processes: bool = True):
 
             cpu_seconds = max(1, int(timeout) + 1)
             resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
-            resource.setrlimit(resource.RLIMIT_AS, (768 * 1024 * 1024, 768 * 1024 * 1024))
+            if address_space_mb is not None:
+                address_space_bytes = max(256, int(address_space_mb)) * 1024 * 1024
+                resource.setrlimit(
+                    resource.RLIMIT_AS,
+                    (address_space_bytes, address_space_bytes),
+                )
             resource.setrlimit(resource.RLIMIT_FSIZE, (16 * 1024 * 1024, 16 * 1024 * 1024))
             resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
             if limit_processes and hasattr(resource, "RLIMIT_NPROC"):
@@ -72,6 +82,7 @@ def _linux_limits(timeout: int, *, limit_processes: bool = True):
 def _run_guarded_process(
     args: List[str], *, cwd: str, timeout: int, env: dict[str, str] | None = None,
     limit_processes: bool = True,
+    address_space_mb: int | None = 768,
 ) -> subprocess.CompletedProcess[str]:
     process = subprocess.Popen(
         args,
@@ -81,7 +92,15 @@ def _run_guarded_process(
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=True,
-        preexec_fn=_linux_limits(timeout, limit_processes=limit_processes) if os.name == "posix" else None,
+        preexec_fn=(
+            _linux_limits(
+                timeout,
+                limit_processes=limit_processes,
+                address_space_mb=address_space_mb,
+            )
+            if os.name == "posix"
+            else None
+        ),
     )
     try:
         stdout, stderr = process.communicate(timeout=timeout)
@@ -119,6 +138,10 @@ def run_node_harness(
             timeout=timeout,
             env=env,
             limit_processes=False,
+            # V8 reserves substantially more virtual address space than its
+            # configured JavaScript heap. Keep the JS heap at 128 MiB while
+            # allowing enough address space for current Node builds to start.
+            address_space_mb=2048,
         )
 
 
