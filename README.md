@@ -14,7 +14,7 @@ tool of that name.
 
 ## Versioning
 
-This is a release candidate: `1.0.0rc16`. Public semantic versioning starts at
+This is a release candidate: `1.0.0rc18`. Public semantic versioning starts at
 `1.0.0`: after the release candidate, `1.0.1` denotes a patch release, `1.1.0`
 and `1.2.0` denote minor releases, and `2.0.0` denotes a major release.
 

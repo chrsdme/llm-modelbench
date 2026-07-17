@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.0rc18
+
+### Release identity synchronization
+
+- Synchronize the README, runtime package version, and changelog at RC18.
+- Carry forward the RC17 Node.js CI and debounce harness portability fixes.
+- Restore release-hygiene validation after RC17 was published with a stale
+  README version reference.
+
 ## 1.0.0rc17
 
 ### CI and Node harness portability
