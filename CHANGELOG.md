@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.0rc19.post2
+
+### RC19.2
+
+- Add bounded recovery/capability policy primitives, deterministic judge
+  selection, readiness summaries, and unattended-safe campaign packaging.
+
 ## 1.0.0rc19.post1
 
 ### RC19.1
