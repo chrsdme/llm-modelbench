@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.0rc19.post3
+
+### RC19.3
+
+- Add campaign-only transactional canonical-adoption preview/application with
+  readiness/package validation, typed terminal confirmation, and provenance.
+
 ## 1.0.0rc19.post2
 
 ### RC19.2
