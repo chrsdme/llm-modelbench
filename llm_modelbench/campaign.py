@@ -773,9 +773,26 @@ def execute_recovery_phase(paths: CampaignPaths, client: Any, cfg: Any, *, budge
     result = apply_plan_fn(client, cfg, plan, rankings_dir=paths.candidate_rankings_dir, ranking_scope="separate")
     records = []
     for index, action in enumerate(result.get("actions", []), 1):
-        records.append({"campaign_id": paths.campaign_id, "parent_run_id": "primary", "attempt_number": index,
-                        "action": action, "policy_version": RECOVERY_POLICY_VERSION,
-                        "stop_reason": action.get("reason") or action.get("status")})
+        child_id = str(action.get("child_run_id") or f"recovery-{index:04d}")
+        child_dir = paths.recovery_children_dir / child_id
+        child_dir.mkdir(parents=True, exist_ok=True)
+        record = {"campaign_id": paths.campaign_id, "parent_row_hash": action.get("parent_row_hash"),
+                  "parent_run_id": "primary", "child_run_id": child_id,
+                  "model": action.get("model"), "model_digest": action.get("model_digest"),
+                  "task": action.get("task"), "task_hash": action.get("task_hash"),
+                  "attempt_number": int(action.get("attempt_number") or index),
+                  "output_budget": action.get("output_budget"), "context": action.get("context"),
+                  "think_mode": action.get("think_mode", "off"), "configuration": action.get("configuration") or {},
+                  "started_at": action.get("started_at"), "ended_at": action.get("ended_at"),
+                  "wall_time_seconds": action.get("wall_time_seconds", 0),
+                  "raw_response_reference": f"children/{child_id}/attempt.json",
+                  "output_classification": action.get("output_classification") or action.get("status"),
+                  "visible_answer": bool(action.get("visible_answer")), "score": action.get("score"),
+                  "reason": action.get("reason"), "error_classification": action.get("error_classification"),
+                  "stop_reason": action.get("stop_reason") or action.get("reason") or action.get("status"),
+                  "policy_version": RECOVERY_POLICY_VERSION}
+        _atomic_write_text(child_dir / "attempt.json", json.dumps(record, indent=2, sort_keys=True))
+        records.append(record)
     _atomic_write_text(paths.recovery_attempts, "".join(json.dumps(item, sort_keys=True) + "\n" for item in records))
     _atomic_write_text(paths.recovery_result, json.dumps(result, indent=2, sort_keys=True))
     if paths.primary_raw_results.read_bytes() != primary_before:
