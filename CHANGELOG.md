@@ -1,6 +1,8 @@
 # Changelog
 
-## RC19.1 — 1.0.0rc19.post1
+## 1.0.0rc19.post1
+
+### RC19.1
 
 - Add isolated campaign workspaces, manifest schema validation, conservative
   operation locks, nested evidence resolution, candidate rankings, and review
