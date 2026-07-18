@@ -606,12 +606,12 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def package_campaign(paths: CampaignPaths) -> Path:
+def package_campaign(paths: CampaignPaths, *, allow_active_lock: bool = False) -> Path:
     """Create one self-contained review zip and a verifiable source inventory."""
     manifest = load_manifest(paths)
     if manifest.state not in (*TERMINAL_STATES, "packaged"):
         raise CampaignError("only packaged or terminal campaigns may be packaged")
-    if read_lock(paths) is not None:
+    if read_lock(paths) is not None and not allow_active_lock:
         raise CampaignError("refusing to package an actively locked campaign")
     package = paths.packages_dir / f"{paths.campaign_id}-review.zip"
     inventory: Dict[str, str] = {}

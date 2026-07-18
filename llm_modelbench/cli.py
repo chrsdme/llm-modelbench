@@ -537,6 +537,12 @@ def cmd_campaign(args, cfg):
             cmd_run(args, cfg)
             campaign.sync_primary_reports(paths)
             campaign.transition(paths, campaign.load_manifest(paths), "packaged")
+            rows = [json.loads(line) for line in paths.primary_raw_results.read_text(encoding="utf-8").splitlines() if line.strip()]
+            for row in rows:
+                row["disposition"] = campaign.classify_recovery_row(row)["disposition"]
+            campaign.write_readiness(paths, rows, judge_available=True)
+            if getattr(args, "unattended_safe", False):
+                campaign.package_campaign(paths, allow_active_lock=True)
         except KeyboardInterrupt:
             campaign.transition(paths, campaign.load_manifest(paths), "interrupted")
             raise
@@ -1187,6 +1193,7 @@ def build_parser():
     camp_run.add_argument("--status-interval", type=float, default=5.0)
     camp_run.add_argument("--live-ui", choices=["off", "compact", "full", "graph", "log"], default="compact")
     camp_run.add_argument("--strict-harness", action="store_true")
+    camp_run.add_argument("--unattended-safe", action="store_true", help="write terminal readiness and review package without host mutation")
 
     r = sub.add_parser("run", help="run the benchmark")
     # Actual scored runs probe capability lanes by default. Planning remains
