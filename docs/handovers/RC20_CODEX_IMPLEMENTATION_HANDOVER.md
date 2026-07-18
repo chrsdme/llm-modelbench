@@ -38,12 +38,12 @@ The RC19.1 tag intentionally remains on its original release-metadata commit;
 the subsequent changelog-heading correction is a separate commit and the tag
 was not rewritten.
 
-Focused campaign tests and the full suite passed before RC20 documentation
-release. A real isolated acceptance campaign is at
-`campaigns/rc20_real_minimal_full`; it used `qwen2.5-coder:3b`, one sample and
-three selected tasks, with no model pull/delete, service/KV/sudo operation, or
-canonical ranking mutation. Its package and readiness summary exist under that
-campaign root; adoption was dry-run only.
+Remediation acceptance campaign: `campaigns/rc20_real_acceptance_v3_20260718_112539`.
+It used `qwen2.5-coder:3b`, one sample, `json_extract`, `kb_taxonomy`, and
+`txt_emails`; primary generation used judge-off and the post-hoc judge evidence
+is persisted under `evidence/judge/`. The package internally verifies and the
+campaign is `ready_for_adoption`; adoption was dry-run only. No model
+pull/delete, service/KV/sudo operation, or canonical ranking mutation occurred.
 
 ## Review and rollback
 
