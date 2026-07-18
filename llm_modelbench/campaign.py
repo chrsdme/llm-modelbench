@@ -881,18 +881,22 @@ def adopt_campaign(paths: CampaignPaths, *, rankings_dir: Path, dry_run: bool = 
         row["ranking_scope"] = "canonical"
         row["canonical_rankings"] = True
         row["campaign_id"] = manifest.campaign_id
-    index = {(str(row.get("run_id")), str(row.get("_source_signature"))): row for row in current}
-    added = replaced = 0
+    index = {(str(row.get("run_id")), str(row.get("model")), str(row.get("task"))): row for row in current}
+    added = replaced = unchanged = 0
+    changes: List[Dict[str, Any]] = []
     for row in incoming:
-        key = (str(row.get("run_id")), str(row.get("_source_signature")))
+        key = (str(row.get("run_id")), str(row.get("model")), str(row.get("task")))
         previous = index.get(key)
-        if previous == row:
+        if previous is not None and previous.get("_source_signature") == row.get("_source_signature"):
+            unchanged += 1
             continue
+        changes.append({"key": {"run_id": key[0], "incoming_signature": row.get("_source_signature"), "existing_signature": previous.get("_source_signature") if previous else None, "model": row.get("model"), "model_digest": row.get("model_digest_resolved"), "task": row.get("task"), "task_hash": row.get("task_hash")}, "operation": "replace" if previous is not None else "add", "old": {"score": previous.get("score"), "reason": previous.get("reason"), "disposition": previous.get("terminal_disposition")} if previous else None, "new": {"score": row.get("score"), "reason": row.get("reason"), "disposition": row.get("terminal_disposition")}, "scope_conversion": "separate_to_canonical"})
         if previous is not None:
             current.remove(previous); replaced += 1
         current.append(row); index[key] = row; added += 1
-    preview = {"campaign_id": manifest.campaign_id, "rows_incoming": len(incoming), "rows_added_or_updated": added,
-               "rows_replaced": replaced, "dry_run": bool(dry_run)}
+    preview = {"campaign_id": manifest.campaign_id, "readiness": readiness.get("readiness"), "package_verified": True,
+               "rows_incoming": len(incoming), "rows_added_or_updated": added, "rows_replaced": replaced,
+               "rows_unchanged": unchanged, "changes": changes, "blockers": [], "dry_run": bool(dry_run)}
     if dry_run:
         return preview
     parent = rankings_dir.parent
