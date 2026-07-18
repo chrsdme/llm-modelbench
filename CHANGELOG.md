@@ -1,5 +1,12 @@
 # Changelog
 
+## RC19.1 — 1.0.0rc19.post1
+
+- Add isolated campaign workspaces, manifest schema validation, conservative
+  operation locks, nested evidence resolution, candidate rankings, and review
+  package/checksum retention utilities.
+- Preserve legacy runs and provide copy-only campaign migration.
+
 ## 1.0.0rc18
 
 ### Release identity synchronization
