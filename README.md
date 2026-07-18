@@ -14,7 +14,7 @@ tool of that name.
 
 ## Versioning
 
-This is a release candidate: `1.0.0rc20`. Public semantic versioning starts at
+This is a release candidate: `1.0.0rc20.post1`. Public semantic versioning starts at
 `1.0.0`: after the release candidate, `1.0.1` denotes a patch release, `1.1.0`
 and `1.2.0` denote minor releases, and `2.0.0` denotes a major release.
 
@@ -98,13 +98,22 @@ package. The normal operator sequence is:
 ./llmb campaign clean example
 ```
 
+`campaign plan` is immutable once generation starts. It may create a new
+campaign, complete a campaign still in `created`, or return an explicit no-op
+for an identical already-planned campaign. It refuses packaged and later
+lifecycle states before writing any file. Use a new campaign ID when models,
+tasks, samples, context, thinking, or output limits must change. If a package
+has already gone stale, package verification and adoption remain fail-closed.
+
 Recovery fairness is conservative: visible answers are never retried, score
 zero stops recovery, recovery is not score fishing, primary evidence remains
 immutable, recovery attempts use bounded progressive budgets with circuit
 breakers, and child provenance is retained. Post-hoc judging is separate from
 generation; the selected judge must be outside the tested cohort by name/digest
-and machine-judged rows remain provisional. If no qualified judge is available,
-readiness records the external-judge blocker instead of silently accepting.
+and machine-judged rows remain provisional. Judge cohort identities are
+deduplicated by model name and digest before selection. If no qualified judge is
+available, readiness records the external-judge blocker instead of silently
+accepting.
 
 Readiness requires explicit terminal dispositions, complete effective rows, no
 harness/manual/external-judge blockers, and successful package verification.

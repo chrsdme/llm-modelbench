@@ -34,6 +34,8 @@ when models, tasks, samples, context, thinking, or output limits must change.
 Interrupted campaigns must be resumed with `campaign resume`, not replanned.
 `campaign plan` does not accept `--no-fingerprint` because fingerprint probes
 are not executed by planning; fingerprint controls belong to `campaign run`.
+If any retained evidence is mutated after packaging, package verification fails
+closed and adoption remains blocked.
 
 ## Recovery fairness
 
@@ -52,6 +54,7 @@ which model/task cell was retried and why.
 Campaign generation runs with judge mode off. Subjective rows are judged
 post-hoc only, after recovery and terminal classification. Judge selection
 excludes tested cohort names, exact digests, and digest-equivalent aliases. The
+tested cohort is deduplicated by model name and digest before selection. The
 selection record persists architecture, calibration, and selection reason.
 `manifest.json` field `judge_model`, when present, refers to generation-time
 judging; post-hoc judge model and digest are recorded in

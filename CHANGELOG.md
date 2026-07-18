@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.0rc20.post1
+
+### RC20 post-release lifecycle hotfix
+
+- Refuse `campaign plan` before filesystem mutation once a campaign has entered
+  generation or any later lifecycle state, including packaged, accepted,
+  rejected, archived diagnostic, and interrupted campaigns.
+- Return an explicit deterministic no-op for identical replans against an
+  already-planned campaign; changed planned settings require a new campaign ID
+  because no audited pre-generation replacement policy exists.
+- Preserve package/adoption fail-closed behavior: stale campaign packages still
+  fail package verification and remain blocked from adoption.
+- Deduplicate post-hoc judge cohort identities by model name and digest before
+  judge selection.
+- Document the post-release reproduction and validated post-fix smoke campaign.
+
 ## 1.0.0rc20
 
 ### RC20 remediation and acceptance
