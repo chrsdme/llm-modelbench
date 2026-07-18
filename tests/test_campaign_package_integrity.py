@@ -65,6 +65,9 @@ def test_tamper_size_checksum_and_stale_source_are_rejected(tmp_path):
     assert not result["valid"] and any("mismatch" in error for error in result["errors"])
     paths=fixture(tmp_path/"stale"); paths.primary_raw_results.write_text("changed\n")
     assert not campaign.verify_package(paths)
+    readiness=json.loads((paths.reports_dir/"readiness.json").read_text())
+    assert readiness["readiness"] == "not_ready_manual_items"
+    assert "package_verification_failed" in readiness["blockers"]
 
 
 def test_unlisted_duplicate_and_unsafe_members_are_rejected(tmp_path):

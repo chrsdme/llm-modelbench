@@ -754,7 +754,19 @@ def verify_package_details(paths: CampaignPaths) -> Dict[str, Any]:
 
 
 def verify_package(paths: CampaignPaths) -> bool:
-    return bool(verify_package_details(paths)["valid"])
+    details = verify_package_details(paths)
+    if not details["valid"]:
+        for readiness_path in (paths.readiness_json, paths.reports_dir / "readiness.json"):
+            if readiness_path.exists():
+                try:
+                    readiness = json.loads(readiness_path.read_text(encoding="utf-8"))
+                    readiness["readiness"] = "not_ready_manual_items"
+                    readiness["package_verification"] = details
+                    readiness["blockers"] = sorted(set(readiness.get("blockers") or []) | {"package_verification_failed"})
+                    _atomic_write_text(readiness_path, json.dumps(readiness, indent=2, sort_keys=True))
+                except Exception:
+                    pass
+    return bool(details["valid"])
 
 
 def cleanup_campaign(paths: CampaignPaths, *, apply: bool = False) -> List[Path]:
