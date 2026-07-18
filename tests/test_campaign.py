@@ -420,6 +420,7 @@ def test_recovery_policy_never_retries_visible_zero_and_uses_progressive_budgets
     assert campaign.classify_recovery_row({"score": 0, "error_kind": None})["retry"] is False
     assert campaign.classify_recovery_row({"error_kind": "thinking_only"})["disposition"] == "thinking_only_pending_retry"
     assert [item["num_predict"] for item in campaign.recovery_profiles(2048, allow_extended=True)] == [2048, 4096, 8192]
+    assert campaign.classify_recovery_row({"score": None, "reason": "raw only, judge off: output"})["disposition"] == "awaiting_external_judge"
 
 
 def test_readiness_requires_terminal_dispositions(tmp_path):

@@ -577,6 +577,7 @@ def cmd_campaign(args, cfg):
                     if (paths.primary_dir / "judge_results.jsonl").exists():
                         __import__("shutil").copy2(paths.primary_dir / "judge_results.jsonl", paths.judge_results)
                     campaign._atomic_write_text(paths.judge_summary, json.dumps({**judged, "selection": selection}, indent=2, sort_keys=True))
+                    rows = judge_dumps.apply_judgements(paths.primary_dir, rows)
                 else:
                     campaign._atomic_write_text(paths.judge_summary, json.dumps({"status": "awaiting_external_judge", "selection": selection}, indent=2, sort_keys=True))
                 campaign.transition(paths, campaign.load_manifest(paths), "packaged")

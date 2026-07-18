@@ -749,6 +749,8 @@ def classify_recovery_row(row: Dict[str, Any]) -> Dict[str, Any]:
         return {"disposition": "harness_failure", "retry": False, "reason": kind}
     if kind:
         return {"disposition": "terminal_model_failure", "retry": False, "reason": kind}
+    if str(row.get("reason") or "").startswith("raw only, judge off"):
+        return {"disposition": "awaiting_external_judge", "retry": False, "reason": "subjective output awaiting post-hoc judge"}
     return {"disposition": "harness_failure", "retry": False, "reason": "unscorable row without error classification"}
 
 
