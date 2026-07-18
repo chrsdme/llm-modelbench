@@ -543,8 +543,45 @@ def cmd_campaign(args, cfg):
             args.no_ranking_update = False
             cmd_run(args, cfg)
             campaign.sync_primary_reports(paths)
-            campaign.transition(paths, campaign.load_manifest(paths), "packaged")
             rows = [json.loads(line) for line in paths.primary_raw_results.read_text(encoding="utf-8").splitlines() if line.strip()]
+            retry_rows = [row for row in rows if campaign.classify_recovery_row(row)["retry"]]
+            if retry_rows:
+                # Evidence-first bounded recovery decision. Existing primary rows remain immutable.
+                manifest_now = campaign.load_manifest(paths)
+                campaign.transition(paths, manifest_now, "recovering")
+                attempts = []
+                for row in retry_rows:
+                    attempts.append({"parent_row_hash": __import__("hashlib").sha256(json.dumps(row, sort_keys=True).encode()).hexdigest(), "attempt": 0, "outcome": "terminal_unexecuted", "policy_version": campaign.RECOVERY_POLICY_VERSION, "configuration": campaign.recovery_profiles(int(args.num_predict or 2048))})
+                campaign._atomic_write_text(paths.recovery_plan, json.dumps({"actions": attempts, "policy_version": campaign.RECOVERY_POLICY_VERSION}, indent=2, sort_keys=True))
+                campaign._atomic_write_text(paths.recovery_attempts, "".join(json.dumps(item, sort_keys=True) + "\n" for item in attempts))
+                campaign._atomic_write_text(paths.recovery_result, json.dumps({"actions": len(attempts), "status": "terminal_unexecuted"}, indent=2, sort_keys=True))
+                if campaign.load_manifest(paths).state != "packaged":
+                    campaign.transition(paths, campaign.load_manifest(paths), "packaged")
+            # Primary generation is always judge-off. Subjective judging is post-hoc.
+            from .tasks import TASKS
+            subjective = {task.id for task in TASKS if task.scorer == "subjective"}
+            eligible = [row for row in rows if row.get("task") in subjective and not row.get("error_kind")]
+            if eligible:
+                manifest_now = campaign.load_manifest(paths)
+                if manifest_now.state == "generating":
+                    campaign.transition(paths, manifest_now, "judging")
+                inventory = client.tags()
+                cohort = [{"name": row.get("model"), "digest": row.get("model_digest_resolved")} for row in rows]
+                candidates = [{"name": item.get("name"), "digest": item.get("digest"), "supported_families": ["text"], "priority": 0, "calibrated": False} for item in inventory]
+                judge = campaign.select_campaign_judge(candidates, cohort)
+                selection = {"eligible": len(eligible), "cohort": cohort, "machine_judged_provisional": True, "judge": judge}
+                campaign._atomic_write_text(paths.judge_dir / "judge_selection.json", json.dumps(selection, indent=2, sort_keys=True))
+                if judge:
+                    from . import judge_dumps
+                    judged = judge_dumps.judge_run(client, paths.primary_dir, judge_model=judge["name"], judge_mode="single")
+                    if (paths.primary_dir / "judge_results.jsonl").exists():
+                        __import__("shutil").copy2(paths.primary_dir / "judge_results.jsonl", paths.judge_results)
+                    campaign._atomic_write_text(paths.judge_summary, json.dumps({**judged, "selection": selection}, indent=2, sort_keys=True))
+                else:
+                    campaign._atomic_write_text(paths.judge_summary, json.dumps({"status": "awaiting_external_judge", "selection": selection}, indent=2, sort_keys=True))
+                campaign.transition(paths, campaign.load_manifest(paths), "packaged")
+            elif campaign.load_manifest(paths).state == "generating":
+                campaign.transition(paths, campaign.load_manifest(paths), "packaged")
             for row in rows:
                 row["disposition"] = campaign.classify_recovery_row(row)["disposition"]
             campaign.write_readiness(paths, rows, judge_available=True)
