@@ -484,6 +484,20 @@ def cmd_campaign(args, cfg):
         print(json.dumps({"campaign_id": manifest.campaign_id, "state": manifest.state,
                           "resume_state": manifest.resume_state, "root": str(paths.root)}, indent=2))
         return
+    if args.campaign_cmd == "package":
+        paths, _ = _campaign_paths_or_exit(args.campaign_id)
+        package = campaign.package_campaign(paths)
+        print(f"campaign package -> {package}")
+        return
+    if args.campaign_cmd == "clean":
+        paths, _ = _campaign_paths_or_exit(args.campaign_id)
+        targets = campaign.cleanup_campaign(paths, apply=bool(args.apply))
+        print(json.dumps({"apply": bool(args.apply), "targets": [str(item) for item in targets]}, indent=2))
+        return
+    if args.campaign_cmd == "migrate-legacy":
+        paths = campaign.migrate_legacy_run(args.run_id, args.campaign_id, runs_dir=Path(args.runs_dir), apply=bool(args.apply))
+        print(json.dumps({"apply": bool(args.apply), "campaign_root": str(paths.root)}, indent=2))
+        return
     if args.campaign_cmd == "plan":
         paths = campaign.resolve_paths(args.campaign_id)
         if paths.manifest.exists():
@@ -1144,6 +1158,16 @@ def build_parser():
     camp_sub = camp.add_subparsers(dest="campaign_cmd", required=True)
     camp_status = camp_sub.add_parser("status", help="show campaign lifecycle state")
     camp_status.add_argument("campaign_id")
+    camp_package = camp_sub.add_parser("package", help="write one campaign review package")
+    camp_package.add_argument("campaign_id")
+    camp_clean = camp_sub.add_parser("clean", help="preview or apply conservative retained-evidence cleanup")
+    camp_clean.add_argument("campaign_id")
+    camp_clean.add_argument("--apply", action="store_true", help="remove only listed disposable campaign dumps")
+    camp_migrate = camp_sub.add_parser("migrate-legacy", help="copy a legacy run into a campaign")
+    camp_migrate.add_argument("--run-id", required=True)
+    camp_migrate.add_argument("--campaign-id", required=True)
+    camp_migrate.add_argument("--runs-dir", default="runs")
+    camp_migrate.add_argument("--apply", action="store_true")
     camp_plan = camp_sub.add_parser("plan", help="create an isolated campaign plan")
     camp_plan.add_argument("--campaign-id", required=True)
     _add_run_filters(camp_plan)

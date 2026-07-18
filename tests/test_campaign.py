@@ -391,3 +391,26 @@ def test_remote_or_malformed_lock_is_not_deleted_automatically(tmp_path):
     paths.lock_file.write_text(json.dumps({"pid": 1, "hostname": "other-host"}))
     with pytest.raises(campaign.CampaignError, match="locked"):
         campaign.acquire_lock(paths, operation="test")
+
+
+def test_campaign_package_and_conservative_cleanup(tmp_path):
+    paths, manifest = campaign.create_campaign("package", models=["x"], campaigns_root=tmp_path / "campaigns")
+    paths.primary_raw_results.write_text('{"score": 1}\n')
+    (paths.primary_dumps_dir / "x.txt").write_text("raw")
+    for state in ("planned", "generating", "packaged", "rejected"):
+        manifest = campaign.transition(paths, manifest, state)
+    package = campaign.package_campaign(paths)
+    assert package.exists() and campaign.verify_package(paths)
+    assert campaign.cleanup_campaign(paths) == [paths.primary_dumps_dir]
+    campaign.cleanup_campaign(paths, apply=True)
+    assert not paths.primary_dumps_dir.exists()
+    assert paths.primary_raw_results.exists()
+
+
+def test_legacy_migration_is_copy_only(tmp_path):
+    source = tmp_path / "runs" / "old"
+    source.mkdir(parents=True)
+    (source / "raw_results.jsonl").write_text('{"score": 1}\n')
+    paths = campaign.migrate_legacy_run("old", "migrated", runs_dir=tmp_path / "runs", campaigns_root=tmp_path / "campaigns", apply=True)
+    assert (paths.primary_dir / "raw_results.jsonl").read_text() == (source / "raw_results.jsonl").read_text()
+    assert source.exists()

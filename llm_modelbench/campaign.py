@@ -16,6 +16,8 @@ import json
 import os
 import re
 import shutil
+import hashlib
+import zipfile
 import tempfile
 import socket
 from dataclasses import asdict, dataclass, field, replace
@@ -594,3 +596,71 @@ def sync_primary_reports(paths: CampaignPaths) -> List[Path]:
             shutil.copy2(source, target)
             copied.append(target)
     return copied
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def package_campaign(paths: CampaignPaths) -> Path:
+    """Create one self-contained review zip and a verifiable source inventory."""
+    manifest = load_manifest(paths)
+    if manifest.state not in (*TERMINAL_STATES, "packaged"):
+        raise CampaignError("only packaged or terminal campaigns may be packaged")
+    if read_lock(paths) is not None:
+        raise CampaignError("refusing to package an actively locked campaign")
+    package = paths.packages_dir / f"{paths.campaign_id}-review.zip"
+    inventory: Dict[str, str] = {}
+    with zipfile.ZipFile(package, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for source in sorted(paths.root.rglob("*")):
+            if not source.is_file() or source == package or paths.packages_dir in source.parents or source == paths.lock_file:
+                continue
+            relative = source.relative_to(paths.root).as_posix()
+            archive.write(source, relative)
+            inventory[relative] = _sha256(source)
+    _atomic_write_text(paths.checksums_json, json.dumps({"files": inventory, "package": _sha256(package)}, indent=2, sort_keys=True))
+    return package
+
+
+def verify_package(paths: CampaignPaths) -> bool:
+    if not paths.checksums_json.exists():
+        return False
+    data = json.loads(paths.checksums_json.read_text(encoding="utf-8"))
+    package = paths.packages_dir / f"{paths.campaign_id}-review.zip"
+    return package.exists() and data.get("package") == _sha256(package) and zipfile.is_zipfile(package)
+
+
+def cleanup_campaign(paths: CampaignPaths, *, apply: bool = False) -> List[Path]:
+    """Retention cleanup is deliberately conservative: only disposable dumps qualify."""
+    manifest = load_manifest(paths)
+    if manifest.state not in TERMINAL_STATES:
+        raise CampaignError("cleanup requires an accepted, rejected, or archived campaign")
+    if read_lock(paths) is not None or not verify_package(paths):
+        raise CampaignError("cleanup requires an unlocked campaign with verified package")
+    candidates = [paths.primary_dumps_dir]
+    if apply:
+        for target in candidates:
+            if target.exists():
+                shutil.rmtree(target)
+    return candidates
+
+
+def migrate_legacy_run(run_id: str, campaign_id: str, *, runs_dir: Path = Path("runs"), campaigns_root: Path = CAMPAIGNS_ROOT, apply: bool = False) -> CampaignPaths:
+    """Copy a legacy run into isolated primary evidence; source evidence is untouched."""
+    source = legacy_run_dir(run_id, runs_dir=runs_dir)
+    if not is_legacy_run_dir(source):
+        raise CampaignError(f"legacy source is not a readable run: {source}")
+    paths = resolve_paths(campaign_id, campaigns_root=campaigns_root)
+    if paths.root.exists() and any(paths.root.iterdir()):
+        raise CampaignError(f"campaign migration target already exists: {paths.root}")
+    if not apply:
+        return paths
+    paths, manifest = create_campaign(campaign_id, models=[], version="legacy-migration", campaigns_root=campaigns_root)
+    shutil.copytree(source, paths.primary_dir, dirs_exist_ok=True)
+    manifest.notes["legacy_source"] = str(source)
+    write_manifest(paths, manifest)
+    return paths
