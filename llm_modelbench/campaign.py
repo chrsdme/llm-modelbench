@@ -166,6 +166,7 @@ class CampaignPaths:
     judge_dir: Path
     judge_results: Path
     judge_summary: Path
+    effective_rows: Path
 
     rankings_dir: Path
     candidate_rankings_dir: Path
@@ -235,6 +236,7 @@ def resolve_paths(
         judge_dir=judge_dir,
         judge_results=judge_dir / "judge_results.jsonl",
         judge_summary=judge_dir / "judge_summary.json",
+        effective_rows=evidence_dir / "effective_rows.jsonl",
         rankings_dir=rankings_dir,
         candidate_rankings_dir=rankings_dir / "candidate",
         reports_dir=reports_dir,
@@ -734,7 +736,13 @@ def classify_recovery_row(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_available: bool = True) -> Dict[str, Any]:
-    dispositions = [str(row.get("disposition") or classify_recovery_row(row)["disposition"]) for row in rows]
+    effective = []
+    for index, row in enumerate(rows):
+        classification = classify_recovery_row(row)
+        disposition = str(row.get("disposition") or classification["disposition"])
+        effective.append({"model": row.get("model"), "model_digest_resolved": row.get("model_digest_resolved"), "task": row.get("task"), "task_hash": row.get("task_hash"), "primary_row_index": index, "primary_row_hash": __import__("hashlib").sha256(json.dumps(row, sort_keys=True, default=str).encode()).hexdigest(), "effective_score": row.get("score"), "effective_reason": row.get("reason"), "result_origin": "primary", "terminal_disposition": disposition, "correctness": "correct" if row.get("score") == 100 else ("visible_wrong" if row.get("score") is not None else "non_scorable")})
+    _atomic_write_text(paths.effective_rows, "".join(json.dumps(row, sort_keys=True) + "\n" for row in effective))
+    dispositions = [row["terminal_disposition"] for row in effective]
     pending = [item for item in dispositions if item not in TERMINAL_DISPOSITIONS]
     if pending:
         state = "not_ready_manual_items"
@@ -744,10 +752,12 @@ def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_a
         state = "not_ready_external_judge"
     else:
         state = "ready_for_adoption"
-    summary = {"campaign_id": paths.campaign_id, "readiness": state, "rows": len(rows),
+    summary = {"campaign_id": paths.campaign_id, "readiness": state, "total_applicable_cells": len(rows), "rows": len(rows),
                "terminal_rows": len(rows) - len(pending), "pending_dispositions": pending,
-               "policy_version": RECOVERY_POLICY_VERSION}
+               "primary_correct": sum(row["correctness"] == "correct" for row in effective), "primary_visible_wrong": sum(row["correctness"] == "visible_wrong" for row in effective), "primary_non_scorable": sum(row["correctness"] == "non_scorable" for row in effective), "recovered_to_correct": 0, "recovered_to_visible_wrong": 0, "recovery_exhausted": sum("pending_retry" in x for x in dispositions), "awaiting_external_judge": dispositions.count("awaiting_external_judge"), "harness_failure": dispositions.count("harness_failure"), "blockers": pending, "policy_version": RECOVERY_POLICY_VERSION}
     _atomic_write_text(paths.readiness_json, json.dumps(summary, indent=2, sort_keys=True))
+    _atomic_write_text(paths.reports_dir / "readiness.json", json.dumps(summary, indent=2, sort_keys=True))
+    _atomic_write_text(paths.reports_dir / "readiness.md", "# Campaign readiness\n\n" + "\n".join(f"- {key}: {value}" for key, value in summary.items()) + "\n")
     return summary
 
 
