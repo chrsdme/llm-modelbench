@@ -7,15 +7,16 @@ candidate rankings, reports, logs, and the final review package. Nothing a
 campaign produces should ever land outside its own directory.
 
 Legacy ``runs/<run_id>/`` layouts are still readable (see
-``is_legacy_run_dir``/``legacy_run_dir``) so existing evidence isn't
+``is_legacy_run_dir``/``legacy_run_dir``) so existing evidence is not
 orphaned by this change, but every *new* campaign uses this layout only.
 """
 from __future__ import annotations
 
 import json
+import os
 import re
 import tempfile
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -23,20 +24,21 @@ from typing import Any, Dict, List, Optional
 CAMPAIGNS_ROOT = Path("campaigns")
 
 _CAMPAIGN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_RESUMABLE_STATES = ("generating", "recovering", "judging")
 
 
 class CampaignError(RuntimeError):
-    """Raised for invalid campaign IDs, missing manifests, or illegal state
-    transitions. Never silently swallowed -- callers must decide what to do."""
+    """Raised for invalid campaign IDs, manifests, or state transitions.
+
+    These errors are never silently swallowed. Callers must decide whether
+    the campaign should stop, be resumed, or be classified as failed.
+    """
 
 
 # ---------------------------------------------------------------------------
 # State machine
 # ---------------------------------------------------------------------------
 
-# Every state a campaign can be in. Terminal states (the last three) are
-# where a campaign must end up before `campaign clean` will touch it, and
-# before canonical adoption is even offered as an option.
 STATES = (
     "created",
     "planned",
@@ -44,25 +46,45 @@ STATES = (
     "recovering",
     "judging",
     "packaged",
+    "interrupted",
+    "failed",
     "accepted",
     "rejected",
     "archived_diagnostic",
 )
 
+# These are publication/lifecycle terminal states. ``failed`` is deliberately
+# not included: failed evidence must still be explicitly rejected or archived
+# before cleanup or publication workflows may treat the campaign as closed.
 TERMINAL_STATES = ("accepted", "rejected", "archived_diagnostic")
 
-# Explicit allowed transitions. Anything not listed here is refused with a
-# clear error rather than silently permitted -- a campaign's state is the
-# one thing every other tool (repair, judge, cleanup, adoption) trusts.
-_ALLOWED_TRANSITIONS: Dict[str, tuple] = {
-    "created": ("planned",),
-    "planned": ("generating",),
-    "generating": ("recovering", "judging", "packaged"),  # recovering/judging are optional
-    "recovering": ("judging", "packaged"),
-    "judging": ("packaged",),
+_ALLOWED_TRANSITIONS: Dict[str, tuple[str, ...]] = {
+    "created": ("planned", "failed"),
+    "planned": ("generating", "failed"),
+    "generating": (
+        "recovering",
+        "judging",
+        "packaged",
+        "interrupted",
+        "failed",
+    ),
+    "recovering": (
+        "judging",
+        "packaged",
+        "interrupted",
+        "failed",
+    ),
+    "judging": (
+        "packaged",
+        "interrupted",
+        "failed",
+    ),
     "packaged": ("accepted", "rejected", "archived_diagnostic"),
-    # Terminal states do not transition anywhere. A campaign that needs more
-    # work after being marked terminal is a new campaign, not a reopened one.
+    # The general table lists all resumable phases. ``transition`` applies the
+    # stronger rule that an interrupted campaign may resume only the exact
+    # phase recorded in ``resume_state``.
+    "interrupted": ("generating", "recovering", "judging", "failed"),
+    "failed": ("rejected", "archived_diagnostic"),
     "accepted": (),
     "rejected": (),
     "archived_diagnostic": (),
@@ -86,10 +108,7 @@ def is_terminal(state: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def validate_campaign_id(campaign_id: str) -> str:
-    """Same discipline as systemd unit name validation elsewhere in this
-    project: a campaign ID becomes a directory name, so it must never
-    contain a path separator, '..', or anything a shell/filesystem would
-    treat specially."""
+    """Validate an identifier that will become a directory name."""
     if not campaign_id or not _CAMPAIGN_ID_RE.fullmatch(campaign_id):
         raise CampaignError(
             f"invalid campaign id {campaign_id!r}: only letters, digits, '.', '_', '-' are allowed"
@@ -105,15 +124,13 @@ def validate_campaign_id(campaign_id: str) -> str:
 
 @dataclass(frozen=True)
 class CampaignPaths:
-    """Every path a campaign ever writes to, resolved once, in one place.
-    Nothing else in this module (or any future phase) should hand-build a
-    path string -- that's exactly the sprawl that created the mess this
-    replaces."""
+    """Every path a campaign writes to, resolved once in one place."""
+
     campaign_id: str
     root: Path
 
+    # Manifest is the single source of truth for state and state history.
     manifest: Path
-    state: Path
 
     plan_dir: Path
     plan_json: Path
@@ -148,12 +165,20 @@ class CampaignPaths:
     packages_dir: Path
 
 
-def campaign_root(campaign_id: str, *, campaigns_root: Path = CAMPAIGNS_ROOT) -> Path:
+def campaign_root(
+    campaign_id: str,
+    *,
+    campaigns_root: Path = CAMPAIGNS_ROOT,
+) -> Path:
     validate_campaign_id(campaign_id)
     return campaigns_root / campaign_id
 
 
-def resolve_paths(campaign_id: str, *, campaigns_root: Path = CAMPAIGNS_ROOT) -> CampaignPaths:
+def resolve_paths(
+    campaign_id: str,
+    *,
+    campaigns_root: Path = CAMPAIGNS_ROOT,
+) -> CampaignPaths:
     root = campaign_root(campaign_id, campaigns_root=campaigns_root)
     plan_dir = root / "plan"
     evidence_dir = root / "evidence"
@@ -169,7 +194,6 @@ def resolve_paths(campaign_id: str, *, campaigns_root: Path = CAMPAIGNS_ROOT) ->
         campaign_id=campaign_id,
         root=root,
         manifest=root / "manifest.json",
-        state=root / "state.json",
         plan_dir=plan_dir,
         plan_json=plan_dir / "plan.json",
         inventory_json=plan_dir / "inventory.json",
@@ -198,17 +222,24 @@ def resolve_paths(campaign_id: str, *, campaigns_root: Path = CAMPAIGNS_ROOT) ->
 
 
 def create_campaign_dirs(paths: CampaignPaths) -> None:
-    """Create every directory a campaign will ever need, up front. Nothing
-    should be responsible for `mkdir -p`-ing its own directory piecemeal --
-    that's exactly how overnight_logs/acceptance_artifacts/rankings-separate
-    ended up as unrelated siblings instead of one tree."""
-    for d in (
-        paths.root, paths.plan_dir, paths.evidence_dir, paths.primary_dir,
-        paths.primary_dumps_dir, paths.recovery_dir, paths.recovery_children_dir,
-        paths.judge_dir, paths.rankings_dir, paths.candidate_rankings_dir,
-        paths.reports_dir, paths.model_cards_dir, paths.logs_dir, paths.packages_dir,
+    """Create the complete campaign directory tree up front."""
+    for directory in (
+        paths.root,
+        paths.plan_dir,
+        paths.evidence_dir,
+        paths.primary_dir,
+        paths.primary_dumps_dir,
+        paths.recovery_dir,
+        paths.recovery_children_dir,
+        paths.judge_dir,
+        paths.rankings_dir,
+        paths.candidate_rankings_dir,
+        paths.reports_dir,
+        paths.model_cards_dir,
+        paths.logs_dir,
+        paths.packages_dir,
     ):
-        d.mkdir(parents=True, exist_ok=True)
+        directory.mkdir(parents=True, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -216,13 +247,18 @@ def create_campaign_dirs(paths: CampaignPaths) -> None:
 # ---------------------------------------------------------------------------
 
 def is_legacy_run_dir(run_dir: Path) -> bool:
-    """A pre-campaign run directory: has raw_results.jsonl directly inside
-    it, not nested under evidence/primary/. Used so existing runs/ evidence
-    remains readable without needing to be migrated before it can be used."""
-    return (run_dir / "raw_results.jsonl").exists() and not (run_dir / "manifest.json").exists()
+    """Return whether *run_dir* uses the pre-campaign layout."""
+    return (
+        (run_dir / "raw_results.jsonl").exists()
+        and not (run_dir / "manifest.json").exists()
+    )
 
 
-def legacy_run_dir(run_id: str, *, runs_dir: Path = Path("runs")) -> Path:
+def legacy_run_dir(
+    run_id: str,
+    *,
+    runs_dir: Path = Path("runs"),
+) -> Path:
     return runs_dir / run_id
 
 
@@ -239,6 +275,7 @@ class CampaignManifest:
     level: str = "full"
     judge_model: Optional[str] = None
     state: str = "created"
+    resume_state: Optional[str] = None
     state_history: List[Dict[str, str]] = field(default_factory=list)
     notes: Dict[str, Any] = field(default_factory=dict)
 
@@ -268,44 +305,127 @@ class CampaignManifest:
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    """Write-then-rename so an interruption mid-write can never leave a
-    truncated/corrupt manifest or state file behind."""
+    """Write, flush, fsync, and atomically replace *path*.
+
+    A failed write or replace leaves the previous manifest intact and removes
+    the temporary file.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    tmp_path = Path(tmp_name)
     try:
-        with open(fd, "w") as handle:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
-        Path(tmp_name).replace(path)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp_path.replace(path)
     except BaseException:
-        Path(tmp_name).unlink(missing_ok=True)
+        tmp_path.unlink(missing_ok=True)
         raise
 
 
-def write_manifest(paths: CampaignPaths, manifest: CampaignManifest) -> None:
-    _atomic_write_text(paths.manifest, json.dumps(manifest.to_dict(), indent=2, sort_keys=True))
+def write_manifest(
+    paths: CampaignPaths,
+    manifest: CampaignManifest,
+) -> None:
+    _atomic_write_text(
+        paths.manifest,
+        json.dumps(manifest.to_dict(), indent=2, sort_keys=True),
+    )
 
 
 def load_manifest(paths: CampaignPaths) -> CampaignManifest:
     if not paths.manifest.exists():
-        raise CampaignError(f"no manifest at {paths.manifest}; is {paths.campaign_id!r} a real campaign?")
-    data = json.loads(paths.manifest.read_text())
-    return CampaignManifest(**data)
+        raise CampaignError(
+            f"no manifest at {paths.manifest}; "
+            f"is {paths.campaign_id!r} a real campaign?"
+        )
+    try:
+        data = json.loads(paths.manifest.read_text(encoding="utf-8"))
+        manifest = CampaignManifest(**data)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise CampaignError(
+            f"invalid campaign manifest at {paths.manifest}: {exc}"
+        ) from exc
+
+    validate_campaign_id(manifest.campaign_id)
+    if manifest.campaign_id != paths.campaign_id:
+        raise CampaignError(
+            f"manifest campaign id {manifest.campaign_id!r} does not match "
+            f"resolved campaign {paths.campaign_id!r}"
+        )
+    if manifest.state not in STATES:
+        raise CampaignError(
+            f"manifest contains unknown campaign state: {manifest.state!r}"
+        )
+    if manifest.state == "interrupted":
+        if manifest.resume_state not in _RESUMABLE_STATES:
+            raise CampaignError(
+                "interrupted campaign manifest must record a valid resume_state"
+            )
+    elif manifest.resume_state is not None:
+        raise CampaignError(
+            f"campaign state {manifest.state!r} must not retain resume_state "
+            f"{manifest.resume_state!r}"
+        )
+    return manifest
 
 
-def transition(paths: CampaignPaths, manifest: CampaignManifest, target: str) -> CampaignManifest:
-    """The only sanctioned way to change a campaign's state. Refuses any
-    transition not explicitly allowed, and records every transition (with a
-    timestamp) in the manifest's own history for later audit."""
+def transition(
+    paths: CampaignPaths,
+    manifest: CampaignManifest,
+    target: str,
+) -> CampaignManifest:
+    """Return and persist a validated new manifest state.
+
+    The input manifest is not mutated. Therefore a failed atomic write leaves
+    both the persisted manifest and the caller's in-memory object unchanged.
+    """
     current = manifest.state
     if not is_valid_transition(current, target):
         raise CampaignError(
             f"illegal campaign state transition: {current!r} -> {target!r} "
-            f"(allowed from {current!r}: {_ALLOWED_TRANSITIONS.get(current, ())})"
+            f"(allowed from {current!r}: "
+            f"{_ALLOWED_TRANSITIONS.get(current, ())})"
         )
-    manifest.state = target
-    manifest.state_history.append({"state": target, "at": datetime.now(timezone.utc).isoformat()})
-    write_manifest(paths, manifest)
-    return manifest
+
+    if current == "interrupted" and target != "failed":
+        if manifest.resume_state not in _RESUMABLE_STATES:
+            raise CampaignError(
+                "interrupted campaign has no valid recorded resume_state"
+            )
+        if target != manifest.resume_state:
+            raise CampaignError(
+                f"interrupted campaign must resume {manifest.resume_state!r}, "
+                f"not {target!r}"
+            )
+
+    now = datetime.now(timezone.utc).isoformat()
+    next_resume_state = manifest.resume_state
+    history_entry: Dict[str, str] = {"state": target, "at": now}
+
+    if target == "interrupted":
+        if current not in _RESUMABLE_STATES:
+            raise CampaignError(
+                f"campaign state {current!r} cannot be interrupted"
+            )
+        next_resume_state = current
+        history_entry["resume_state"] = current
+    elif current == "interrupted":
+        next_resume_state = None
+
+    updated = replace(
+        manifest,
+        state=target,
+        resume_state=next_resume_state,
+        state_history=[*manifest.state_history, history_entry],
+    )
+    write_manifest(paths, updated)
+    return updated
 
 
 def create_campaign(
@@ -315,17 +435,20 @@ def create_campaign(
     level: str = "full",
     version: str = "",
     campaigns_root: Path = CAMPAIGNS_ROOT,
-) -> tuple:
-    """Create a brand-new campaign: directories, manifest, initial state.
-    Refuses to silently reuse an existing campaign_id -- same principle as
-    context-profile's run-directory reuse refusal."""
+) -> tuple[CampaignPaths, CampaignManifest]:
+    """Create a new campaign and refuse non-empty ID reuse."""
     paths = resolve_paths(campaign_id, campaigns_root=campaigns_root)
     if paths.root.exists() and any(paths.root.iterdir()):
         raise CampaignError(
-            f"campaign directory already exists and is not empty: {paths.root}; "
-            "use a new campaign id to preserve prior evidence"
+            f"campaign directory already exists and is not empty: "
+            f"{paths.root}; use a new campaign id to preserve prior evidence"
         )
     create_campaign_dirs(paths)
-    manifest = CampaignManifest.new(campaign_id, models=models, level=level, version=version)
+    manifest = CampaignManifest.new(
+        campaign_id,
+        models=models,
+        level=level,
+        version=version,
+    )
     write_manifest(paths, manifest)
     return paths, manifest
