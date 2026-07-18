@@ -945,6 +945,23 @@ def cmd_coverage(args, cfg):
         print(json.dumps(ledger, indent=2))
 
 def cmd_rankings(args, cfg):
+    if getattr(args, "adopt_campaign", None):
+        from . import campaign
+        paths = campaign.resolve_paths(args.adopt_campaign)
+        if not paths.manifest.exists():
+            raise SystemExit(f"unknown campaign {args.adopt_campaign!r}")
+        preview = campaign.adopt_campaign(paths, rankings_dir=Path(args.out or "rankings"), dry_run=True)
+        print(json.dumps(preview, indent=2, sort_keys=True))
+        if args.dry_run:
+            return
+        required = f"ADOPT {args.adopt_campaign}"
+        if not sys.stdin.isatty():
+            raise SystemExit(f"canonical adoption requires typed terminal confirmation: {required}")
+        if input(f"Type {required} to publish canonical rankings: ").strip() != required:
+            raise SystemExit("canonical adoption cancelled")
+        result = campaign.adopt_campaign(paths, rankings_dir=Path(args.out or "rankings"), dry_run=False)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
     runs_dir = Path(args.runs_dir or "runs")
     rankings_dir = Path(args.out or "rankings")
     from . import ranking_controls
@@ -1481,6 +1498,8 @@ def build_parser():
     rnk.add_argument("--reason", help="generic public-safe reason saved with include/exclude/archive operations")
     rnk.add_argument("--list-excluded", action="store_true", help="print rankings exclusions and exit unless combined with --rescan")
     rnk.add_argument("--include-separate", action="store_true", help="include runs marked separate/diagnostic in this output")
+    rnk.add_argument("--adopt", dest="adopt_campaign", help="adopt one validated campaign; arbitrary source directories are refused")
+    rnk.add_argument("--dry-run", action="store_true", help="preview campaign adoption without canonical mutation")
 
     sub.add_parser("selftest", help="verify scoring logic offline")
     return p

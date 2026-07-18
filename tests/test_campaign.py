@@ -445,3 +445,21 @@ def test_judge_selection_excludes_cohort_and_prefers_calibrated_other_family():
         {"name": "judge", "digest": "judge-digest", "supported_families": ["text"], "architecture_family": "b", "calibrated": True, "priority": 1},
     ], [{"name": "tested", "digest": "same", "architecture_family": "a"}])
     assert chosen["name"] == "judge"
+
+
+def test_campaign_adoption_dry_run_and_transactional_temp_canonical(tmp_path):
+    paths, manifest = campaign.create_campaign("adopt", models=["x"], campaigns_root=tmp_path / "campaigns")
+    paths.primary_raw_results.write_text('{"model": "x", "task": "exact", "score": 100}\n')
+    for state in ("planned", "generating", "packaged"):
+        manifest = campaign.transition(paths, manifest, state)
+    campaign.package_campaign(paths)
+    campaign.write_readiness(paths, [{"score": 100}])
+    paths.candidate_rankings_dir.mkdir(parents=True, exist_ok=True)
+    paths.candidate_rankings_dir.joinpath("master_raw.jsonl").write_text(json.dumps({
+        "run_id": "primary", "_source_signature": "sig", "model": "x", "task": "exact", "score": 100,
+    }) + "\n")
+    canonical = tmp_path / "rankings"
+    assert campaign.adopt_campaign(paths, rankings_dir=canonical, dry_run=True)["rows_added_or_updated"] == 1
+    campaign.adopt_campaign(paths, rankings_dir=canonical, dry_run=False)
+    assert campaign.load_manifest(paths).state == "accepted"
+    assert "campaign_id" in (canonical / "master_raw.jsonl").read_text()

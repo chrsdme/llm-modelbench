@@ -782,3 +782,65 @@ def select_campaign_judge(inventory: List[Dict[str, Any]], cohort: List[Dict[str
         str(item.get("architecture_family") or "") == majority,
         -int(item.get("priority") or 0), str(item.get("name") or ""),
     ))[0]
+
+
+def adopt_campaign(paths: CampaignPaths, *, rankings_dir: Path, dry_run: bool = True) -> Dict[str, Any]:
+    """Transactionally overlay validated candidate rows into canonical rankings."""
+    manifest = load_manifest(paths)
+    readiness = json.loads(paths.readiness_json.read_text()) if paths.readiness_json.exists() else {}
+    if readiness.get("readiness") != "ready_for_adoption":
+        raise CampaignError("campaign is not ready_for_adoption")
+    if not verify_package(paths):
+        raise CampaignError("campaign package checksums do not verify")
+    candidate_raw = paths.candidate_rankings_dir / "master_raw.jsonl"
+    if not candidate_raw.exists():
+        raise CampaignError("candidate rankings evidence is missing")
+    def read_rows(path: Path) -> List[Dict[str, Any]]:
+        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.exists() else []
+    current = read_rows(rankings_dir / "master_raw.jsonl")
+    incoming = read_rows(candidate_raw)
+    for row in incoming:
+        row["ranking_scope"] = "canonical"
+        row["canonical_rankings"] = True
+        row["campaign_id"] = manifest.campaign_id
+    index = {(str(row.get("run_id")), str(row.get("_source_signature"))): row for row in current}
+    added = replaced = 0
+    for row in incoming:
+        key = (str(row.get("run_id")), str(row.get("_source_signature")))
+        previous = index.get(key)
+        if previous == row:
+            continue
+        if previous is not None:
+            current.remove(previous); replaced += 1
+        current.append(row); index[key] = row; added += 1
+    preview = {"campaign_id": manifest.campaign_id, "rows_incoming": len(incoming), "rows_added_or_updated": added,
+               "rows_replaced": replaced, "dry_run": bool(dry_run)}
+    if dry_run:
+        return preview
+    parent = rankings_dir.parent
+    temp = Path(tempfile.mkdtemp(prefix=".campaign-adopt-", dir=str(parent)))
+    try:
+        if rankings_dir.exists():
+            shutil.copytree(rankings_dir, temp, dirs_exist_ok=True)
+        raw = temp / "master_raw.jsonl"
+        _atomic_write_text(raw, "".join(json.dumps(row, sort_keys=True) + "\n" for row in current))
+        from . import rankings
+        rankings.write_rankings(temp / "no-runs", temp, force_rescan=True)
+        backup = parent / f".rankings-backup-{paths.campaign_id}"
+        if backup.exists():
+            raise CampaignError(f"adoption backup path already exists: {backup}")
+        if rankings_dir.exists():
+            os.replace(rankings_dir, backup)
+        os.replace(temp, rankings_dir)
+        if backup.exists():
+            shutil.rmtree(backup)
+        _atomic_write_text(paths.adoption_record, json.dumps({**preview, "adopted_at": datetime.now(timezone.utc).isoformat()}, indent=2, sort_keys=True))
+        transition(paths, manifest, "accepted")
+        return preview
+    except BaseException:
+        if not rankings_dir.exists() and 'backup' in locals() and backup.exists():
+            os.replace(backup, rankings_dir)
+        raise
+    finally:
+        if temp.exists():
+            shutil.rmtree(temp)
