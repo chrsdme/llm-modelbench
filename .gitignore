@@ -6,6 +6,7 @@ dist/
 .venv/
 venv/
 runs/
+campaigns/
 rankings/
 _last_summary.json
 .pytest_cache/

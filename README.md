@@ -14,7 +14,7 @@ tool of that name.
 
 ## Versioning
 
-This is a release candidate: `1.0.0rc19.post3`. Public semantic versioning starts at
+This is a release candidate: `1.0.0rc20`. Public semantic versioning starts at
 `1.0.0`: after the release candidate, `1.0.1` denotes a patch release, `1.1.0`
 and `1.2.0` denote minor releases, and `2.0.0` denotes a major release.
 
@@ -66,6 +66,28 @@ Ollama inventory; `--mock` exercises the pipeline without Ollama.
 Only run real models after explicit operator approval. A normal staged flow is
 inventory, plan, a smoke pass, a repeatable short pass for survivors, then
 focused full/context checks where needed. See [benchmark levels](docs/BENCHMARK_LEVELS.md).
+
+## Campaign workflow
+
+Campaigns isolate generated evidence below `campaigns/<id>/`: primary evidence,
+recovery/judge sidecars, candidate rankings, reports, readiness, checksums, and
+one review package. A visible answer (including score zero) is never retried;
+bounded recovery is only for thinking-only, empty, or transient failures and
+uses progressive 2048/4096/8192-style budgets with circuit-breaker policy.
+
+```bash
+./llmb campaign run --campaign-id example --level full \
+  --models 'installed-model' --unattended-safe --yes --live-ui off
+./llmb campaign status example
+./llmb campaign package example
+./llmb rankings --adopt example --dry-run
+```
+
+Candidate rankings never alter canonical rankings. Canonical adoption is a
+Tier-2 human action: it validates readiness and package checksums, previews the
+diff, then requires `ADOPT <campaign-id>` typed in an interactive terminal.
+Legacy `runs/` remain readable and can be copied into a campaign with
+`campaign migrate-legacy`; cleanup defaults to preview and retains raw evidence.
 
 
 ## Validation and diagnostics

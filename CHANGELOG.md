@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.0rc20
+
+### RC20 acceptance
+
+- Complete the campaign-methodology release path with an isolated mock flow and
+  a bounded real Ollama acceptance campaign. Canonical adoption remained a
+  dry-run only.
+
 ## 1.0.0rc19.post3
 
 ### RC19.3

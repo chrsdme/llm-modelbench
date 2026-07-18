@@ -1,53 +1,52 @@
 # RC20 Codex implementation handover
 
-## Status
+## Final architecture
 
-Partial. RC19.1 workspace foundations are implemented and validated; RC19.2,
-RC19.3, and RC20 automation/adoption acceptance remain unimplemented. Canonical
-rankings were not changed and no real Ollama campaign was run.
+Campaign work is isolated below `campaigns/<id>/`: manifest/state history,
+plan, primary/recovery/judge evidence, candidate rankings, reports, logs,
+checksums, readiness, adoption record, and a review ZIP. Legacy `runs/` remain
+readable; migration copies rather than moves source evidence.
 
-## Implemented architecture
+The campaign policy treats every visible scored answer—including score zero—as
+immutable. Recovery policy primitives only permit thinking-only, empty-output,
+and transient retries, with progressive budgets. Capability resolution does not
+misclassify transport failures as unsupported. Judge selection excludes cohort
+names/digests and prefers calibrated compatible text judges. Candidate adoption
+is campaign-only, verifies readiness/package inventory, previews first, and
+requires an interactive `ADOPT <campaign-id>` confirmation.
 
-- `campaigns/<id>` owns manifests, plan, primary/recovery/judge evidence,
-  candidate rankings, reports, logs, packages, checksums, readiness, and adoption
-  record locations.
-- `llmb campaign plan`, `run`, and `status` create/use isolated primary evidence
-  and candidate rankings. Existing legacy commands remain compatible.
-- Manifest schema v1 validates structural fields while ignoring unknown optional
-  future fields. Campaign locks only reclaim a conclusively dead same-host PID.
-- Review packages have a SHA-256 inventory. Cleanup is deliberately conservative
-  and only removes primary raw dump files after a verified package. Legacy runs
-  are copied, never moved.
+## Commands
 
-## Commits and tag
+`./llmb campaign plan --campaign-id <id> ...` creates a plan.
 
-- `d506f4b fix: harden campaign lifecycle state handling`
-- `090037c feat: add campaign evidence resolver and locking`
-- `dd77e5a feat: route benchmark subsystems through campaign workspaces`
-- `4db83cc feat: add campaign packaging and retention`
-- `f3802a5 chore: prepare RC19.1 campaign workspace release`
-- `840ef09 fix: restore release changelog version heading`
-- Local tag: `v1.0.0rc19.post1`
+`./llmb campaign run --campaign-id <id> --unattended-safe --yes ...` runs an
+isolated primary campaign, readiness summary, and package.
 
-The tag was created before `840ef09`; it has deliberately not been rewritten.
+`./llmb campaign status <id>`, `package <id>`, and `clean <id> [--apply]`
+inspect/package/retain evidence. `migrate-legacy` is copy-only.
 
-## Validation
+`./llmb rankings --adopt <id> --dry-run` is the exact human adoption preview.
+Do not run non-dry adoption without a human review; canonical adoption was not
+performed by this campaign work.
 
-Final completed validation: `python3 -m pytest -q` — 438 passed; `./llmb
-selftest` — ALL GOOD. A disposable mock campaign succeeded under its campaign
-root and was removed. Full session evidence is in
-`/tmp/llm-modelbench-rc20-codex-20260718_034148`.
+## Releases and validation
 
-## Known limitations and review
+Local tags: `v1.0.0rc19.post1`, `v1.0.0rc19.post2`,
+`v1.0.0rc19.post3`, and `v1.0.0rc20`.
 
-Recovery/capability/judge orchestration, readiness, transactional canonical
-adoption, RC19.2/RC19.3/RC20 release gates, and real-Ollama acceptance must be
-implemented before claiming RC20. Do not perform adoption: there is no adopted
-campaign. When that work is complete, the intended human preview command is:
+The RC19.1 tag intentionally remains on its original release-metadata commit;
+the subsequent changelog-heading correction is a separate commit and the tag
+was not rewritten.
 
-`./llmb rankings adopt --campaign <campaign-id> --dry-run`
+Focused campaign tests and the full suite passed before RC20 documentation
+release. A real isolated acceptance campaign is at
+`campaigns/rc20_real_minimal_full`; it used `qwen2.5-coder:3b`, one sample and
+three selected tasks, with no model pull/delete, service/KV/sudo operation, or
+canonical ranking mutation. Its package and readiness summary exist under that
+campaign root; adoption was dry-run only.
 
-No canonical adoption was performed. Review commits, the local tag position,
-the log directory, and campaign tests before continuing. Rollback of the
-implemented changes is by normal review/revert commits; primary legacy evidence
-is never modified by migration.
+## Review and rollback
+
+Review local commits/tags, `/tmp/llm-modelbench-rc20-codex-20260718_034148`,
+the real package/checksums, and the adoption preview. Roll back code only with
+normal follow-up revert commits. Do not delete or overwrite primary evidence.
