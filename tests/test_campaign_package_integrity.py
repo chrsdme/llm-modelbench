@@ -4,7 +4,7 @@ import pytest
 from llm_modelbench import campaign
 
 
-def fixture(tmp_path, *, origin="primary"):
+def fixture(tmp_path, *, origin="primary", complete_refs=False):
     paths, manifest = campaign.create_campaign("pkg", models=["x"], campaigns_root=tmp_path / "campaigns")
     paths.plan_json.write_text(json.dumps({"task_hashes": {"exact": "h"}}))
     paths.inventory_json.write_text(json.dumps([{"name": "x", "digest": "d"}]))
@@ -12,7 +12,18 @@ def fixture(tmp_path, *, origin="primary"):
     paths.primary_raw_results.write_text('{"model":"x","task":"exact","score":100}\n')
     paths.primary_run_validity.write_text('{"status":"valid"}')
     (paths.primary_dir / "model_identities.json").write_text('{"x":{"digest":"d"}}')
-    paths.effective_rows.write_text(json.dumps({"model":"x","task":"exact","task_hash":"h","result_origin":origin,"terminal_disposition":"scored"})+'\n')
+    effective={"model":"x","task":"exact","task_hash":"h","result_origin":origin,"terminal_disposition":"scored"}
+    if origin == "recovered": effective["recovery_child_id"]="child"
+    if origin == "judged": effective["judge_row_hash"]="judge-row"
+    paths.effective_rows.write_text(json.dumps(effective)+'\n')
+    if complete_refs and origin == "recovered":
+        paths.recovery_plan.write_text('{"actions":[]}'); paths.recovery_result.write_text('{"status":"complete"}')
+        paths.recovery_attempts.write_text('{"child_run_id":"child"}\n')
+        child=paths.recovery_children_dir/"child"; child.mkdir(); (child/"attempt.json").write_text('{}')
+    if complete_refs and origin == "judged":
+        (paths.judge_dir/"judge_selection.json").write_text('{"judge":{"digest":"jd"}}')
+        paths.judge_results.write_text('{"source_row_hash":"judge-row","judge_digest":"jd"}\n')
+        paths.judge_summary.write_text('{"judged":1}')
     (paths.reports_dir/"readiness.json").write_text('{"readiness":"ready_for_adoption"}')
     (paths.reports_dir/"readiness.md").write_text('# Ready\n')
     (paths.reports_dir/"report.html").write_text('report')
@@ -100,6 +111,14 @@ def test_recovery_and_judge_references_require_evidence(tmp_path):
     paths=fixture(tmp_path/"judge",origin="judged")
     result=campaign.verify_package_details(paths)
     assert not result["valid"] and not result["judge_references_valid"]
+
+
+@pytest.mark.parametrize("origin", ["recovered", "judged"])
+def test_complete_recovery_and_judge_references_verify(tmp_path, origin):
+    paths=fixture(tmp_path,origin=origin,complete_refs=True)
+    result=campaign.verify_package_details(paths)
+    assert result["valid"]
+    assert result["recovery_references_valid"] and result["judge_references_valid"]
 
 
 def test_atomic_rebuild_preserves_primary_and_one_final_package(tmp_path):
