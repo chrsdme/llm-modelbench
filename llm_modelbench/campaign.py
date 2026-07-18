@@ -978,16 +978,42 @@ def select_campaign_judge(inventory: List[Dict[str, Any]], cohort: List[Dict[str
 def adopt_campaign(paths: CampaignPaths, *, rankings_dir: Path, dry_run: bool = True) -> Dict[str, Any]:
     """Transactionally overlay validated candidate rows into canonical rankings."""
     manifest = load_manifest(paths)
+    candidate_raw = paths.candidate_rankings_dir / "master_raw.jsonl"
+    def read_rows(path: Path) -> List[Dict[str, Any]]:
+        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.exists() else []
+    if manifest.state == "accepted" and paths.adoption_record.exists():
+        incoming_noop, current_noop = read_rows(candidate_raw), read_rows(rankings_dir / "master_raw.jsonl")
+        current_by_cell = {(str(row.get("run_id")),str(row.get("model")),str(row.get("task"))): row for row in current_noop}
+        if all(current_by_cell.get((str(row.get("run_id")),str(row.get("model")),str(row.get("task"))),{}).get("_source_signature") == row.get("_source_signature") for row in incoming_noop):
+            return {"campaign_id": manifest.campaign_id, "campaign_version": manifest.version, "readiness": "ready_for_adoption",
+                    "package_verified": True, "rows_incoming": len(incoming_noop), "rows_added_or_updated": 0,
+                    "rows_replaced": 0, "rows_unchanged": len(incoming_noop), "changes": [], "blockers": [],
+                    "warnings": ["campaign already adopted with identical signatures"], "would_be_noop": True, "dry_run": bool(dry_run)}
     readiness = json.loads(paths.readiness_json.read_text()) if paths.readiness_json.exists() else {}
     if readiness.get("readiness") != "ready_for_adoption":
         raise CampaignError("campaign is not ready_for_adoption")
-    if not verify_package(paths):
+    package_verification = verify_package_details(paths)
+    if not package_verification["valid"]:
         raise CampaignError("campaign package checksums do not verify")
-    candidate_raw = paths.candidate_rankings_dir / "master_raw.jsonl"
+    if not paths.effective_rows.exists():
+        raise CampaignError("effective terminal evidence is missing")
+    effective = read_jsonl = [json.loads(line) for line in paths.effective_rows.read_text().splitlines() if line.strip()]
+    plan = json.loads(paths.plan_json.read_text())
+    planned_hashes = plan.get("task_hashes") or {}
+    for row in effective:
+        task = str(row.get("task") or "")
+        if task and planned_hashes.get(task) and row.get("task_hash") != planned_hashes[task]:
+            raise CampaignError(f"task hash mismatch for {task}")
+        if row.get("terminal_disposition") == "harness_failure":
+            raise CampaignError("unresolved harness failure in effective evidence")
+    selection_path = paths.judge_dir / "judge_selection.json"
+    judge_selection = json.loads(selection_path.read_text()) if selection_path.exists() else {}
+    judge = judge_selection.get("judge") or {}
+    cohort_digests = {str(item.get("digest") or "") for item in judge_selection.get("cohort") or []}
+    if judge.get("digest") and str(judge["digest"]) in cohort_digests:
+        raise CampaignError("judge digest conflicts with tested cohort")
     if not candidate_raw.exists():
         raise CampaignError("candidate rankings evidence is missing")
-    def read_rows(path: Path) -> List[Dict[str, Any]]:
-        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.exists() else []
     current = read_rows(rankings_dir / "master_raw.jsonl")
     incoming = read_rows(candidate_raw)
     for row in incoming:
@@ -1007,12 +1033,29 @@ def adopt_campaign(paths: CampaignPaths, *, rankings_dir: Path, dry_run: bool = 
         if previous is not None:
             current.remove(previous); replaced += 1
         current.append(row); index[key] = row; added += 1
-    preview = {"campaign_id": manifest.campaign_id, "readiness": readiness.get("readiness"), "package_verified": True,
+    def aggregate(rows):
+        by_model: Dict[str, List[float]] = {}
+        for item in rows:
+            if isinstance(item.get("score"), (int, float)): by_model.setdefault(str(item.get("model")), []).append(float(item["score"]))
+        return {model: sum(scores)/len(scores) for model, scores in by_model.items()}
+    old_aggregate, new_aggregate = aggregate(read_rows(rankings_dir / "master_raw.jsonl")), aggregate(current)
+    preview = {"campaign_id": manifest.campaign_id, "campaign_version": manifest.version,
+               "manifest_schema_version": manifest.schema_version, "readiness": readiness.get("readiness"),
+               "package_path": package_verification["package_path"], "package_digest": package_verification["package_digest"],
+               "package_verification": package_verification, "package_verified": True,
                "rows_incoming": len(incoming), "rows_added_or_updated": added, "rows_replaced": replaced,
-               "rows_unchanged": unchanged, "changes": changes, "blockers": [], "dry_run": bool(dry_run)}
+               "rows_unchanged": unchanged, "rows_excluded": 0, "changes": changes,
+               "old_coverage": len(read_rows(rankings_dir / "master_raw.jsonl")), "new_coverage": len(current),
+               "old_model_aggregates": old_aggregate, "new_model_aggregates": new_aggregate,
+               "judge": judge, "judge_validation": "valid", "tested_cohort_digests": sorted(cohort_digests),
+               "canonical_scope_conversion": True, "blockers": [], "warnings": [],
+               "would_be_noop": added == 0, "dry_run": bool(dry_run)}
     if dry_run:
         return preview
+    if added == 0 and manifest.state == "accepted":
+        return preview
     parent = rankings_dir.parent
+    transaction_id = hashlib.sha256(f"{manifest.campaign_id}:{datetime.now(timezone.utc).isoformat()}".encode()).hexdigest()[:16]
     temp = Path(tempfile.mkdtemp(prefix=".campaign-adopt-", dir=str(parent)))
     try:
         if rankings_dir.exists():
@@ -1021,20 +1064,35 @@ def adopt_campaign(paths: CampaignPaths, *, rankings_dir: Path, dry_run: bool = 
         _atomic_write_text(raw, "".join(json.dumps(row, sort_keys=True) + "\n" for row in current))
         from . import rankings
         rankings.write_rankings(temp / "no-runs", temp, force_rescan=True)
-        backup = parent / f".rankings-backup-{paths.campaign_id}"
+        required_artifacts = [raw, temp / "master_summary.json", temp / "master_report_data.json"]
+        if not all(item.is_file() for item in required_artifacts):
+            raise CampaignError("strict rankings rebuild produced incomplete artifacts")
+        adopted = read_rows(raw)
+        if any(row.get("ranking_scope") != "canonical" or not row.get("canonical_rankings") for row in adopted if row.get("campaign_id") == manifest.campaign_id):
+            raise CampaignError("adopted rows are not visible in canonical scope")
+        backup = parent / f".rankings-backup-{paths.campaign_id}-{transaction_id}"
         if backup.exists():
             raise CampaignError(f"adoption backup path already exists: {backup}")
         if rankings_dir.exists():
             os.replace(rankings_dir, backup)
         os.replace(temp, rankings_dir)
+        before_digest = _sha256(backup / "master_raw.jsonl") if (backup / "master_raw.jsonl").exists() else None
+        after_digest = _sha256(rankings_dir / "master_raw.jsonl")
+        record = {**preview, "transaction_id": transaction_id, "adopted_at": datetime.now(timezone.utc).isoformat(),
+                  "confirmation_type": "typed_campaign_id", "manifest_digest": _sha256(paths.manifest),
+                  "canonical_source_before_digest": before_digest, "canonical_source_after_digest": after_digest,
+                  "final_validation": "passed", "final_campaign_state": "accepted"}
+        _atomic_write_text(paths.adoption_record, json.dumps(record, indent=2, sort_keys=True))
+        transition(paths, manifest, "accepted")
         if backup.exists():
             shutil.rmtree(backup)
-        _atomic_write_text(paths.adoption_record, json.dumps({**preview, "adopted_at": datetime.now(timezone.utc).isoformat()}, indent=2, sort_keys=True))
-        transition(paths, manifest, "accepted")
         return preview
     except BaseException:
-        if not rankings_dir.exists() and 'backup' in locals() and backup.exists():
+        if 'backup' in locals() and backup.exists():
+            if rankings_dir.exists(): shutil.rmtree(rankings_dir)
             os.replace(backup, rankings_dir)
+        if paths.adoption_record.exists() and manifest.state != "accepted":
+            paths.adoption_record.unlink()
         raise
     finally:
         if temp.exists():
