@@ -2,7 +2,7 @@ import json
 
 from llm_modelbench.config import Config
 from llm_modelbench.ollama import MockClient
-from llm_modelbench.planner import build_plan
+from llm_modelbench.planner import build_plan, render_plan
 from llm_modelbench.grade import export_blind
 
 
@@ -12,6 +12,8 @@ def test_planner_mock_counts():
     plan = build_plan(MockClient(), cfg, level="smoke", sample_mode="smart")
     assert plan["models_active"] == 4
     assert plan["tasks_total"] > 0
+    assert plan["tasks_unique"] <= plan["tasks_total"]
+    assert "unique /" in render_plan(plan)
     assert plan["samples_total"] == plan["tasks_total"]
 
 

@@ -83,6 +83,14 @@ def test_tamper_size_checksum_and_stale_source_are_rejected(tmp_path):
     assert "package_verification_failed" in readiness["blockers"]
 
 
+def test_stale_package_adoption_remains_fail_closed(tmp_path):
+    paths = fixture(tmp_path)
+    paths.readiness_json.write_text('{"readiness":"ready_for_adoption"}')
+    paths.plan_json.write_text(json.dumps({"task_hashes": {"exact": "changed"}}))
+    with pytest.raises(campaign.CampaignError, match="package checksums do not verify"):
+        campaign.adopt_campaign(paths, rankings_dir=tmp_path / "rankings", dry_run=True)
+
+
 def test_unlisted_duplicate_and_unsafe_members_are_rejected(tmp_path):
     paths=fixture(tmp_path); rewrite(paths,extra=("unexpected.txt",b"x"))
     assert not campaign.verify_package(paths)

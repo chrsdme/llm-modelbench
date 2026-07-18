@@ -53,6 +53,10 @@ def test_cli_forced_mock_campaign_runs_full_terminal_lifecycle(tmp_path, monkeyp
     assert any(row["task"] == "py_csv" and row["result_origin"] == "recovered" and row["effective_score"] == 0 for row in rows)
     assert any(row["terminal_disposition"] == "terminal_thinking_only" for row in rows)
     assert any(row["terminal_disposition"] == "terminal_transient" for row in rows)
+    judge_selection = json.loads(paths.judge_dir.joinpath("judge_selection.json").read_text())
+    assert judge_selection["cohort"] == [{"digest": "mock-qwen25coder14b", "name": "qwen2.5-coder:14b"}]
+    assert judge_selection["posthoc_judge_model"] == "llama3.1:8b"
+    assert judge_selection["generation_judge_model"] is None
     assert json.loads(paths.readiness_json.read_text())["readiness"] == "ready_for_adoption"
     assert campaign.verify_package_details(paths)["valid"] is True
     with zipfile.ZipFile(paths.packages_dir / f"{cid}-review.zip") as archive:

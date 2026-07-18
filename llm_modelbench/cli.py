@@ -517,13 +517,31 @@ def cmd_campaign(args, cfg):
         paths = campaign.resolve_paths(args.campaign_id)
         if paths.manifest.exists():
             manifest = campaign.load_manifest(paths)
+            if manifest.state not in {"created", "planned"}:
+                raise SystemExit(campaign.campaign_replan_refusal(manifest))
         else:
             models = [value.strip() for value in (args.models or "").split(";") if value.strip()]
             paths, manifest = campaign.create_campaign(args.campaign_id, models=models, level=args.level, version=__version__)
         client = _client(args, cfg)
         selected = _resolve_model_selection(args, client)
         plan = _plan_for_args(args, cfg, client, selected_models=selected)
-        campaign.write_campaign_plan(paths, plan, inventory=client.tags(), capabilities=plan.get("capability_profiles") or {}, configuration={"level": args.level, "models": args.models, "judge_policy": getattr(args, "judge", "off"), "samples": args.samples, "think": args.think, "ctx": args.ctx, "num_predict": args.num_predict})
+        configuration = {"level": args.level, "models": args.models, "judge_policy": getattr(args, "judge", "off"), "samples": args.samples, "think": args.think, "ctx": args.ctx, "num_predict": args.num_predict}
+        if manifest.state == "planned":
+            if not paths.plan_json.exists():
+                raise SystemExit(campaign.campaign_replan_refusal(manifest))
+            existing = json.loads(paths.plan_json.read_text(encoding="utf-8"))
+            proposed = campaign._campaign_plan_payload(paths, plan, configuration=configuration, created_at=existing.get("created_at"))
+            if campaign.campaign_plan_equivalent(existing, proposed):
+                print(json.dumps({
+                    "campaign_id": manifest.campaign_id,
+                    "state": manifest.state,
+                    "result": "noop",
+                    "plan": str(paths.plan_json),
+                    "message": "identical campaign plan already persisted; no files changed",
+                }, indent=2))
+                return
+            raise SystemExit(campaign.campaign_replan_refusal(manifest))
+        campaign.write_campaign_plan(paths, plan, inventory=client.tags(), capabilities=plan.get("capability_profiles") or {}, configuration=configuration)
         if manifest.state == "created":
             campaign.transition(paths, manifest, "planned")
         print(f"campaign plan -> {paths.plan_json}")
@@ -577,10 +595,14 @@ def cmd_campaign(args, cfg):
                 if manifest_now.state in {"generating", "recovering"}:
                     campaign.transition(paths, manifest_now, "judging")
                 inventory = client.tags()
-                cohort = [{"name": row.get("model"), "digest": row.get("model_digest_resolved")} for row in rows]
+                cohort_by_key = {}
+                for row in rows:
+                    key = (str(row.get("model") or ""), str(row.get("model_digest_resolved") or ""))
+                    cohort_by_key.setdefault(key, {"name": row.get("model"), "digest": row.get("model_digest_resolved")})
+                cohort = list(cohort_by_key.values())
                 candidates = [{"name": item.get("name"), "digest": item.get("digest"), "supported_families": ["text"], "priority": 0, "calibrated": False} for item in inventory]
                 judge = campaign.select_campaign_judge(candidates, cohort)
-                selection = {"eligible": len(eligible), "cohort": cohort, "machine_judged_provisional": True, "judge": judge}
+                selection = {"eligible": len(eligible), "cohort": cohort, "machine_judged_provisional": True, "judge": judge, "posthoc_judge_model": (judge or {}).get("name"), "posthoc_judge_digest": (judge or {}).get("digest"), "generation_judge_model": None}
                 campaign._atomic_write_text(paths.judge_dir / "judge_selection.json", json.dumps(selection, indent=2, sort_keys=True))
                 if judge:
                     from . import judge_dumps
@@ -1258,9 +1280,18 @@ def build_parser():
     camp_migrate_mode = camp_migrate.add_mutually_exclusive_group()
     camp_migrate_mode.add_argument("--apply", action="store_true")
     camp_migrate_mode.add_argument("--dry-run", action="store_false", dest="apply", help="preview only (default)")
-    camp_plan = camp_sub.add_parser("plan", help="create an isolated campaign plan")
+    camp_plan = camp_sub.add_parser(
+        "plan",
+        help="create an isolated campaign plan",
+        description=(
+            "Create or inspect the immutable pre-generation campaign plan. "
+            "This command does not run fingerprint probes; --no-fingerprint is "
+            "available only on campaign run."
+        ),
+    )
     camp_plan.add_argument("--campaign-id", required=True)
     _add_run_filters(camp_plan)
+    camp_plan.add_argument("--judge", choices=["off"], default="off", help="campaign primary generation is planned with judge mode off")
     camp_run = camp_sub.add_parser("run", help="run a primary benchmark inside a campaign")
     camp_run.add_argument("--campaign-id", required=True)
     _add_run_filters(camp_run, auto_default=True)

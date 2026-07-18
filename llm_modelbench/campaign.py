@@ -397,8 +397,8 @@ def write_manifest(
     )
 
 
-def write_campaign_plan(paths: CampaignPaths, plan: Dict[str, Any], *, inventory: List[Dict[str, Any]], capabilities: Dict[str, Any], configuration: Dict[str, Any]) -> Dict[str, Any]:
-    """Persist the accepted pre-generation contract atomically."""
+def _campaign_plan_payload(paths: CampaignPaths, plan: Dict[str, Any], *, configuration: Dict[str, Any], created_at: Optional[str] = None) -> Dict[str, Any]:
+    """Build the persisted pre-generation contract without writing it."""
     from .runner import _task_hash
     from .tasks import TASKS
     task_map = {task.id: _task_hash(task) for task in TASKS}
@@ -408,13 +408,43 @@ def write_campaign_plan(paths: CampaignPaths, plan: Dict[str, Any], *, inventory
         "generation_judge_mode": "off",
         "task_hashes": {task_id: task_map[task_id] for model in plan.get("active_models", []) for task_id in model.get("tasks", []) if task_id in task_map},
         "configuration": configuration,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": created_at or datetime.now(timezone.utc).isoformat(),
         "recovery_policy_version": RECOVERY_POLICY_VERSION if "RECOVERY_POLICY_VERSION" in globals() else "pending",
     })
+    return accepted
+
+
+def write_campaign_plan(paths: CampaignPaths, plan: Dict[str, Any], *, inventory: List[Dict[str, Any]], capabilities: Dict[str, Any], configuration: Dict[str, Any]) -> Dict[str, Any]:
+    """Persist the accepted pre-generation contract atomically."""
+    accepted = _campaign_plan_payload(paths, plan, configuration=configuration)
     _atomic_write_text(paths.plan_json, json.dumps(accepted, indent=2, sort_keys=True))
     _atomic_write_text(paths.inventory_json, json.dumps(inventory, indent=2, sort_keys=True))
     _atomic_write_text(paths.capabilities_json, json.dumps(capabilities, indent=2, sort_keys=True))
     return accepted
+
+
+def campaign_plan_equivalent(existing: Dict[str, Any], proposed: Dict[str, Any]) -> bool:
+    """Compare campaign plan contracts while ignoring volatile write time."""
+    left = dict(existing)
+    right = dict(proposed)
+    left.pop("created_at", None)
+    right.pop("created_at", None)
+    return left == right
+
+
+def campaign_replan_refusal(manifest: CampaignManifest) -> str:
+    """Human-facing fail-closed message for unsafe in-place replanning."""
+    if manifest.state == "interrupted":
+        allowed = f"campaign resume {manifest.campaign_id}"
+    elif manifest.state == "planned":
+        allowed = f"campaign run --campaign-id {manifest.campaign_id}"
+    else:
+        allowed = f"campaign status {manifest.campaign_id}"
+    return (
+        f"campaign plan refused for campaign {manifest.campaign_id!r}: "
+        f"current state is {manifest.state!r}; allowed next action: {allowed}; "
+        "create a new campaign ID when plan settings must change."
+    )
 
 
 def load_manifest(paths: CampaignPaths) -> CampaignManifest:

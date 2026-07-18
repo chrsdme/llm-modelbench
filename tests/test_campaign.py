@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from llm_modelbench import campaign
+from llm_modelbench import campaign, cli
 
 
 def _complete_package_fixture(paths):
@@ -19,6 +19,55 @@ def _complete_package_fixture(paths):
     paths.reports_dir.joinpath("readiness.md").write_text("# Ready\n")
     paths.candidate_rankings_dir.joinpath("master_raw.jsonl").write_text(json.dumps({"model": "x", "task": "exact", "score": 100}) + "\n")
     paths.candidate_rankings_dir.joinpath("master_summary.json").write_text("[]\n")
+
+
+def _tree_bytes(root: Path) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _cli_plan_args(campaign_id: str, *, tasks: str = "json_extract") -> list[str]:
+    return [
+        "campaign", "plan",
+        "--campaign-id", campaign_id,
+        "--mock",
+        "--models", "qwen2.5-coder:14b",
+        "--level", "short",
+        "--tasks", tasks,
+        "--samples", "1",
+        "--judge", "off",
+        "--num-predict", "512",
+    ]
+
+
+def _campaign_in_state(tmp_path: Path, state: str, *, campaign_id: str = "replan") -> campaign.CampaignPaths:
+    paths, manifest = campaign.create_campaign(campaign_id, models=["x"], campaigns_root=tmp_path / "campaigns")
+    paths.primary_raw_results.write_text('{"model": "x", "task": "exact", "score": 100}\n')
+    _complete_package_fixture(paths)
+    if state == "created":
+        return paths
+    for target in ("planned", "generating", "recovering", "judging", "packaged"):
+        if target == "recovering" and state == "judging":
+            continue
+        manifest = campaign.transition(paths, manifest, target)
+        if target == state:
+            return paths
+    if state in {"accepted", "rejected", "archived_diagnostic"}:
+        manifest = campaign.transition(paths, manifest, state)
+        return paths
+    if state == "interrupted":
+        # Recreate the exact interrupted state from a resumable phase.
+        paths, manifest = campaign.create_campaign(campaign_id + "_i", models=["x"], campaigns_root=tmp_path / "campaigns")
+        paths.primary_raw_results.write_text('{"model": "x", "task": "exact", "score": 100}\n')
+        _complete_package_fixture(paths)
+        manifest = campaign.transition(paths, manifest, "planned")
+        manifest = campaign.transition(paths, manifest, "generating")
+        campaign.transition(paths, manifest, "interrupted")
+        return paths
+    raise AssertionError(state)
 
 
 def test_create_campaign_builds_full_directory_tree(tmp_path):
@@ -56,6 +105,82 @@ def test_create_campaign_refuses_to_reuse_a_nonempty_existing_id(tmp_path):
             models=["y"],
             campaigns_root=campaigns_root,
         )
+
+
+def test_campaign_plan_creates_new_campaign_and_identical_planned_noop(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    cid = "plan_noop"
+    cli.main(_cli_plan_args(cid))
+    paths = campaign.resolve_paths(cid, campaigns_root=Path("campaigns"))
+    before = _tree_bytes(paths.root)
+    capsys.readouterr()
+
+    cli.main(_cli_plan_args(cid))
+
+    output = capsys.readouterr().out
+    result = json.loads(output)
+    assert result["result"] == "noop"
+    assert result["campaign_id"] == cid
+    assert _tree_bytes(paths.root) == before
+    assert campaign.load_manifest(paths).state == "planned"
+
+
+def test_campaign_plan_changed_planned_request_is_refused_without_mutation(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    cid = "plan_changed"
+    cli.main(_cli_plan_args(cid))
+    paths = campaign.resolve_paths(cid, campaigns_root=Path("campaigns"))
+    before = _tree_bytes(paths.root)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(_cli_plan_args(cid, tasks="json_extract,agent_plan"))
+
+    text = str(exc.value)
+    assert cid in text and "current state is 'planned'" in text
+    assert "campaign run --campaign-id plan_changed" in text
+    assert "create a new campaign ID" in text
+    assert _tree_bytes(paths.root) == before
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "generating",
+        "recovering",
+        "judging",
+        "packaged",
+        "accepted",
+        "rejected",
+        "archived_diagnostic",
+        "interrupted",
+    ],
+)
+def test_campaign_plan_refuses_post_generation_states_before_writing(tmp_path, monkeypatch, state):
+    monkeypatch.chdir(tmp_path)
+    paths = _campaign_in_state(tmp_path, state, campaign_id=f"replan_{state}")
+    package = paths.packages_dir / f"{paths.campaign_id}-review.zip"
+    if campaign.load_manifest(paths).state in {"packaged", "accepted", "rejected", "archived_diagnostic"}:
+        campaign.package_campaign(paths)
+    before = _tree_bytes(paths.root)
+    package_before = package.read_bytes() if package.exists() else None
+    plan_before = paths.plan_json.read_bytes() if paths.plan_json.exists() else None
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(_cli_plan_args(paths.campaign_id, tasks="json_extract,agent_plan"))
+
+    text = str(exc.value)
+    current_state = campaign.load_manifest(paths).state
+    assert paths.campaign_id in text
+    assert f"current state is {current_state!r}" in text
+    assert "allowed next action:" in text
+    assert "create a new campaign ID" in text
+    if current_state == "interrupted":
+        assert f"campaign resume {paths.campaign_id}" in text
+    assert _tree_bytes(paths.root) == before
+    if package_before is not None:
+        assert package.read_bytes() == package_before
+    if plan_before is not None:
+        assert paths.plan_json.read_bytes() == plan_before
 
 
 @pytest.mark.parametrize(

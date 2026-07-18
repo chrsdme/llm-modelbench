@@ -27,6 +27,14 @@ same orchestration path for planning, generation, recovery, judging, readiness,
 candidate rankings, package creation, package verification, adoption dry-run
 eligibility, and cleanup dry-run eligibility.
 
+`./llmb campaign plan` may create a new campaign, complete a campaign still in
+`created`, or return an explicit no-op for an identical already-planned
+campaign. It refuses in-place changes after `planned`; use a new campaign ID
+when models, tasks, samples, context, thinking, or output limits must change.
+Interrupted campaigns must be resumed with `campaign resume`, not replanned.
+`campaign plan` does not accept `--no-fingerprint` because fingerprint probes
+are not executed by planning; fingerprint controls belong to `campaign run`.
+
 ## Recovery fairness
 
 Recovery is only for rows that are not scorable as primary evidence:
@@ -45,6 +53,9 @@ Campaign generation runs with judge mode off. Subjective rows are judged
 post-hoc only, after recovery and terminal classification. Judge selection
 excludes tested cohort names, exact digests, and digest-equivalent aliases. The
 selection record persists architecture, calibration, and selection reason.
+`manifest.json` field `judge_model`, when present, refers to generation-time
+judging; post-hoc judge model and digest are recorded in
+`evidence/judge/judge_selection.json` and `evidence/judge/judge_summary.json`.
 
 Machine-judged subjective evidence is labelled provisional. If no qualified
 judge is available, readiness records the unresolved external-judge blocker

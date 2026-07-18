@@ -122,6 +122,7 @@ def build_plan(
         })
 
     total_tasks = sum(int(m["tasks_total"]) for m in active)
+    unique_tasks = len({task_id for model in active for task_id in model.get("tasks", [])})
     total_samples = sum(int(m["samples_total"]) for m in active)
     rough = _rough_seconds(total_samples, len(active))
     reasons: Dict[str, int] = {}
@@ -141,6 +142,7 @@ def build_plan(
         "models_active": len(active),
         "models_skipped": len(skipped),
         "tasks_total": total_tasks,
+        "tasks_unique": unique_tasks,
         "samples_total": total_samples,
         "rough_eta_seconds": rough,
         "filters": describe_filters(
@@ -168,7 +170,7 @@ def render_plan(plan: Dict[str, Any], *, max_models: int = 80, max_skips: int = 
         f"Selection:    {plan.get('selection_mode')}",
         f"Auto probe:   {'yes' if plan.get('auto_probe') else 'no (metadata/profile routing only)'}",
         f"Models:       {plan.get('models_active')} active / {plan.get('models_total_inventory')} installed  ({plan.get('models_skipped')} skipped)",
-        f"Tasks:        {plan.get('tasks_total')}",
+        f"Tasks:        {plan.get('tasks_unique', plan.get('tasks_total'))} unique / {plan.get('tasks_total')} model-task cells",
         f"Generations:  {plan.get('samples_total')}",
         f"Rough ETA:    {seconds_hms(plan.get('rough_eta_seconds'))}  (pre-run estimate; live ETA updates during run)",
     ]
