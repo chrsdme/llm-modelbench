@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import tempfile
 import socket
 from dataclasses import asdict, dataclass, field, replace
@@ -579,3 +580,17 @@ def create_campaign(
     )
     write_manifest(paths, manifest)
     return paths, manifest
+
+
+def sync_primary_reports(paths: CampaignPaths) -> List[Path]:
+    """Publish report views under the campaign report root without moving evidence."""
+    copied: List[Path] = []
+    for source in paths.primary_dir.iterdir():
+        if source.is_file() and source.name in {
+            "report.html", "scorecard.md", "scorecard.csv", "routing.md",
+            "prune.md", "clones.md", "regression.md", "summary.json",
+        }:
+            target = paths.reports_dir / source.name
+            shutil.copy2(source, target)
+            copied.append(target)
+    return copied

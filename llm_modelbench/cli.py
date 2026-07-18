@@ -468,6 +468,70 @@ def cmd_plan(args, cfg):
         print(f"plan json -> {args.plan_json}")
 
 
+def _campaign_paths_or_exit(campaign_id: str):
+    from . import campaign
+    paths = campaign.resolve_paths(campaign_id)
+    if not paths.manifest.exists():
+        raise SystemExit(f"unknown campaign {campaign_id!r}")
+    return paths, campaign.load_manifest(paths)
+
+
+def cmd_campaign(args, cfg):
+    """Thin compatibility layer: existing runners receive a normal nested run dir."""
+    from . import campaign, planner
+    if args.campaign_cmd == "status":
+        paths, manifest = _campaign_paths_or_exit(args.campaign_id)
+        print(json.dumps({"campaign_id": manifest.campaign_id, "state": manifest.state,
+                          "resume_state": manifest.resume_state, "root": str(paths.root)}, indent=2))
+        return
+    if args.campaign_cmd == "plan":
+        paths = campaign.resolve_paths(args.campaign_id)
+        if paths.manifest.exists():
+            manifest = campaign.load_manifest(paths)
+        else:
+            models = [value.strip() for value in (args.models or "").split(";") if value.strip()]
+            paths, manifest = campaign.create_campaign(args.campaign_id, models=models, level=args.level, version=__version__)
+        client = _client(args, cfg)
+        selected = _resolve_model_selection(args, client)
+        plan = _plan_for_args(args, cfg, client, selected_models=selected)
+        planner.write_plan(paths.plan_json, plan)
+        if manifest.state == "created":
+            campaign.transition(paths, manifest, "planned")
+        print(f"campaign plan -> {paths.plan_json}")
+        return
+    if args.campaign_cmd == "run":
+        paths = campaign.resolve_paths(args.campaign_id)
+        if not paths.manifest.exists():
+            models = [value.strip() for value in (args.models or "").split(";") if value.strip()]
+            paths, manifest = campaign.create_campaign(args.campaign_id, models=models, level=args.level, version=__version__)
+            manifest = campaign.transition(paths, manifest, "planned")
+        else:
+            manifest = campaign.load_manifest(paths)
+        if manifest.state == "planned":
+            manifest = campaign.transition(paths, manifest, "generating")
+        elif manifest.state == "interrupted" and manifest.resume_state == "generating":
+            manifest = campaign.transition(paths, manifest, "generating")
+        elif manifest.state != "generating":
+            raise SystemExit(f"campaign {args.campaign_id!r} cannot run from state {manifest.state!r}")
+        lock = campaign.acquire_lock(paths, operation="campaign-run", phase="generating")
+        try:
+            args.out = str(paths.evidence_dir)
+            args.run_id = "primary"
+            args.rankings_out = str(paths.candidate_rankings_dir)
+            args.separate_ranking = True
+            args.no_ranking_update = False
+            cmd_run(args, cfg)
+            campaign.sync_primary_reports(paths)
+            campaign.transition(paths, campaign.load_manifest(paths), "packaged")
+        except KeyboardInterrupt:
+            campaign.transition(paths, campaign.load_manifest(paths), "interrupted")
+            raise
+        finally:
+            campaign.release_lock(paths, lock)
+        return
+    raise SystemExit("campaign command required")
+
+
 def cmd_grade(args, cfg):
     from . import grade
     run_dir = _require_run_dir(args, command="grade")
@@ -1076,6 +1140,30 @@ def build_parser():
                     help="subjective scoring mode used for sample planning; default: off")
     pl.add_argument("--json", action="store_true")
 
+    camp = sub.add_parser("campaign", help="manage isolated campaign workspaces")
+    camp_sub = camp.add_subparsers(dest="campaign_cmd", required=True)
+    camp_status = camp_sub.add_parser("status", help="show campaign lifecycle state")
+    camp_status.add_argument("campaign_id")
+    camp_plan = camp_sub.add_parser("plan", help="create an isolated campaign plan")
+    camp_plan.add_argument("--campaign-id", required=True)
+    _add_run_filters(camp_plan)
+    camp_run = camp_sub.add_parser("run", help="run a primary benchmark inside a campaign")
+    camp_run.add_argument("--campaign-id", required=True)
+    _add_run_filters(camp_run, auto_default=True)
+    camp_run.add_argument("--judge", choices=["single", "panel", "off"], default="off")
+    camp_run.add_argument("--dump-subjective", action="store_true", default=True)
+    camp_run.add_argument("--no-dump", dest="dump_subjective", action="store_false")
+    camp_run.add_argument("--dump-raw", action="store_true", default=True)
+    camp_run.add_argument("--no-dump-raw", dest="dump_raw", action="store_false")
+    camp_run.add_argument("--fingerprint", action="store_true", default=True)
+    camp_run.add_argument("--no-fingerprint", dest="fingerprint", action="store_false")
+    camp_run.add_argument("--resume", action="store_true", default=True)
+    camp_run.add_argument("--no-resume", dest="resume", action="store_false")
+    camp_run.add_argument("--yes", action="store_true")
+    camp_run.add_argument("--status-interval", type=float, default=5.0)
+    camp_run.add_argument("--live-ui", choices=["off", "compact", "full", "graph", "log"], default="compact")
+    camp_run.add_argument("--strict-harness", action="store_true")
+
     r = sub.add_parser("run", help="run the benchmark")
     # Actual scored runs probe capability lanes by default. Planning remains
     # metadata-only unless --auto is explicit, so a read-only plan stays cheap.
@@ -1379,6 +1467,8 @@ def main(argv=None):
         cmd_inventory(args, cfg)
     elif args.cmd == "plan":
         cmd_plan(args, cfg)
+    elif args.cmd == "campaign":
+        cmd_campaign(args, cfg)
     elif args.cmd == "run":
         cmd_run(args, cfg)
     elif args.cmd == "watch":
