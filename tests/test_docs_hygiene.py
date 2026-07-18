@@ -13,6 +13,7 @@ _EXCLUDED_DIR_NAMES = {
     "build",
     "dist",
     "runs",
+    "campaigns",
     "rankings",
     ".pytest_cache",
     ".mypy_cache",
