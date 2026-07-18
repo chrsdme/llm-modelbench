@@ -758,3 +758,27 @@ def classify_capability_probe(probes: List[Dict[str, Any]]) -> str:
     if "measured_failure" in states:
         return "capability_measured_failure"
     return "probe_unresolved_transient"
+
+
+def select_campaign_judge(inventory: List[Dict[str, Any]], cohort: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Select an installed text judge outside the tested cohort deterministically."""
+    cohort_names = {str(item.get("name") or item.get("model") or "") for item in cohort}
+    cohort_digests = {str(item.get("digest") or item.get("model_digest_resolved") or "") for item in cohort}
+    cohort_families = [str(item.get("architecture_family") or "") for item in cohort]
+    majority = max(set(cohort_families), key=cohort_families.count) if cohort_families else ""
+    candidates = []
+    for item in inventory:
+        name, digest = str(item.get("name") or ""), str(item.get("digest") or "")
+        families = item.get("supported_families") or item.get("families") or []
+        if name in cohort_names or (digest and digest in cohort_digests) or "text" not in families:
+            continue
+        if int(item.get("context") or item.get("context_length") or 0) and int(item.get("context") or item.get("context_length")) < 1024:
+            continue
+        candidates.append(item)
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda item: (
+        not bool(item.get("calibrated")),
+        str(item.get("architecture_family") or "") == majority,
+        -int(item.get("priority") or 0), str(item.get("name") or ""),
+    ))[0]

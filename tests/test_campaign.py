@@ -436,3 +436,12 @@ def test_readiness_requires_terminal_dispositions(tmp_path):
 ])
 def test_capability_reprobe_taxonomy(probes, expected):
     assert campaign.classify_capability_probe(probes) == expected
+
+
+def test_judge_selection_excludes_cohort_and_prefers_calibrated_other_family():
+    chosen = campaign.select_campaign_judge([
+        {"name": "tested-alias", "digest": "same", "supported_families": ["text"], "priority": 99},
+        {"name": "same-family", "digest": "other", "supported_families": ["text"], "architecture_family": "a", "calibrated": True},
+        {"name": "judge", "digest": "judge-digest", "supported_families": ["text"], "architecture_family": "b", "calibrated": True, "priority": 1},
+    ], [{"name": "tested", "digest": "same", "architecture_family": "a"}])
+    assert chosen["name"] == "judge"
