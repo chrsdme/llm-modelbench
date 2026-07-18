@@ -546,15 +546,18 @@ def cmd_campaign(args, cfg):
             rows = [json.loads(line) for line in paths.primary_raw_results.read_text(encoding="utf-8").splitlines() if line.strip()]
             retry_rows = [row for row in rows if campaign.classify_recovery_row(row)["retry"]]
             if retry_rows:
-                # Evidence-first bounded recovery decision. Existing primary rows remain immutable.
+                # Execute the existing bounded repair engine against nested primary evidence.
+                from . import repair
                 manifest_now = campaign.load_manifest(paths)
                 campaign.transition(paths, manifest_now, "recovering")
+                plan = repair.build_plan(paths.evidence_dir, run_id="primary", think_retry_num_predict=int(args.num_predict or 2048), judge_mode="off")
+                campaign._atomic_write_text(paths.recovery_plan, json.dumps(plan.to_dict(), indent=2, sort_keys=True))
+                result = repair.apply_plan(client, cfg, plan, rankings_dir=paths.candidate_rankings_dir, ranking_scope="separate")
                 attempts = []
-                for row in retry_rows:
-                    attempts.append({"parent_row_hash": __import__("hashlib").sha256(json.dumps(row, sort_keys=True).encode()).hexdigest(), "attempt": 0, "outcome": "terminal_unexecuted", "policy_version": campaign.RECOVERY_POLICY_VERSION, "configuration": campaign.recovery_profiles(int(args.num_predict or 2048))})
-                campaign._atomic_write_text(paths.recovery_plan, json.dumps({"actions": attempts, "policy_version": campaign.RECOVERY_POLICY_VERSION}, indent=2, sort_keys=True))
+                for action in result.get("actions", []):
+                    attempts.append({"campaign_id": paths.campaign_id, "action": action, "policy_version": campaign.RECOVERY_POLICY_VERSION})
                 campaign._atomic_write_text(paths.recovery_attempts, "".join(json.dumps(item, sort_keys=True) + "\n" for item in attempts))
-                campaign._atomic_write_text(paths.recovery_result, json.dumps({"actions": len(attempts), "status": "terminal_unexecuted"}, indent=2, sort_keys=True))
+                campaign._atomic_write_text(paths.recovery_result, json.dumps(result, indent=2, sort_keys=True))
                 if campaign.load_manifest(paths).state != "packaged":
                     campaign.transition(paths, campaign.load_manifest(paths), "packaged")
             # Primary generation is always judge-off. Subjective judging is post-hoc.
