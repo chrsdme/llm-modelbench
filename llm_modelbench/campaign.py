@@ -646,6 +646,12 @@ def package_campaign(paths: CampaignPaths, *, allow_active_lock: bool = False) -
         for source in sorted(paths.root.rglob("*")):
             if not source.is_file() or source in {package, temp_package, paths.lock_file} or paths.packages_dir in source.parents or paths.checksums_dir in source.parents or paths.readiness_dir in source.parents:
                 continue
+            # Per-response dumps are disposable intermediates.  Immutable raw
+            # results and any recovery child evidence are packaged separately;
+            # including dumps would make a conservative retention cleanup stale
+            # the otherwise verified review package.
+            if source == paths.primary_dumps_dir or paths.primary_dumps_dir in source.parents:
+                continue
             if source.parent == paths.primary_dir and source.name in duplicate_primary_reports:
                 continue
             relative = source.relative_to(paths.root).as_posix()
@@ -769,36 +775,289 @@ def verify_package(paths: CampaignPaths) -> bool:
     return bool(details["valid"])
 
 
-def cleanup_campaign(paths: CampaignPaths, *, apply: bool = False) -> List[Path]:
-    """Retention cleanup is deliberately conservative: only disposable dumps qualify."""
+def _json_object(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _cleanup_pending_blockers(paths: CampaignPaths) -> List[str]:
+    blockers: List[str] = []
+    recovery = _json_object(paths.recovery_result)
+    if str(recovery.get("status") or "").lower() in {"pending", "running", "interrupted", "in_progress"}:
+        blockers.append("pending_recovery")
+    for action in recovery.get("actions") or []:
+        if str(action.get("status") or "").lower() in {"pending", "running", "retry_pending", "in_progress"}:
+            blockers.append("pending_recovery")
+            break
+    judge = _json_object(paths.judge_summary)
+    if int(judge.get("pending") or 0) > 0 or str(judge.get("status") or "").lower() in {"pending", "running", "interrupted", "in_progress"}:
+        blockers.append("pending_judging")
+    if paths.effective_rows.exists():
+        try:
+            rows = [json.loads(line) for line in paths.effective_rows.read_text(encoding="utf-8").splitlines() if line.strip()]
+        except (OSError, ValueError, json.JSONDecodeError):
+            blockers.append("invalid_effective_terminal_ledger")
+        else:
+            dispositions = [str(row.get("terminal_disposition") or "") for row in rows]
+            if any("pending" in value for value in dispositions):
+                blockers.append("pending_terminal_disposition")
+            if any("manual" in value or "conflicting" in value for value in dispositions):
+                blockers.append("unresolved_manual_item")
+    return sorted(set(blockers))
+
+
+def cleanup_campaign(paths: CampaignPaths, *, apply: bool = False) -> Dict[str, Any]:
+    """Plan or apply a conservative, evidence-preserving campaign cleanup."""
     manifest = load_manifest(paths)
+    blockers: List[str] = []
+    warnings: List[str] = []
     if manifest.state not in TERMINAL_STATES:
-        raise CampaignError("cleanup requires an accepted, rejected, or archived campaign")
-    if read_lock(paths) is not None or not verify_package(paths):
-        raise CampaignError("cleanup requires an unlocked campaign with verified package")
-    candidates = [paths.primary_dumps_dir]
+        blockers.append(f"ineligible_state:{manifest.state}")
+    lock = read_lock(paths)
+    stale_lock = bool(lock and lock_is_stale(lock))
+    if lock and not stale_lock:
+        blockers.append("active_or_ambiguous_lock")
+    elif stale_lock:
+        warnings.append("proven_stale_same_host_lock")
+    packages = sorted(paths.packages_dir.glob("*.zip")) if paths.packages_dir.exists() else []
+    if len(packages) != 1:
+        blockers.append("missing_final_package" if not packages else "multiple_final_packages")
+    verification = verify_package_details(paths)
+    if not verification.get("valid"):
+        blockers.append("package_verification_failed")
+    blockers.extend(_cleanup_pending_blockers(paths))
+    for required, label in ((paths.effective_rows, "missing_effective_terminal_ledger"),
+                            (paths.reports_dir / "readiness.md", "missing_readiness_markdown")):
+        if not required.is_file():
+            blockers.append(label)
+    if not paths.readiness_json.is_file() and not (paths.reports_dir / "readiness.json").is_file():
+        blockers.append("missing_readiness")
+
+    candidates: List[Path] = []
+    if paths.primary_dumps_dir.exists():
+        try:
+            _inside(paths.root, paths.primary_dumps_dir)
+        except CampaignError:
+            blockers.append("unsafe_cleanup_target")
+        else:
+            if paths.primary_dumps_dir.is_symlink():
+                blockers.append("symlink_cleanup_target")
+            elif paths.primary_dumps_dir.is_dir():
+                candidates.append(paths.primary_dumps_dir)
+            else:
+                blockers.append("unexpected_cleanup_target_type")
+    blockers = sorted(set(blockers))
+    removable_files = [file for target in candidates for file in target.rglob("*") if file.is_file() and not file.is_symlink()]
+    bytes_proposed = sum(file.stat().st_size for file in removable_files)
+    retained = [file for file in sorted(paths.root.rglob("*"))
+                if file.is_file() and not any(file == target or target in file.parents for target in candidates)]
+    result: Dict[str, Any] = {
+        "campaign_id": paths.campaign_id,
+        "dry_run": not apply,
+        "applied": False,
+        "eligible": not blockers,
+        "blockers": blockers,
+        "files_proposed_for_removal": [str(file.relative_to(paths.root)) for file in removable_files],
+        "targets_proposed_for_removal": [str(target.relative_to(paths.root)) for target in candidates],
+        "files_removed": [],
+        "bytes_proposed": bytes_proposed,
+        "bytes_removed": 0,
+        "files_retained": [str(file.relative_to(paths.root)) for file in retained],
+        "verification": verification,
+        "policy_version": CLEANUP_POLICY_VERSION,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "errors": [],
+        "warnings": warnings,
+    }
     if apply:
-        for target in candidates:
-            if target.exists():
+        if blockers:
+            raise CampaignError("cleanup refused: " + ", ".join(blockers))
+        if stale_lock:
+            # Only same-host dead-PID locks reach this branch.
+            paths.lock_file.unlink()
+        try:
+            for target in candidates:
+                _inside(paths.root, target)
                 shutil.rmtree(target)
-    return candidates
+        except BaseException as exc:
+            result["errors"].append(str(exc))
+            raise CampaignError(f"cleanup failed while removing an enumerated redundant target: {exc}") from exc
+        result["applied"] = True
+        result["files_removed"] = result["files_proposed_for_removal"]
+        result["bytes_removed"] = bytes_proposed
+        audit = paths.root / "cleanup" / "cleanup_record.json"
+        _inside(paths.root, audit)
+        _atomic_write_text(audit, json.dumps(result, indent=2, sort_keys=True))
+    return result
 
 
-def migrate_legacy_run(run_id: str, campaign_id: str, *, runs_dir: Path = Path("runs"), campaigns_root: Path = CAMPAIGNS_ROOT, apply: bool = False) -> CampaignPaths:
-    """Copy a legacy run into isolated primary evidence; source evidence is untouched."""
+def cleanup_all_campaigns(*, campaigns_root: Path = CAMPAIGNS_ROOT, apply: bool = False) -> Dict[str, Any]:
+    """Process eligible campaigns and report, rather than aborting on, unsafe ones."""
+    results: List[Dict[str, Any]] = []
+    if campaigns_root.exists():
+        for root in sorted(item for item in campaigns_root.iterdir() if item.is_dir() and not item.is_symlink()):
+            try:
+                paths = resolve_paths(root.name, campaigns_root=campaigns_root)
+                preview = cleanup_campaign(paths, apply=False)
+                results.append(cleanup_campaign(paths, apply=True) if apply and preview["eligible"] else preview)
+            except CampaignError as exc:
+                results.append({"campaign_id": root.name, "eligible": False, "applied": False,
+                                "blockers": [str(exc)], "errors": [str(exc)]})
+    return {"dry_run": not apply, "applied": bool(apply), "campaigns": results,
+            "eligible_count": sum(bool(item.get("eligible")) for item in results),
+            "processed_count": sum(bool(item.get("applied")) for item in results),
+            "policy_version": CLEANUP_POLICY_VERSION}
+
+
+def _legacy_source_files(source: Path) -> List[Path]:
+    if source.is_symlink():
+        raise CampaignError("legacy source may not be a symlink")
+    files: List[Path] = []
+    for item in sorted(source.rglob("*")):
+        if item.is_symlink():
+            raise CampaignError(f"legacy source contains unsupported symlink: {item}")
+        if item.is_file():
+            resolved = item.resolve()
+            if not resolved.is_relative_to(source.resolve()):
+                raise CampaignError(f"legacy source file escapes source root: {item}")
+            files.append(item)
+    return files
+
+
+def _legacy_rows(path: Path) -> List[Dict[str, Any]]:
+    try:
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise CampaignError(f"malformed legacy raw evidence: {exc}") from exc
+    if not rows or not all(isinstance(row, dict) for row in rows):
+        raise CampaignError("malformed legacy raw evidence: expected JSON object rows")
+    return rows
+
+
+def migrate_legacy_run(run_id: str, campaign_id: str, *, runs_dir: Path = Path("runs"), campaigns_root: Path = CAMPAIGNS_ROOT, apply: bool = False) -> Dict[str, Any]:
+    """Plan or perform a copy-only legacy import with forensic provenance."""
+    validate_campaign_id(run_id)
     source = legacy_run_dir(run_id, runs_dir=runs_dir)
+    runs_root = runs_dir.resolve()
+    if not source.resolve().is_relative_to(runs_root):
+        raise CampaignError("legacy source escapes runs root")
     if not is_legacy_run_dir(source):
         raise CampaignError(f"legacy source is not a readable run: {source}")
+    files = _legacy_source_files(source)
+    rows = _legacy_rows(source / "raw_results.jsonl")
+    source_checksums = {file.relative_to(source).as_posix(): {"sha256": _sha256(file), "size": file.stat().st_size} for file in files}
     paths = resolve_paths(campaign_id, campaigns_root=campaigns_root)
     if paths.root.exists() and any(paths.root.iterdir()):
         raise CampaignError(f"campaign migration target already exists: {paths.root}")
+    recovery_names = {"repair_plan.json", "repair_result.json", "repair_results.jsonl", "repair_attempts.jsonl"}
+    judge_names = {"judge_selection.json", "judge_results.jsonl", "judge_summary.json"}
+    report_names = {"report.html", "scorecard.md", "scorecard.csv", "routing.md", "prune.md", "clones.md", "regression.md", "summary.json"}
+    sidecars = {file.relative_to(source).as_posix():
+                ("recovery" if file.name in recovery_names else "judge" if file.name in judge_names else "reports" if file.name in report_names else "primary")
+                for file in files}
+    unavailable = ["original_model_digest", "original_task_hash", "historical_capability_probe"]
+    result: Dict[str, Any] = {
+        "source_run_id": run_id, "source_path": str(source.resolve()),
+        "destination_campaign_id": campaign_id, "destination_path": str(paths.root),
+        "dry_run": not apply, "applied": False,
+        "files_to_copy": sorted(source_checksums), "files_copied": [],
+        "source_checksums": source_checksums, "sidecars_detected": sidecars,
+        "sidecars_mapped": {}, "unavailable_historical_fields": unavailable,
+        "source_immutability_verified": False, "destination_valid": False,
+        "policy_version": MIGRATION_POLICY_VERSION, "errors": [], "warnings": [],
+    }
     if not apply:
-        return paths
-    paths, manifest = create_campaign(campaign_id, models=[], version="legacy-migration", campaigns_root=campaigns_root)
-    shutil.copytree(source, paths.primary_dir, dirs_exist_ok=True)
-    manifest.notes["legacy_source"] = str(source)
-    write_manifest(paths, manifest)
-    return paths
+        return result
+    created = False
+    try:
+        paths, manifest = create_campaign(campaign_id, models=sorted({str(row.get("model") or "legacy_model_unavailable") for row in rows}),
+                                          version="legacy-migration", campaigns_root=campaigns_root)
+        created = True
+        for file in files:
+            relative = file.relative_to(source)
+            lane = sidecars[relative.as_posix()]
+            if lane == "recovery":
+                target = paths.recovery_dir / ("recovery_" + file.name.removeprefix("repair_"))
+            elif lane == "judge":
+                target = paths.judge_dir / file.name
+            elif lane == "reports":
+                target = paths.reports_dir / file.name
+            else:
+                target = paths.primary_dir / relative
+            _inside(paths.root, target)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(file, target)
+            result["files_copied"].append(relative.as_posix())
+            result["sidecars_mapped"][relative.as_posix()] = target.relative_to(paths.root).as_posix()
+        if not paths.primary_run_validity.exists():
+            _atomic_write_text(paths.primary_run_validity, json.dumps({"status": "valid", "source": "legacy_import", "historical_value": "historical_value_unavailable"}, indent=2))
+        models = sorted({str(row.get("model") or "legacy_model_unavailable") for row in rows})
+        identities = {model: {"digest": "legacy_digest_unavailable", "source": "historical_value_unavailable"} for model in models}
+        _atomic_write_text(paths.primary_dir / "model_identities.json", json.dumps(identities, indent=2, sort_keys=True))
+        tasks = sorted({str(row.get("task") or "legacy_task_unavailable") for row in rows})
+        plan = {"campaign_id": campaign_id, "legacy_source_run_id": run_id, "generation_judge_mode": "historical_value_unavailable",
+                "task_hashes": {task: "legacy_task_hash_unavailable" for task in tasks}, "models": models,
+                "historical_fields": {name: "historical_value_unavailable" for name in unavailable}}
+        _atomic_write_text(paths.plan_json, json.dumps(plan, indent=2, sort_keys=True))
+        _atomic_write_text(paths.inventory_json, json.dumps([{"name": model, "digest": "legacy_digest_unavailable"} for model in models], indent=2, sort_keys=True))
+        _atomic_write_text(paths.capabilities_json, json.dumps({model: {"state": "historical_value_unavailable"} for model in models}, indent=2, sort_keys=True))
+        effective: List[Dict[str, Any]] = []
+        candidate: List[Dict[str, Any]] = []
+        for index, row in enumerate(rows):
+            visible = row.get("score") is not None
+            disposition = "scored" if visible else "terminal_model_failure"
+            effective.append({"model": row.get("model"), "model_digest_resolved": "legacy_digest_unavailable", "task": row.get("task"),
+                              "task_hash": "legacy_task_hash_unavailable", "primary_row_index": index,
+                              "primary_row_hash": hashlib.sha256(json.dumps(row, sort_keys=True, default=str).encode()).hexdigest(),
+                              "effective_score": row.get("score"), "effective_reason": row.get("reason"),
+                              "result_origin": "primary", "terminal_disposition": disposition})
+            imported = dict(row); imported.update({"run_id": row.get("run_id") or run_id, "campaign_id": campaign_id,
+                                                  "ranking_scope": "separate", "model_digest_resolved": "legacy_digest_unavailable",
+                                                  "task_hash": "legacy_task_hash_unavailable", "terminal_disposition": disposition})
+            candidate.append(imported)
+        _atomic_write_text(paths.effective_rows, "".join(json.dumps(row, sort_keys=True) + "\n" for row in effective))
+        _atomic_write_text(paths.candidate_rankings_dir / "master_raw.jsonl", "".join(json.dumps(row, sort_keys=True) + "\n" for row in candidate))
+        _atomic_write_text(paths.candidate_rankings_dir / "master_summary.json", json.dumps({"source": "legacy_import", "rows": len(candidate)}, indent=2))
+        readiness = {"campaign_id": campaign_id, "readiness": "diagnostic_only", "rows": len(rows), "terminal_rows": len(effective),
+                     "blockers": ["historical_identity_or_task_hash_unavailable"], "historical_limitations": unavailable}
+        _atomic_write_text(paths.readiness_json, json.dumps(readiness, indent=2, sort_keys=True))
+        _atomic_write_text(paths.reports_dir / "readiness.json", json.dumps(readiness, indent=2, sort_keys=True))
+        _atomic_write_text(paths.reports_dir / "readiness.md", "# Legacy campaign readiness\n\n- readiness: diagnostic_only\n- historical identities/task hashes: unavailable\n")
+        after = {file.relative_to(source).as_posix(): {"sha256": _sha256(file), "size": file.stat().st_size} for file in _legacy_source_files(source)}
+        if after != source_checksums:
+            raise CampaignError("legacy source changed during migration")
+        result["source_immutability_verified"] = True
+        provenance = {"migration_id": f"legacy-{campaign_id}", "migrated_at": datetime.now(timezone.utc).isoformat(),
+                      "source_run_id": run_id, "source_path": str(source.resolve()), "source_checksums": source_checksums,
+                      "destination_campaign_id": campaign_id, "detected_source_layout_version": "legacy-run-v1",
+                      "imported_files": result["files_copied"], "skipped_files": [], "unavailable_historical_fields": unavailable,
+                      "inferred_fields": {"models_and_tasks": "read from raw_results.jsonl"}, "original_run_version": "historical_value_unavailable",
+                      "original_model_identities": identities, "task_ids_and_hashes": plan["task_hashes"],
+                      "sidecar_mappings": result["sidecars_mapped"], "migration_policy_version": MIGRATION_POLICY_VERSION,
+                      "source_immutability_verified": True}
+        _atomic_write_text(paths.plan_dir / "migration_provenance.json", json.dumps(provenance, indent=2, sort_keys=True))
+        manifest.notes.update({"legacy_source": str(source), "migration_provenance": "plan/migration_provenance.json"})
+        write_manifest(paths, manifest)
+        for state in ("planned", "generating", "packaged", "archived_diagnostic"):
+            manifest = transition(paths, manifest, state)
+        package_campaign(paths)
+        result["destination_valid"] = bool(verify_package_details(paths)["valid"])
+        if not result["destination_valid"]:
+            raise CampaignError("migrated campaign package did not verify")
+        result["applied"] = True
+        result["dry_run"] = False
+        return result
+    except BaseException:
+        if created and paths.root.exists():
+            # The destination was created by this invocation and never became a
+            # successfully returned migration.  Source evidence is untouched.
+            shutil.rmtree(paths.root)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -806,6 +1065,8 @@ def migrate_legacy_run(run_id: str, campaign_id: str, *, runs_dir: Path = Path("
 # ---------------------------------------------------------------------------
 
 RECOVERY_POLICY_VERSION = "rc19.2.1"
+CLEANUP_POLICY_VERSION = "rc20-retention-1"
+MIGRATION_POLICY_VERSION = "rc20-legacy-copy-1"
 TERMINAL_DISPOSITIONS = {
     "scored", "judged", "confirmed_capability_unavailable",
     "capability_measured_failure", "environment_limited", "operator_excluded",

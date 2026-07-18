@@ -415,8 +415,12 @@ def test_campaign_package_and_conservative_cleanup(tmp_path):
         manifest = campaign.transition(paths, manifest, state)
     package = campaign.package_campaign(paths)
     assert package.exists() and campaign.verify_package(paths)
-    assert campaign.cleanup_campaign(paths) == [paths.primary_dumps_dir]
-    campaign.cleanup_campaign(paths, apply=True)
+    preview = campaign.cleanup_campaign(paths)
+    assert preview["eligible"] is True
+    assert preview["dry_run"] is True
+    assert preview["targets_proposed_for_removal"] == ["evidence/primary/dumps"]
+    applied = campaign.cleanup_campaign(paths, apply=True)
+    assert applied["applied"] is True
     assert not paths.primary_dumps_dir.exists()
     assert paths.primary_raw_results.exists()
 
@@ -425,7 +429,9 @@ def test_legacy_migration_is_copy_only(tmp_path):
     source = tmp_path / "runs" / "old"
     source.mkdir(parents=True)
     (source / "raw_results.jsonl").write_text('{"score": 1}\n')
-    paths = campaign.migrate_legacy_run("old", "migrated", runs_dir=tmp_path / "runs", campaigns_root=tmp_path / "campaigns", apply=True)
+    result = campaign.migrate_legacy_run("old", "migrated", runs_dir=tmp_path / "runs", campaigns_root=tmp_path / "campaigns", apply=True)
+    paths = campaign.resolve_paths("migrated", campaigns_root=tmp_path / "campaigns")
+    assert result["applied"] is True
     assert (paths.primary_dir / "raw_results.jsonl").read_text() == (source / "raw_results.jsonl").read_text()
     assert source.exists()
 
