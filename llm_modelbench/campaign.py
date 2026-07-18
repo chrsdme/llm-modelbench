@@ -16,12 +16,14 @@ import json
 import os
 import re
 import tempfile
+import socket
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 CAMPAIGNS_ROOT = Path("campaigns")
+MANIFEST_SCHEMA_VERSION = 1
 
 _CAMPAIGN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _RESUMABLE_STATES = ("generating", "recovering", "judging")
@@ -33,6 +35,15 @@ class CampaignError(RuntimeError):
     These errors are never silently swallowed. Callers must decide whether
     the campaign should stop, be resumed, or be classified as failed.
     """
+
+
+def _inside(root: Path, candidate: Path) -> Path:
+    """Return *candidate* only when it cannot escape the campaign root."""
+    root_resolved = root.resolve()
+    candidate_resolved = candidate.resolve()
+    if not candidate_resolved.is_relative_to(root_resolved):
+        raise CampaignError(f"campaign-managed path escapes campaign root: {candidate}")
+    return candidate
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +174,13 @@ class CampaignPaths:
     campaign_log: Path
 
     packages_dir: Path
+    checksums_dir: Path
+    checksums_json: Path
+    readiness_dir: Path
+    readiness_json: Path
+    adoption_dir: Path
+    adoption_record: Path
+    lock_file: Path
 
 
 def campaign_root(
@@ -189,8 +207,11 @@ def resolve_paths(
     reports_dir = root / "reports"
     logs_dir = root / "logs"
     packages_dir = root / "packages"
+    checksums_dir = root / "checksums"
+    readiness_dir = root / "readiness"
+    adoption_dir = root / "adoption"
 
-    return CampaignPaths(
+    paths = CampaignPaths(
         campaign_id=campaign_id,
         root=root,
         manifest=root / "manifest.json",
@@ -218,7 +239,18 @@ def resolve_paths(
         logs_dir=logs_dir,
         campaign_log=logs_dir / "campaign.log",
         packages_dir=packages_dir,
+        checksums_dir=checksums_dir,
+        checksums_json=checksums_dir / "sha256.json",
+        readiness_dir=readiness_dir,
+        readiness_json=readiness_dir / "summary.json",
+        adoption_dir=adoption_dir,
+        adoption_record=adoption_dir / "adoption.json",
+        lock_file=root / ".campaign.lock",
     )
+    for value in paths.__dict__.values():
+        if isinstance(value, Path):
+            _inside(root, value)
+    return paths
 
 
 def create_campaign_dirs(paths: CampaignPaths) -> None:
@@ -238,6 +270,9 @@ def create_campaign_dirs(paths: CampaignPaths) -> None:
         paths.model_cards_dir,
         paths.logs_dir,
         paths.packages_dir,
+        paths.checksums_dir,
+        paths.readiness_dir,
+        paths.adoption_dir,
     ):
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -262,6 +297,24 @@ def legacy_run_dir(
     return runs_dir / run_id
 
 
+def owning_campaign_path(path: Path, *, campaigns_root: Path = CAMPAIGNS_ROOT) -> Optional[CampaignPaths]:
+    """Resolve a nested campaign path to its owner, refusing malformed roots."""
+    target = path.resolve()
+    root = campaigns_root.resolve()
+    if not target.is_relative_to(root):
+        return None
+    relative = target.relative_to(root)
+    if not relative.parts:
+        return None
+    campaign_id = relative.parts[0]
+    paths = resolve_paths(campaign_id, campaigns_root=campaigns_root)
+    if not paths.root.exists() or not paths.manifest.exists():
+        return None
+    _inside(paths.root, target)
+    load_manifest(paths)
+    return paths
+
+
 # ---------------------------------------------------------------------------
 # Manifest
 # ---------------------------------------------------------------------------
@@ -271,6 +324,7 @@ class CampaignManifest:
     campaign_id: str
     created_at: str
     version: str
+    schema_version: int = MANIFEST_SCHEMA_VERSION
     models: List[str] = field(default_factory=list)
     level: str = "full"
     judge_model: Optional[str] = None
@@ -346,13 +400,22 @@ def load_manifest(paths: CampaignPaths) -> CampaignManifest:
         )
     try:
         data = json.loads(paths.manifest.read_text(encoding="utf-8"))
-        manifest = CampaignManifest(**data)
+        if not isinstance(data, dict):
+            raise TypeError("manifest must be a JSON object")
+        known = set(CampaignManifest.__dataclass_fields__)
+        manifest = CampaignManifest(**{key: value for key, value in data.items() if key in known})
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise CampaignError(
             f"invalid campaign manifest at {paths.manifest}: {exc}"
         ) from exc
 
     validate_campaign_id(manifest.campaign_id)
+    if not isinstance(manifest.schema_version, int) or manifest.schema_version < 1:
+        raise CampaignError("manifest contains an invalid schema_version")
+    if not isinstance(manifest.models, list) or not all(isinstance(model, str) for model in manifest.models):
+        raise CampaignError("manifest models must be a list of strings")
+    if not isinstance(manifest.state_history, list) or not all(isinstance(item, dict) for item in manifest.state_history):
+        raise CampaignError("manifest state_history must be a list of objects")
     if manifest.campaign_id != paths.campaign_id:
         raise CampaignError(
             f"manifest campaign id {manifest.campaign_id!r} does not match "
@@ -373,6 +436,70 @@ def load_manifest(paths: CampaignPaths) -> CampaignManifest:
             f"{manifest.resume_state!r}"
         )
     return manifest
+
+
+# ---------------------------------------------------------------------------
+# Campaign lock
+# ---------------------------------------------------------------------------
+
+def _pid_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def read_lock(paths: CampaignPaths) -> Optional[Dict[str, Any]]:
+    if not paths.lock_file.exists():
+        return None
+    try:
+        value = json.loads(paths.lock_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise CampaignError(f"invalid campaign lock at {paths.lock_file}: {exc}") from exc
+    if not isinstance(value, dict) or not isinstance(value.get("pid"), int) or not isinstance(value.get("hostname"), str):
+        raise CampaignError(f"invalid campaign lock at {paths.lock_file}")
+    return value
+
+
+def lock_is_stale(lock: Dict[str, Any]) -> bool:
+    """Prove stale only for a dead PID on this host; remote locks stay active."""
+    return lock.get("hostname") == socket.gethostname() and not _pid_is_running(lock["pid"])
+
+
+def acquire_lock(paths: CampaignPaths, *, operation: str, phase: str = "") -> Dict[str, Any]:
+    """Atomically acquire a lock without deleting an active or ambiguous lock."""
+    existing = read_lock(paths)
+    if existing is not None:
+        if not lock_is_stale(existing):
+            raise CampaignError(f"campaign is locked by pid {existing['pid']} on {existing['hostname']}")
+        # A same-host dead PID is proof enough to replace a stale task lock.
+        paths.lock_file.unlink()
+    record = {
+        "pid": os.getpid(), "hostname": socket.gethostname(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "operation": operation, "phase": phase,
+    }
+    try:
+        fd = os.open(paths.lock_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as exc:
+        raise CampaignError("campaign lock was acquired concurrently") from exc
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(record, handle, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return record
+
+
+def release_lock(paths: CampaignPaths, lock: Dict[str, Any]) -> None:
+    current = read_lock(paths)
+    if current is None:
+        return
+    if current != lock:
+        raise CampaignError("refusing to release a lock owned by another operation")
+    paths.lock_file.unlink()
 
 
 def transition(

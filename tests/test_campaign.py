@@ -354,3 +354,40 @@ def test_is_legacy_run_dir_detects_pre_campaign_runs(tmp_path):
     (new_style / "raw_results.jsonl").write_text("{}\n")
     (new_style / "manifest.json").write_text("{}\n")
     assert campaign.is_legacy_run_dir(new_style) is False
+
+
+def test_manifest_schema_is_forward_compatible_but_structural_errors_fail(tmp_path):
+    paths, _ = campaign.create_campaign("schema", models=["x"], campaigns_root=tmp_path / "campaigns")
+    data = json.loads(paths.manifest.read_text())
+    data["future_optional_field"] = {"safe": True}
+    paths.manifest.write_text(json.dumps(data))
+    assert campaign.load_manifest(paths).schema_version == campaign.MANIFEST_SCHEMA_VERSION
+    data["models"] = "not-a-list"
+    paths.manifest.write_text(json.dumps(data))
+    with pytest.raises(campaign.CampaignError, match="models"):
+        campaign.load_manifest(paths)
+
+
+def test_owning_campaign_path_resolves_nested_evidence_and_ignores_legacy(tmp_path):
+    root = tmp_path / "campaigns"
+    paths, _ = campaign.create_campaign("owner", models=["x"], campaigns_root=root)
+    assert campaign.owning_campaign_path(paths.recovery_children_dir / "child" / "raw_results.jsonl", campaigns_root=root).campaign_id == "owner"
+    assert campaign.owning_campaign_path(tmp_path / "runs" / "old" / "raw_results.jsonl", campaigns_root=root) is None
+
+
+def test_campaign_lock_refuses_active_and_replaces_proven_stale(tmp_path, monkeypatch):
+    paths, _ = campaign.create_campaign("locked", models=["x"], campaigns_root=tmp_path / "campaigns")
+    held = campaign.acquire_lock(paths, operation="test", phase="plan")
+    with pytest.raises(campaign.CampaignError, match="locked"):
+        campaign.acquire_lock(paths, operation="other")
+    campaign.release_lock(paths, held)
+    paths.lock_file.write_text(json.dumps({"pid": 999999999, "hostname": campaign.socket.gethostname()}))
+    fresh = campaign.acquire_lock(paths, operation="replacement")
+    campaign.release_lock(paths, fresh)
+
+
+def test_remote_or_malformed_lock_is_not_deleted_automatically(tmp_path):
+    paths, _ = campaign.create_campaign("remote_lock", models=["x"], campaigns_root=tmp_path / "campaigns")
+    paths.lock_file.write_text(json.dumps({"pid": 1, "hostname": "other-host"}))
+    with pytest.raises(campaign.CampaignError, match="locked"):
+        campaign.acquire_lock(paths, operation="test")
