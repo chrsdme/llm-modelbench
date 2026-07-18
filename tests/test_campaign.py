@@ -8,6 +8,19 @@ import pytest
 from llm_modelbench import campaign
 
 
+def _complete_package_fixture(paths):
+    paths.plan_json.write_text(json.dumps({"task_hashes": {"exact": "h"}}))
+    paths.inventory_json.write_text(json.dumps([{"name": "x", "digest": "d"}]))
+    paths.capabilities_json.write_text(json.dumps({"x": {"supported_families": ["text"]}}))
+    paths.primary_run_validity.write_text(json.dumps({"status": "valid"}))
+    (paths.primary_dir / "model_identities.json").write_text(json.dumps({"x": {"digest": "d"}}))
+    paths.effective_rows.write_text(json.dumps({"model": "x", "task": "exact", "task_hash": "h", "terminal_disposition": "scored"}) + "\n")
+    paths.reports_dir.joinpath("readiness.json").write_text(json.dumps({"readiness": "ready_for_adoption"}))
+    paths.reports_dir.joinpath("readiness.md").write_text("# Ready\n")
+    paths.candidate_rankings_dir.joinpath("master_raw.jsonl").write_text(json.dumps({"model": "x", "task": "exact", "score": 100}) + "\n")
+    paths.candidate_rankings_dir.joinpath("master_summary.json").write_text("[]\n")
+
+
 def test_create_campaign_builds_full_directory_tree(tmp_path):
     campaigns_root = tmp_path / "campaigns"
     paths, manifest = campaign.create_campaign(
@@ -397,6 +410,7 @@ def test_campaign_package_and_conservative_cleanup(tmp_path):
     paths, manifest = campaign.create_campaign("package", models=["x"], campaigns_root=tmp_path / "campaigns")
     paths.primary_raw_results.write_text('{"score": 1}\n')
     (paths.primary_dumps_dir / "x.txt").write_text("raw")
+    _complete_package_fixture(paths)
     for state in ("planned", "generating", "packaged", "rejected"):
         manifest = campaign.transition(paths, manifest, state)
     package = campaign.package_campaign(paths)
@@ -451,14 +465,15 @@ def test_judge_selection_excludes_cohort_and_prefers_calibrated_other_family():
 def test_campaign_adoption_dry_run_and_transactional_temp_canonical(tmp_path):
     paths, manifest = campaign.create_campaign("adopt", models=["x"], campaigns_root=tmp_path / "campaigns")
     paths.primary_raw_results.write_text('{"model": "x", "task": "exact", "score": 100}\n')
+    _complete_package_fixture(paths)
     for state in ("planned", "generating", "packaged"):
         manifest = campaign.transition(paths, manifest, state)
-    campaign.package_campaign(paths)
     campaign.write_readiness(paths, [{"score": 100}])
     paths.candidate_rankings_dir.mkdir(parents=True, exist_ok=True)
     paths.candidate_rankings_dir.joinpath("master_raw.jsonl").write_text(json.dumps({
         "run_id": "primary", "_source_signature": "sig", "model": "x", "task": "exact", "score": 100,
     }) + "\n")
+    campaign.package_campaign(paths)
     canonical = tmp_path / "rankings"
     assert campaign.adopt_campaign(paths, rankings_dir=canonical, dry_run=True)["rows_added_or_updated"] == 1
     campaign.adopt_campaign(paths, rankings_dir=canonical, dry_run=False)

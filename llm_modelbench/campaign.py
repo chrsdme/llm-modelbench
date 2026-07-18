@@ -636,41 +636,125 @@ def package_campaign(paths: CampaignPaths, *, allow_active_lock: bool = False) -
     if read_lock(paths) is not None and not allow_active_lock:
         raise CampaignError("refusing to package an actively locked campaign")
     package = paths.packages_dir / f"{paths.campaign_id}-review.zip"
-    inventory: Dict[str, str] = {}
+    fd, temp_name = tempfile.mkstemp(prefix=f".{paths.campaign_id}-", suffix=".zip.tmp", dir=paths.packages_dir)
+    os.close(fd)
+    temp_package = Path(temp_name)
+    inventory: List[Dict[str, Any]] = []
     duplicate_primary_reports = {"report.html", "scorecard.md", "scorecard.csv", "routing.md", "prune.md", "clones.md", "regression.md", "summary.json"}
-    with zipfile.ZipFile(package, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    try:
+        payloads: List[tuple[Path, str]] = []
         for source in sorted(paths.root.rglob("*")):
-            if not source.is_file() or source == package or paths.packages_dir in source.parents or source == paths.lock_file:
+            if not source.is_file() or source in {package, temp_package, paths.lock_file} or paths.packages_dir in source.parents or paths.checksums_dir in source.parents or paths.readiness_dir in source.parents:
                 continue
             if source.parent == paths.primary_dir and source.name in duplicate_primary_reports:
                 continue
             relative = source.relative_to(paths.root).as_posix()
-            archive.write(source, relative)
-            inventory[relative] = _sha256(source)
-        archive.writestr("package/sha256.json", json.dumps({"files": inventory}, indent=2, sort_keys=True))
-    _atomic_write_text(paths.checksums_json, json.dumps({"files": inventory, "package": _sha256(package)}, indent=2, sort_keys=True))
+            payloads.append((source, relative))
+            inventory.append({"path": relative, "sha256": _sha256(source), "size": source.stat().st_size, "role": relative.split('/', 1)[0]})
+        inventory_bytes = json.dumps({"campaign_id": paths.campaign_id, "files": inventory}, indent=2, sort_keys=True).encode()
+        checksums = [*inventory, {"path": "package/inventory.json", "sha256": hashlib.sha256(inventory_bytes).hexdigest(), "size": len(inventory_bytes), "role": "package"}]
+        with zipfile.ZipFile(temp_package, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for source, relative in payloads:
+                archive.write(source, relative)
+            archive.writestr("package/inventory.json", inventory_bytes)
+            archive.writestr("package/sha256.json", json.dumps({"files": checksums}, indent=2, sort_keys=True))
+        os.replace(temp_package, package)
+    except BaseException:
+        temp_package.unlink(missing_ok=True)
+        raise
+    _atomic_write_text(paths.checksums_json, json.dumps({"package": _sha256(package), "size": package.stat().st_size,
+        "source_files": {entry["path"]: {"sha256": entry["sha256"], "size": entry["size"]} for entry in inventory}}, indent=2, sort_keys=True))
     return package
 
 
-def verify_package(paths: CampaignPaths) -> bool:
-    if not paths.checksums_json.exists():
-        return False
-    data = json.loads(paths.checksums_json.read_text(encoding="utf-8"))
+def verify_package_details(paths: CampaignPaths) -> Dict[str, Any]:
     package = paths.packages_dir / f"{paths.campaign_id}-review.zip"
-    if not (package.exists() and data.get("package") == _sha256(package) and zipfile.is_zipfile(package)):
-        return False
+    result: Dict[str, Any] = {"campaign_id": paths.campaign_id, "package_path": str(package), "package_digest": None,
+        "verified_at": datetime.now(timezone.utc).isoformat(), "valid": False, "file_count": 0,
+        "verified_checksum_count": 0, "required_files_valid": False, "recovery_references_valid": False,
+        "judge_references_valid": False, "terminal_ledger_valid": False, "candidate_rankings_valid": False,
+        "unexpected_file_count": 0, "errors": [], "warnings": []}
+    if not paths.checksums_json.exists():
+        result["errors"].append("missing external package checksum"); return result
+    try:
+        data = json.loads(paths.checksums_json.read_text(encoding="utf-8"))
+    except Exception:
+        result["errors"].append("invalid external package checksum"); return result
+    if not package.exists() or not zipfile.is_zipfile(package):
+        result["errors"].append("missing or invalid zip package"); return result
+    result["package_digest"] = _sha256(package)
+    if data.get("package") != result["package_digest"] or data.get("size") != package.stat().st_size:
+        result["errors"].append("stale package digest or size"); return result
+    for relative, expected in (data.get("source_files") or {}).items():
+        source = paths.root / relative
+        if not source.is_file() or source.stat().st_size != expected.get("size") or _sha256(source) != expected.get("sha256"):
+            result["errors"].append(f"stale source evidence: {relative}")
     with zipfile.ZipFile(package) as archive:
+        infos = archive.infolist(); names = [info.filename for info in infos]
+        if len(names) != len(set(names)):
+            result["errors"].append("duplicate archive member")
+        for info in infos:
+            pure = Path(info.filename)
+            if pure.is_absolute() or ".." in pure.parts:
+                result["errors"].append(f"unsafe archive path: {info.filename}")
+            if ((info.external_attr >> 16) & 0o170000) == 0o120000:
+                result["errors"].append(f"unsupported symlink: {info.filename}")
+        if result["errors"]:
+            return result
+        with tempfile.TemporaryDirectory(prefix="llmb-package-verify-", dir="/tmp") as extraction:
+            archive.extractall(extraction)
         try:
-            internal = json.loads(archive.read("package/sha256.json"))
+            internal = json.loads(archive.read("package/sha256.json")); inv = json.loads(archive.read("package/inventory.json"))
         except (KeyError, ValueError):
-            return False
-        names = set(archive.namelist())
-        if set(internal.get("files", {})) != names - {"package/sha256.json"}:
-            return False
-        for name, digest in internal["files"].items():
-            if hashlib.sha256(archive.read(name)).hexdigest() != digest:
-                return False
-    return True
+            result["errors"].append("missing or malformed internal metadata"); return result
+        entries = internal.get("files")
+        if not isinstance(entries, list) or not all(isinstance(x, dict) for x in entries):
+            result["errors"].append("invalid internal checksum format"); return result
+        listed = {x.get("path") for x in entries}
+        unexpected = set(names) - listed - {"package/sha256.json"}
+        result["unexpected_file_count"] = len(unexpected)
+        if unexpected: result["errors"].append(f"unexpected unlisted files: {sorted(unexpected)}")
+        for entry in entries:
+            name = entry.get("path")
+            if name not in names: result["errors"].append(f"missing listed file: {name}"); continue
+            content = archive.read(name)
+            if len(content) != entry.get("size"): result["errors"].append(f"size mismatch: {name}")
+            if hashlib.sha256(content).hexdigest() != entry.get("sha256"): result["errors"].append(f"checksum mismatch: {name}")
+            else: result["verified_checksum_count"] += 1
+        required = {"manifest.json","plan/plan.json","plan/inventory.json","plan/capabilities.json","evidence/primary/raw_results.jsonl","evidence/primary/run_validity.json","evidence/primary/model_identities.json","evidence/effective_rows.jsonl","reports/readiness.json","reports/readiness.md","rankings/candidate/master_raw.jsonl","rankings/candidate/master_summary.json","package/inventory.json","package/sha256.json"}
+        missing = required - set(names)
+        if missing: result["errors"].append(f"missing required files: {sorted(missing)}")
+        result["required_files_valid"] = not missing
+        result["terminal_ledger_valid"] = "evidence/effective_rows.jsonl" in names
+        result["candidate_rankings_valid"] = {"rankings/candidate/master_raw.jsonl","rankings/candidate/master_summary.json"} <= set(names)
+        result["recovery_references_valid"] = True
+        result["judge_references_valid"] = True
+        if "evidence/effective_rows.jsonl" in names:
+            try:
+                effective = [json.loads(line) for line in archive.read("evidence/effective_rows.jsonl").decode().splitlines() if line]
+            except Exception:
+                effective = []; result["errors"].append("invalid effective terminal ledger")
+            recovered = [row for row in effective if row.get("result_origin") == "recovered" or row.get("recovery_attempt_number")]
+            judged = [row for row in effective if row.get("result_origin") == "judged" or row.get("judge_row_hash")]
+            if recovered:
+                needed = {"evidence/recovery/recovery_plan.json","evidence/recovery/recovery_result.json","evidence/recovery/recovery_attempts.jsonl"}
+                if not needed <= set(names):
+                    result["recovery_references_valid"] = False; result["errors"].append("missing referenced recovery evidence")
+                for row in recovered:
+                    child = row.get("recovery_child_id")
+                    if child and f"evidence/recovery/children/{child}/attempt.json" not in names:
+                        result["recovery_references_valid"] = False; result["errors"].append(f"missing referenced recovery child: {child}")
+            if judged:
+                needed = {"evidence/judge/judge_selection.json","evidence/judge/judge_results.jsonl","evidence/judge/judge_summary.json"}
+                if not needed <= set(names):
+                    result["judge_references_valid"] = False; result["errors"].append("missing referenced judge evidence")
+        result["file_count"] = len(names)
+    result["valid"] = not result["errors"]
+    return result
+
+
+def verify_package(paths: CampaignPaths) -> bool:
+    return bool(verify_package_details(paths)["valid"])
 
 
 def cleanup_campaign(paths: CampaignPaths, *, apply: bool = False) -> List[Path]:
