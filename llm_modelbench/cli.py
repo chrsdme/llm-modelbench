@@ -547,26 +547,15 @@ def cmd_campaign(args, cfg):
             retry_rows = [row for row in rows if campaign.classify_recovery_row(row)["retry"]]
             if retry_rows:
                 # Execute the existing bounded repair engine against nested primary evidence.
-                from . import repair
                 manifest_now = campaign.load_manifest(paths)
-                campaign.transition(paths, manifest_now, "recovering")
-                plan = repair.build_plan(paths.evidence_dir, run_id="primary", think_retry_num_predict=int(args.num_predict or 2048), judge_mode="off")
-                campaign._atomic_write_text(paths.recovery_plan, json.dumps(plan.to_dict(), indent=2, sort_keys=True))
-                result = repair.apply_plan(client, cfg, plan, rankings_dir=paths.candidate_rankings_dir, ranking_scope="separate")
-                attempts = []
-                for action in result.get("actions", []):
-                    attempts.append({"campaign_id": paths.campaign_id, "action": action, "policy_version": campaign.RECOVERY_POLICY_VERSION})
-                campaign._atomic_write_text(paths.recovery_attempts, "".join(json.dumps(item, sort_keys=True) + "\n" for item in attempts))
-                campaign._atomic_write_text(paths.recovery_result, json.dumps(result, indent=2, sort_keys=True))
-                if campaign.load_manifest(paths).state != "packaged":
-                    campaign.transition(paths, campaign.load_manifest(paths), "packaged")
+                result = campaign.execute_recovery_phase(paths, client, cfg, budget=int(args.num_predict or 2048))
             # Primary generation is always judge-off. Subjective judging is post-hoc.
             from .tasks import TASKS
             subjective = {task.id for task in TASKS if task.scorer == "subjective"}
             eligible = [row for row in rows if row.get("task") in subjective and not row.get("error_kind")]
             if eligible:
                 manifest_now = campaign.load_manifest(paths)
-                if manifest_now.state == "generating":
+                if manifest_now.state in {"generating", "recovering"}:
                     campaign.transition(paths, manifest_now, "judging")
                 inventory = client.tags()
                 cohort = [{"name": row.get("model"), "digest": row.get("model_digest_resolved")} for row in rows]
@@ -584,7 +573,7 @@ def cmd_campaign(args, cfg):
                 else:
                     campaign._atomic_write_text(paths.judge_summary, json.dumps({"status": "awaiting_external_judge", "selection": selection}, indent=2, sort_keys=True))
                 campaign.transition(paths, campaign.load_manifest(paths), "packaged")
-            elif campaign.load_manifest(paths).state == "generating":
+            elif campaign.load_manifest(paths).state in {"generating", "recovering"}:
                 campaign.transition(paths, campaign.load_manifest(paths), "packaged")
             for row in rows:
                 row["disposition"] = campaign.classify_recovery_row(row)["disposition"]

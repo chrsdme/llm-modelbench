@@ -754,6 +754,35 @@ def classify_recovery_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return {"disposition": "harness_failure", "retry": False, "reason": "unscorable row without error classification"}
 
 
+def execute_recovery_phase(paths: CampaignPaths, client: Any, cfg: Any, *, budget: int = 2048,
+                           build_plan_fn: Any = None, apply_plan_fn: Any = None) -> Dict[str, Any]:
+    """Run bounded recovery while proving primary evidence remains immutable."""
+    from . import repair
+    build_plan_fn = build_plan_fn or repair.build_plan
+    apply_plan_fn = apply_plan_fn or repair.apply_plan
+    primary_before = paths.primary_raw_results.read_bytes()
+    manifest = load_manifest(paths)
+    if manifest.state == "generating":
+        transition(paths, manifest, "recovering")
+    elif manifest.state == "interrupted" and manifest.resume_state == "recovering":
+        transition(paths, manifest, "recovering")
+    elif manifest.state != "recovering":
+        raise CampaignError(f"recovery cannot start from {manifest.state!r}")
+    plan = build_plan_fn(paths.evidence_dir, run_id="primary", think_retry_num_predict=int(budget), judge_mode="off")
+    _atomic_write_text(paths.recovery_plan, json.dumps(plan.to_dict(), indent=2, sort_keys=True))
+    result = apply_plan_fn(client, cfg, plan, rankings_dir=paths.candidate_rankings_dir, ranking_scope="separate")
+    records = []
+    for index, action in enumerate(result.get("actions", []), 1):
+        records.append({"campaign_id": paths.campaign_id, "parent_run_id": "primary", "attempt_number": index,
+                        "action": action, "policy_version": RECOVERY_POLICY_VERSION,
+                        "stop_reason": action.get("reason") or action.get("status")})
+    _atomic_write_text(paths.recovery_attempts, "".join(json.dumps(item, sort_keys=True) + "\n" for item in records))
+    _atomic_write_text(paths.recovery_result, json.dumps(result, indent=2, sort_keys=True))
+    if paths.primary_raw_results.read_bytes() != primary_before:
+        raise CampaignError("recovery mutated immutable primary evidence")
+    return result
+
+
 def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_available: bool = True) -> Dict[str, Any]:
     effective = []
     for index, row in enumerate(rows):
