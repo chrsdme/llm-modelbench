@@ -414,3 +414,15 @@ def test_legacy_migration_is_copy_only(tmp_path):
     paths = campaign.migrate_legacy_run("old", "migrated", runs_dir=tmp_path / "runs", campaigns_root=tmp_path / "campaigns", apply=True)
     assert (paths.primary_dir / "raw_results.jsonl").read_text() == (source / "raw_results.jsonl").read_text()
     assert source.exists()
+
+
+def test_recovery_policy_never_retries_visible_zero_and_uses_progressive_budgets():
+    assert campaign.classify_recovery_row({"score": 0, "error_kind": None})["retry"] is False
+    assert campaign.classify_recovery_row({"error_kind": "thinking_only"})["disposition"] == "thinking_only_pending_retry"
+    assert [item["num_predict"] for item in campaign.recovery_profiles(2048, allow_extended=True)] == [2048, 4096, 8192]
+
+
+def test_readiness_requires_terminal_dispositions(tmp_path):
+    paths, _ = campaign.create_campaign("ready", models=["x"], campaigns_root=tmp_path / "campaigns")
+    assert campaign.write_readiness(paths, [{"score": 0}])["readiness"] == "ready_for_adoption"
+    assert campaign.write_readiness(paths, [{"error_kind": "empty_output"}])["readiness"] == "not_ready_manual_items"

@@ -664,3 +664,68 @@ def migrate_legacy_run(run_id: str, campaign_id: str, *, runs_dir: Path = Path("
     manifest.notes["legacy_source"] = str(source)
     write_manifest(paths, manifest)
     return paths
+
+
+# ---------------------------------------------------------------------------
+# Unattended methodology policy (RC19.2)
+# ---------------------------------------------------------------------------
+
+RECOVERY_POLICY_VERSION = "rc19.2.1"
+TERMINAL_DISPOSITIONS = {
+    "scored", "judged", "confirmed_capability_unavailable",
+    "capability_measured_failure", "environment_limited", "operator_excluded",
+    "terminal_model_failure", "harness_failure", "awaiting_external_judge",
+}
+
+
+def visible_answer(row: Dict[str, Any]) -> bool:
+    """A scored row, including score zero, is immutable evidence not a retry cue."""
+    return row.get("score") is not None and not row.get("error_kind")
+
+
+def recovery_profiles(default_budget: int, *, allow_extended: bool = False) -> List[Dict[str, Any]]:
+    budget = max(1, int(default_budget or 2048))
+    profiles = [
+        {"attempt": 1, "num_predict": budget, "think": "off"},
+        {"attempt": 2, "num_predict": max(budget * 2, 4096), "think": "off"},
+    ]
+    if allow_extended:
+        profiles.append({"attempt": 3, "num_predict": max(budget * 4, 8192), "think": "off"})
+    return profiles
+
+
+def classify_recovery_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Classify a primary cell without score fishing or host remediation."""
+    if visible_answer(row):
+        return {"disposition": "scored", "retry": False, "reason": "visible scorable answer"}
+    kind = str(row.get("error_kind") or "")
+    text = str(row.get("error") or row.get("reason") or "").lower()
+    if kind == "thinking_only":
+        return {"disposition": "thinking_only_pending_retry", "retry": True, "reason": kind}
+    if kind == "empty_output":
+        return {"disposition": "empty_output_pending_retry", "retry": True, "reason": kind}
+    if "timeout" in text or " 5" in text or "http" in text and "5" in text:
+        return {"disposition": "transient_retry_pending", "retry": True, "reason": "transient transport failure"}
+    if kind == "harness_error":
+        return {"disposition": "harness_failure", "retry": False, "reason": kind}
+    if kind:
+        return {"disposition": "terminal_model_failure", "retry": False, "reason": kind}
+    return {"disposition": "harness_failure", "retry": False, "reason": "unscorable row without error classification"}
+
+
+def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_available: bool = True) -> Dict[str, Any]:
+    dispositions = [str(row.get("disposition") or classify_recovery_row(row)["disposition"]) for row in rows]
+    pending = [item for item in dispositions if item not in TERMINAL_DISPOSITIONS]
+    if pending:
+        state = "not_ready_manual_items"
+    elif "harness_failure" in dispositions:
+        state = "not_ready_harness_failure"
+    elif "awaiting_external_judge" in dispositions or not judge_available:
+        state = "not_ready_external_judge"
+    else:
+        state = "ready_for_adoption"
+    summary = {"campaign_id": paths.campaign_id, "readiness": state, "rows": len(rows),
+               "terminal_rows": len(rows) - len(pending), "pending_dispositions": pending,
+               "policy_version": RECOVERY_POLICY_VERSION}
+    _atomic_write_text(paths.readiness_json, json.dumps(summary, indent=2, sort_keys=True))
+    return summary
