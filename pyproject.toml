@@ -39,3 +39,6 @@ llm_modelbench = ["rankings_template.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff.lint]
+ignore = ["E701", "E702", "E402"]

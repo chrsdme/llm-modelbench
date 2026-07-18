@@ -710,12 +710,16 @@ def verify_package_details(paths: CampaignPaths) -> Dict[str, Any]:
                 result["errors"].append(f"unsupported symlink: {info.filename}")
         if result["errors"]:
             return result
-        with tempfile.TemporaryDirectory(prefix="llmb-package-verify-", dir="/tmp") as extraction:
+        with tempfile.TemporaryDirectory(prefix="llmb-package-verify-") as extraction:
             archive.extractall(extraction)
         try:
-            internal = json.loads(archive.read("package/sha256.json")); inv = json.loads(archive.read("package/inventory.json"))
+            internal = json.loads(archive.read("package/sha256.json"))
+            inventory = json.loads(archive.read("package/inventory.json"))
         except (KeyError, ValueError):
             result["errors"].append("missing or malformed internal metadata"); return result
+        if not isinstance(inventory, dict):
+            result["errors"].append("invalid package inventory format")
+            return result
         entries = internal.get("files")
         if not isinstance(entries, list) or not all(isinstance(x, dict) for x in entries):
             result["errors"].append("invalid internal checksum format"); return result

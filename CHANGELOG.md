@@ -2,11 +2,28 @@
 
 ## 1.0.0rc20
 
-### RC20 acceptance
+### RC20 remediation and acceptance
 
-- Complete the campaign-methodology release path with an isolated mock flow and
-  a bounded real Ollama acceptance campaign. Canonical adoption remained a
-  dry-run only.
+- Persist complete campaign plans, inventory, capability routing, model
+  identities, task hashes, and judge-off primary-generation configuration.
+- Execute real bounded recovery for non-scorable campaign rows while preserving
+  immutable primary evidence and recovery child provenance.
+- Add automatic post-hoc judge selection/execution with outside-cohort digest
+  checks and provisional machine-judge evidence.
+- Materialize terminal effective-row ledgers and readiness summaries with
+  explicit dispositions, blockers, and package-verification propagation.
+- Build one internally verified review package with inventory/checksum
+  validation, recovery references, judge references, and strict extraction
+  checks.
+- Harden transactional campaign adoption with detailed dry-run previews,
+  typed confirmation, candidate-to-canonical scope conversion, rollback, and
+  no generic `--yes` bypass.
+- Harden cleanup and copy-only legacy migration for forensic preservation,
+  path containment, failure recovery, and root-artifact hygiene.
+- Prove the full CLI lifecycle with forced mock acceptance and revalidate the
+  existing real acceptance campaign under the final schemas.
+- Replace the prior empty-input canonical-ranking hash with a deterministic
+  structured manifest proof; real canonical adoption was not performed.
 
 ## 1.0.0rc19.post3
 

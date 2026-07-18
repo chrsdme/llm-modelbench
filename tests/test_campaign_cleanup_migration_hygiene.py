@@ -5,7 +5,6 @@ All fixtures are disposable and live below pytest's temporary directory.
 import hashlib
 import json
 import os
-from pathlib import Path
 
 import pytest
 
@@ -167,7 +166,7 @@ def test_cleanup_failure_is_recoverable_and_never_touches_sibling(tmp_path, monk
 
 def test_cleanup_all_reports_and_processes_only_eligible(tmp_path):
     shared = tmp_path / "shared"
-    good = _fixture(shared, campaign_id="good", campaigns_root=shared / "campaigns")
+    _fixture(shared, campaign_id="good", campaigns_root=shared / "campaigns")
     bad, manifest = campaign.create_campaign("bad", models=["m"], campaigns_root=shared / "campaigns")
     manifest = campaign.transition(bad, manifest, "planned")
     result = campaign.cleanup_all_campaigns(campaigns_root=shared / "campaigns", apply=True)
@@ -282,7 +281,7 @@ def test_campaign_mode_commands_have_no_root_artifact_leakage(tmp_path, monkeypa
             pass
     # Create a valid temporary campaign for package/clean/status and an
     # interrupted one for the explicit resume parser.
-    packaged = _fixture(tmp_path, campaign_id="packaged", campaigns_root=tmp_path / "campaigns")
+    _fixture(tmp_path, campaign_id="packaged", campaigns_root=tmp_path / "campaigns")
     main(["campaign", "package", "packaged"])
     main(["campaign", "clean", "packaged", "--dry-run"])
     interrupted, manifest = campaign.create_campaign("interrupted", models=["m"], campaigns_root=tmp_path / "campaigns")

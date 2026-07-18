@@ -9,6 +9,7 @@ Current user and contributor documentation is kept separate from historical rele
 - [TASKS.md](TASKS.md), task and fixture contracts
 - [SCORING.md](SCORING.md), deterministic and judged scoring semantics
 - [CAPABILITY_ROUTING.md](CAPABILITY_ROUTING.md), model selection and capability probes
+- [CAMPAIGNS.md](CAMPAIGNS.md), isolated campaign lifecycle and adoption controls
 - [RANKINGS.md](RANKINGS.md), persistent rankings and model history
 - [JUDGE_DUMPS.md](JUDGE_DUMPS.md), post-hoc judging
 - [REPAIR.md](REPAIR.md), bounded recovery and provenance

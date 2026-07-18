@@ -1,4 +1,6 @@
-import argparse, hashlib, json
+import argparse
+import hashlib
+import json
 from pathlib import Path
 import pytest
 from llm_modelbench import campaign, cli, rankings

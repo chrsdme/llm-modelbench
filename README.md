@@ -69,26 +69,61 @@ focused full/context checks where needed. See [benchmark levels](docs/BENCHMARK_
 
 ## Campaign workflow
 
-Campaigns isolate generated evidence below `campaigns/<id>/`: primary evidence,
-recovery/judge sidecars, candidate rankings, reports, readiness, checksums, and
-one review package. A visible answer (including score zero) is never retried;
-bounded recovery is only for thinking-only, empty, or transient failures and
-uses progressive 2048/4096/8192-style budgets with circuit-breaker policy.
+Campaigns isolate generated evidence below `campaigns/<id>/`: plan files,
+primary evidence, recovery/judge sidecars, terminal effective rows, candidate
+rankings, reports, readiness, checksums, cleanup previews, and one review
+package. The normal operator sequence is:
+
+1. optional smoke run;
+2. `campaign plan`;
+3. primary generation with generation-time judging off;
+4. bounded automatic recovery for non-scorable failures only;
+5. deterministic capability/environment classification;
+6. automatic post-hoc judge selection and execution;
+7. terminal effective-row ledger generation;
+8. readiness calculation;
+9. candidate rankings;
+10. complete verified package;
+11. human adoption preview;
+12. exact typed canonical adoption decision.
 
 ```bash
+./llmb campaign plan --campaign-id example --level full \
+  --models 'installed-model' --samples 1 --judge off
 ./llmb campaign run --campaign-id example --level full \
   --models 'installed-model' --unattended-safe --yes --live-ui off
 ./llmb campaign status example
 ./llmb campaign package example
 ./llmb rankings --adopt example --dry-run
+./llmb campaign clean example
 ```
 
-Candidate rankings never alter canonical rankings. Canonical adoption is a
-Tier-2 human action: it validates readiness and package checksums, previews the
-diff, then requires `ADOPT <campaign-id>` typed in an interactive terminal.
-Legacy `runs/` remain readable and can be copied into a campaign with
-`campaign migrate-legacy`; cleanup defaults to preview and retains raw evidence.
+Recovery fairness is conservative: visible answers are never retried, score
+zero stops recovery, recovery is not score fishing, primary evidence remains
+immutable, recovery attempts use bounded progressive budgets with circuit
+breakers, and child provenance is retained. Post-hoc judging is separate from
+generation; the selected judge must be outside the tested cohort by name/digest
+and machine-judged rows remain provisional. If no qualified judge is available,
+readiness records the external-judge blocker instead of silently accepting.
 
+Readiness requires explicit terminal dispositions, complete effective rows, no
+harness/manual/external-judge blockers, and successful package verification.
+Recovered means “terminal evidence was found,” not “the answer became correct.”
+The final package contains one authoritative report tree, inventory, internal
+checksums, recovery references, and judge references, and is verified before
+adoption is considered.
+
+Candidate rankings never alter canonical rankings. Canonical adoption is
+campaign-only and Tier-2: it validates readiness/package signatures, previews
+additions/replacements/no-ops, converts candidate scope to canonical scope, and
+requires `ADOPT <campaign-id>` typed in an interactive terminal. There is no
+generic `--yes` bypass for adoption. Adoption rebuilds transactionally and
+rolls back on failure. Legacy `runs/` remain readable and can be copied into a
+campaign with `campaign migrate-legacy`; migration is copy-only. Cleanup
+defaults to dry-run, retains forensic evidence, and campaign-mode commands are
+tested not to leak root-level artifacts.
+
+See [campaign methodology](docs/CAMPAIGNS.md).
 
 ## Validation and diagnostics
 

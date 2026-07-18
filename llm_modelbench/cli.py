@@ -478,7 +478,7 @@ def _campaign_paths_or_exit(campaign_id: str):
 
 def cmd_campaign(args, cfg):
     """Thin compatibility layer: existing runners receive a normal nested run dir."""
-    from . import campaign, planner
+    from . import campaign
     if args.campaign_cmd == "status":
         paths, manifest = _campaign_paths_or_exit(args.campaign_id)
         print(json.dumps({"campaign_id": manifest.campaign_id, "state": manifest.state,
