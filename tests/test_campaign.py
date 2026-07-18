@@ -426,3 +426,13 @@ def test_readiness_requires_terminal_dispositions(tmp_path):
     paths, _ = campaign.create_campaign("ready", models=["x"], campaigns_root=tmp_path / "campaigns")
     assert campaign.write_readiness(paths, [{"score": 0}])["readiness"] == "ready_for_adoption"
     assert campaign.write_readiness(paths, [{"error_kind": "empty_output"}])["readiness"] == "not_ready_manual_items"
+
+
+@pytest.mark.parametrize("probes, expected", [
+    ([{"state": "unavailable"}], "confirmed_unavailable"),
+    ([{"state": "responded_contract_failed"}], "responded_contract_failed"),
+    ([{"state": "environment_limited"}], "environment_limited"),
+    ([{"state": "supported"}, {"state": "unavailable"}], "conflicting_evidence/manual_review"),
+])
+def test_capability_reprobe_taxonomy(probes, expected):
+    assert campaign.classify_capability_probe(probes) == expected

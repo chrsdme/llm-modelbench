@@ -729,3 +729,32 @@ def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_a
                "policy_version": RECOVERY_POLICY_VERSION}
     _atomic_write_text(paths.readiness_json, json.dumps(summary, indent=2, sort_keys=True))
     return summary
+
+
+CAPABILITY_STATES = {
+    "confirmed_supported", "confirmed_unavailable", "responded_contract_failed",
+    "capability_measured_failure", "probe_unresolved_transient", "environment_limited",
+    "operator_excluded", "conflicting_evidence/manual_review",
+}
+
+
+def classify_capability_probe(probes: List[Dict[str, Any]]) -> str:
+    """Resolve bounded functional probes without mistaking transport failure for absence."""
+    if not probes:
+        return "probe_unresolved_transient"
+    states = {str(item.get("state") or "") for item in probes}
+    if "operator_excluded" in states:
+        return "operator_excluded"
+    if "environment_limited" in states:
+        return "environment_limited"
+    if "supported" in states and "unavailable" in states:
+        return "conflicting_evidence/manual_review"
+    if "supported" in states:
+        return "confirmed_supported"
+    if "unavailable" in states:
+        return "confirmed_unavailable"
+    if "responded_contract_failed" in states:
+        return "responded_contract_failed"
+    if "measured_failure" in states:
+        return "capability_measured_failure"
+    return "probe_unresolved_transient"
