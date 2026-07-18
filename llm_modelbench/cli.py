@@ -508,7 +508,7 @@ def cmd_campaign(args, cfg):
         client = _client(args, cfg)
         selected = _resolve_model_selection(args, client)
         plan = _plan_for_args(args, cfg, client, selected_models=selected)
-        planner.write_plan(paths.plan_json, plan)
+        campaign.write_campaign_plan(paths, plan, inventory=client.tags(), capabilities=plan.get("capability_profiles") or {}, configuration={"level": args.level, "models": args.models, "judge_policy": getattr(args, "judge", "off"), "samples": args.samples, "think": args.think, "ctx": args.ctx, "num_predict": args.num_predict})
         if manifest.state == "created":
             campaign.transition(paths, manifest, "planned")
         print(f"campaign plan -> {paths.plan_json}")
@@ -529,6 +529,13 @@ def cmd_campaign(args, cfg):
             raise SystemExit(f"campaign {args.campaign_id!r} cannot run from state {manifest.state!r}")
         lock = campaign.acquire_lock(paths, operation="campaign-run", phase="generating")
         try:
+            client = _client(args, cfg)
+            selected = _resolve_model_selection(args, client)
+            accepted_plan = _plan_for_args(args, cfg, client, selected_models=selected)
+            campaign.write_campaign_plan(paths, accepted_plan, inventory=client.tags(), capabilities=accepted_plan.get("capability_profiles") or {}, configuration={"level": args.level, "models": args.models, "judge_policy": getattr(args, "judge", "off"), "samples": args.samples, "think": args.think, "ctx": args.ctx, "num_predict": args.num_predict})
+            args._accepted_plan = accepted_plan
+            args._selected_models = selected
+            args.judge = "off"
             args.out = str(paths.evidence_dir)
             args.run_id = "primary"
             args.rankings_out = str(paths.candidate_rankings_dir)

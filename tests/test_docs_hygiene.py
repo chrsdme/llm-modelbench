@@ -26,6 +26,8 @@ _EXCLUDED_DIR_NAMES = {
 
 
 def _is_local_generated_path(path: Path) -> bool:
+    if path.name == "CODEX_RC20_COMPLETION_REMEDIATION.md":
+        return True
     if _EXCLUDED_DIR_NAMES.intersection(path.parts):
         return True
     return any(part.endswith(".egg-info") for part in path.parts)

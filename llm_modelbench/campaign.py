@@ -395,6 +395,26 @@ def write_manifest(
     )
 
 
+def write_campaign_plan(paths: CampaignPaths, plan: Dict[str, Any], *, inventory: List[Dict[str, Any]], capabilities: Dict[str, Any], configuration: Dict[str, Any]) -> Dict[str, Any]:
+    """Persist the accepted pre-generation contract atomically."""
+    from .runner import _task_hash
+    from .tasks import TASKS
+    task_map = {task.id: _task_hash(task) for task in TASKS}
+    accepted = dict(plan)
+    accepted.update({
+        "campaign_id": paths.campaign_id,
+        "generation_judge_mode": "off",
+        "task_hashes": {task_id: task_map[task_id] for model in plan.get("active_models", []) for task_id in model.get("tasks", []) if task_id in task_map},
+        "configuration": configuration,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "recovery_policy_version": RECOVERY_POLICY_VERSION if "RECOVERY_POLICY_VERSION" in globals() else "pending",
+    })
+    _atomic_write_text(paths.plan_json, json.dumps(accepted, indent=2, sort_keys=True))
+    _atomic_write_text(paths.inventory_json, json.dumps(inventory, indent=2, sort_keys=True))
+    _atomic_write_text(paths.capabilities_json, json.dumps(capabilities, indent=2, sort_keys=True))
+    return accepted
+
+
 def load_manifest(paths: CampaignPaths) -> CampaignManifest:
     if not paths.manifest.exists():
         raise CampaignError(
