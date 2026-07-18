@@ -646,6 +646,9 @@ def package_campaign(paths: CampaignPaths, *, allow_active_lock: bool = False) -
         for source in sorted(paths.root.rglob("*")):
             if not source.is_file() or source in {package, temp_package, paths.lock_file} or paths.packages_dir in source.parents or paths.checksums_dir in source.parents or paths.readiness_dir in source.parents:
                 continue
+            relative_parts = source.relative_to(paths.root).parts
+            if len(relative_parts) >= 2 and relative_parts[0] == "evidence" and str(relative_parts[1]).startswith("repair_"):
+                continue
             # Per-response dumps are disposable intermediates.  Immutable raw
             # results and any recovery child evidence are packaged separately;
             # including dumps would make a conservative retention cleanup stale
@@ -1070,7 +1073,8 @@ MIGRATION_POLICY_VERSION = "rc20-legacy-copy-1"
 TERMINAL_DISPOSITIONS = {
     "scored", "judged", "confirmed_capability_unavailable",
     "capability_measured_failure", "environment_limited", "operator_excluded",
-    "terminal_model_failure", "harness_failure", "awaiting_external_judge",
+    "terminal_model_failure", "terminal_thinking_only", "terminal_empty",
+    "terminal_transient", "harness_failure", "awaiting_external_judge",
 }
 
 
@@ -1096,6 +1100,14 @@ def classify_recovery_row(row: Dict[str, Any]) -> Dict[str, Any]:
         return {"disposition": "scored", "retry": False, "reason": "visible scorable answer"}
     kind = str(row.get("error_kind") or "")
     text = str(row.get("error") or row.get("reason") or "").lower()
+    if kind in {"capability_unavailable", "confirmed_capability_unavailable"}:
+        return {"disposition": "confirmed_capability_unavailable", "retry": False, "reason": kind}
+    if kind in {"capability_measured_failure", "measured_failure"}:
+        return {"disposition": "capability_measured_failure", "retry": False, "reason": kind}
+    if kind == "environment_limited":
+        return {"disposition": "environment_limited", "retry": False, "reason": kind}
+    if kind == "operator_excluded":
+        return {"disposition": "operator_excluded", "retry": False, "reason": kind}
     if kind == "thinking_only":
         return {"disposition": "thinking_only_pending_retry", "retry": True, "reason": kind}
     if kind == "empty_output":
@@ -1125,31 +1137,55 @@ def execute_recovery_phase(paths: CampaignPaths, client: Any, cfg: Any, *, budge
         transition(paths, manifest, "recovering")
     elif manifest.state != "recovering":
         raise CampaignError(f"recovery cannot start from {manifest.state!r}")
-    plan = build_plan_fn(paths.evidence_dir, run_id="primary", think_retry_num_predict=int(budget), judge_mode="off")
+    plan = build_plan_fn(paths.evidence_dir, run_id="primary", think_retry_num_predict=int(budget),
+                         judge_mode="off", include_missing=False)
     _atomic_write_text(paths.recovery_plan, json.dumps(plan.to_dict(), indent=2, sort_keys=True))
     result = apply_plan_fn(client, cfg, plan, rankings_dir=paths.candidate_rankings_dir, ranking_scope="separate")
     records = []
     for index, action in enumerate(result.get("actions", []), 1):
-        child_id = str(action.get("child_run_id") or f"recovery-{index:04d}")
-        child_dir = paths.recovery_children_dir / child_id
-        child_dir.mkdir(parents=True, exist_ok=True)
-        record = {"campaign_id": paths.campaign_id, "parent_row_hash": action.get("parent_row_hash"),
-                  "parent_run_id": "primary", "child_run_id": child_id,
-                  "model": action.get("model"), "model_digest": action.get("model_digest"),
-                  "task": action.get("task"), "task_hash": action.get("task_hash"),
-                  "attempt_number": int(action.get("attempt_number") or index),
-                  "output_budget": action.get("output_budget"), "context": action.get("context"),
-                  "think_mode": action.get("think_mode", "off"), "configuration": action.get("configuration") or {},
-                  "started_at": action.get("started_at"), "ended_at": action.get("ended_at"),
-                  "wall_time_seconds": action.get("wall_time_seconds", 0),
-                  "raw_response_reference": f"children/{child_id}/attempt.json",
-                  "output_classification": action.get("output_classification") or action.get("status"),
-                  "visible_answer": bool(action.get("visible_answer")), "score": action.get("score"),
-                  "reason": action.get("reason"), "error_classification": action.get("error_classification"),
-                  "stop_reason": action.get("stop_reason") or action.get("reason") or action.get("status"),
-                  "policy_version": RECOVERY_POLICY_VERSION}
-        _atomic_write_text(child_dir / "attempt.json", json.dumps(record, indent=2, sort_keys=True))
-        records.append(record)
+        attempts = list(action.get("attempts") or []) or [{"attempt_number": index}]
+        for attempt in attempts:
+            child_id = str(attempt.get("child_run_id") or action.get("child_run_id") or f"recovery-{index:04d}")
+            child_dir = paths.recovery_children_dir / child_id
+            child_dir.mkdir(parents=True, exist_ok=True)
+            source_child = paths.evidence_dir / child_id
+            if source_child.is_dir():
+                for source_file in sorted(source_child.rglob("*")):
+                    if source_file.is_file():
+                        relative_child = source_file.relative_to(source_child)
+                        if relative_child.parts and relative_child.parts[0] not in {
+                            "raw", "subjective", "raw_results.jsonl", "run_validity.json",
+                            "model_identities.json", "config.json", "filters.json",
+                            "capability_report.json", "ranking_scope.json", "status.json",
+                            "summary_meta.json", "skipped_models.json",
+                        }:
+                            continue
+                        target = child_dir / source_file.relative_to(source_child)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(source_file, target)
+            record = {"campaign_id": paths.campaign_id, "parent_row_hash": action.get("parent_row_hash"),
+                      "parent_run_id": "primary", "child_run_id": child_id,
+                      "action_id": action.get("action_id"), "kind": action.get("kind"),
+                      "model": action.get("model"), "model_digest": action.get("model_digest"),
+                      "task": action.get("task") or (action.get("tasks") or [None])[0],
+                      "task_hash": action.get("task_hash"),
+                      "tasks": action.get("tasks") or attempt.get("required_tasks") or [],
+                      "attempt_number": int(attempt.get("attempt_number") or index),
+                      "output_budget": action.get("output_budget"), "context": action.get("context"),
+                      "think_mode": action.get("think_mode", "off"),
+                      "configuration": attempt.get("overrides") or {},
+                      "started_at": action.get("started_at"), "ended_at": action.get("ended_at"),
+                      "wall_time_seconds": action.get("wall_time_seconds", 0),
+                      "raw_response_reference": f"children/{child_id}/raw_results.jsonl",
+                      "output_classification": attempt.get("status") or action.get("status"),
+                      "visible_answer": bool(action.get("visible_answer") or attempt.get("valid_tasks")),
+                      "score": action.get("score", attempt.get("score")),
+                      "reason": action.get("reason"),
+                      "error_classification": action.get("status"),
+                      "stop_reason": action.get("stop_reason") or action.get("reason") or attempt.get("status") or action.get("status"),
+                      "policy_version": RECOVERY_POLICY_VERSION}
+            _atomic_write_text(child_dir / "attempt.json", json.dumps(record, indent=2, sort_keys=True))
+            records.append(record)
     _atomic_write_text(paths.recovery_attempts, "".join(json.dumps(item, sort_keys=True) + "\n" for item in records))
     _atomic_write_text(paths.recovery_result, json.dumps(result, indent=2, sort_keys=True))
     if paths.primary_raw_results.read_bytes() != primary_before:
@@ -1157,26 +1193,206 @@ def execute_recovery_phase(paths: CampaignPaths, client: Any, cfg: Any, *, budge
     return result
 
 
+def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: List[Dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            rows.append(json.loads(line))
+    return rows
+
+
+def _primary_row_hash(row: Dict[str, Any]) -> str:
+    from .repair import _row_hash
+    return _row_hash(row)
+
+
+def _json_compact_hash(row: Dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(row, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
+
+
+def _child_rows_by_repair_hash(paths: CampaignPaths) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for child_dir in sorted(paths.recovery_children_dir.iterdir() if paths.recovery_children_dir.exists() else []):
+        raw = child_dir / "raw_results.jsonl"
+        for row in _read_jsonl(raw):
+            source = str(row.get("repair_source_row_hash") or "")
+            task = str(row.get("task") or "")
+            if source and task:
+                candidate = dict(row)
+                candidate["_recovery_child_id"] = child_dir.name
+                out[f"{source}:{task}"] = candidate
+    return out
+
+
+def _recovery_actions_by_source(paths: CampaignPaths) -> Dict[str, Dict[str, Any]]:
+    plan = _json_object(paths.recovery_plan)
+    result = _json_object(paths.recovery_result)
+    planned = {str(action.get("action_id") or ""): action for action in plan.get("actions") or []}
+    out: Dict[str, Dict[str, Any]] = {}
+    for action in result.get("actions") or []:
+        action_id = str(action.get("action_id") or "")
+        source_hashes = (planned.get(action_id) or {}).get("source_row_hashes") or {}
+        for task in action.get("tasks") or []:
+            source = str(source_hashes.get(str(task)) or "")
+            if source:
+                out[f"{source}:{task}"] = action
+    return out
+
+
+def _terminal_after_recovery(primary: Dict[str, Any], action: Optional[Dict[str, Any]], child: Optional[Dict[str, Any]]) -> str:
+    if child and child.get("score") is not None and not child.get("error_kind"):
+        return "scored"
+    status = str((action or {}).get("status") or "")
+    kind = str(primary.get("error_kind") or "")
+    if status == "measured_failure":
+        return "capability_measured_failure"
+    if status in {"timeout"}:
+        return "terminal_transient"
+    if kind == "thinking_only":
+        return "terminal_thinking_only"
+    if kind == "empty_output":
+        return "terminal_empty"
+    text = str(primary.get("reason") or primary.get("error") or "").lower()
+    if "timeout" in text or " 5" in text or ("http" in text and "5" in text):
+        return "terminal_transient"
+    return classify_recovery_row(primary)["disposition"]
+
+
+def _candidate_from_effective(row: Dict[str, Any], manifest: CampaignManifest) -> Dict[str, Any]:
+    candidate = {
+        "run_id": "primary",
+        "campaign_id": manifest.campaign_id,
+        "model": row.get("model"),
+        "model_digest_resolved": row.get("model_digest_resolved"),
+        "task": row.get("task"),
+        "task_hash": row.get("task_hash"),
+        "score": row.get("effective_score"),
+        "reason": row.get("effective_reason"),
+        "terminal_disposition": row.get("terminal_disposition"),
+        "result_origin": row.get("result_origin"),
+        "ranking_scope": "separate",
+        "canonical_rankings": False,
+        "_source_signature": row.get("effective_row_hash"),
+    }
+    return candidate
+
+
 def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_available: bool = True) -> Dict[str, Any]:
-    effective = []
+    manifest = load_manifest(paths)
+    raw_primary_rows = _read_jsonl(paths.primary_raw_results)
+    child_by_source = _child_rows_by_repair_hash(paths)
+    action_by_source = _recovery_actions_by_source(paths)
+    judge_rows = _read_jsonl(paths.judge_results)
+    judge_by_source = {str(row.get("source_row_hash") or ""): row for row in judge_rows if row.get("status") == "judged"}
+    effective: List[Dict[str, Any]] = []
     for index, row in enumerate(rows):
+        raw_primary = raw_primary_rows[index] if index < len(raw_primary_rows) else row
+        primary_hash = _primary_row_hash(raw_primary)
+        task = str(row.get("task") or "")
+        key = f"{primary_hash}:{task}"
+        child = child_by_source.get(key)
+        action = action_by_source.get(key)
         classification = classify_recovery_row(row)
+        source = row
+        origin = "primary"
         disposition = str(row.get("disposition") or classification["disposition"])
-        effective.append({"model": row.get("model"), "model_digest_resolved": row.get("model_digest_resolved"), "task": row.get("task"), "task_hash": row.get("task_hash"), "primary_row_index": index, "primary_row_hash": __import__("hashlib").sha256(json.dumps(row, sort_keys=True, default=str).encode()).hexdigest(), "effective_score": row.get("score"), "effective_reason": row.get("reason"), "result_origin": "primary", "terminal_disposition": disposition, "correctness": "correct" if row.get("score") == 100 else ("visible_wrong" if row.get("score") is not None else "non_scorable")})
+        recovery_attempt_number = None
+        recovery_child_id = None
+        if child or action:
+            source = child or row
+            origin = "recovered" if child and child.get("score") is not None and not child.get("error_kind") else "recovery_terminal"
+            disposition = _terminal_after_recovery(row, action, child)
+            recovery_child_id = (child or {}).get("_recovery_child_id")
+            if child:
+                recovery_attempt_number = child.get("repair_attempt_number")
+        judge_source_hash = str(row.get("judge_source_row_hash") or "")
+        judge_row = judge_by_source.get(judge_source_hash)
+        if row.get("posthoc_judged") or judge_row:
+            source = row
+            origin = "judged"
+            disposition = "judged"
+        item = {
+            "model": row.get("model"),
+            "model_digest_resolved": row.get("model_digest_resolved") or source.get("model_digest_resolved") or source.get("model_digest"),
+            "task": row.get("task"),
+            "task_hash": row.get("task_hash") or source.get("task_hash"),
+            "primary_row_index": index,
+            "primary_row_hash": primary_hash,
+            "recovery_row_hash": _primary_row_hash(child) if child else None,
+            "recovery_child_id": recovery_child_id,
+            "recovery_attempt_number": recovery_attempt_number,
+            "judge_source_row_hash": judge_source_hash or None,
+            "judge_row_hash": _json_compact_hash(judge_row) if judge_row else None,
+            "result_origin": origin,
+            "effective_score": source.get("score"),
+            "effective_reason": source.get("reason"),
+            "terminal_disposition": disposition,
+            "capability_status": disposition if disposition in {"confirmed_capability_unavailable", "capability_measured_failure"} else None,
+            "environment_status": disposition if disposition == "environment_limited" else None,
+            "harness_status": disposition if disposition == "harness_failure" else None,
+            "provenance": {
+                "campaign_id": paths.campaign_id,
+                "primary_run_id": "primary",
+                "recovery_action_id": (action or {}).get("action_id"),
+                "recovery_status": (action or {}).get("status"),
+                "judge_model": row.get("judge_model") or (judge_row or {}).get("judge_model"),
+                "judge_mode": row.get("judge_mode") or (judge_row or {}).get("judge_mode"),
+            },
+        }
+        item["correctness"] = (
+            "correct" if item.get("effective_score") == 100 else
+            "visible_wrong" if item.get("effective_score") is not None else
+            "non_scorable"
+        )
+        item["effective_row_hash"] = _json_compact_hash(item)
+        effective.append(item)
     _atomic_write_text(paths.effective_rows, "".join(json.dumps(row, sort_keys=True) + "\n" for row in effective))
-    dispositions = [row["terminal_disposition"] for row in effective]
+
+    dispositions = [str(row["terminal_disposition"]) for row in effective]
     pending = [item for item in dispositions if item not in TERMINAL_DISPOSITIONS]
-    if pending:
-        state = "not_ready_manual_items"
-    elif "harness_failure" in dispositions:
-        state = "not_ready_harness_failure"
-    elif "awaiting_external_judge" in dispositions or not judge_available:
-        state = "not_ready_external_judge"
-    else:
-        state = "ready_for_adoption"
-    summary = {"campaign_id": paths.campaign_id, "readiness": state, "total_applicable_cells": len(rows), "rows": len(rows),
-               "terminal_rows": len(rows) - len(pending), "pending_dispositions": pending,
-               "primary_correct": sum(row["correctness"] == "correct" for row in effective), "primary_visible_wrong": sum(row["correctness"] == "visible_wrong" for row in effective), "primary_non_scorable": sum(row["correctness"] == "non_scorable" for row in effective), "recovered_to_correct": 0, "recovered_to_visible_wrong": 0, "recovery_exhausted": sum("pending_retry" in x for x in dispositions), "awaiting_external_judge": dispositions.count("awaiting_external_judge"), "harness_failure": dispositions.count("harness_failure"), "blockers": pending, "policy_version": RECOVERY_POLICY_VERSION}
+    blockers = list(pending)
+    if "harness_failure" in dispositions:
+        blockers.append("harness_failure")
+    if "awaiting_external_judge" in dispositions or not judge_available:
+        blockers.append("awaiting_external_judge")
+    state = "ready_for_adoption" if not blockers else (
+        "not_ready_harness_failure" if "harness_failure" in blockers else
+        "not_ready_external_judge" if "awaiting_external_judge" in blockers else
+        "not_ready_manual_items"
+    )
+    summary = {
+        "campaign_id": paths.campaign_id,
+        "readiness": state,
+        "total_applicable_cells": len(rows),
+        "rows": len(rows),
+        "terminal_rows": len(rows) - len(pending),
+        "pending_dispositions": pending,
+        "primary_correct": sum(row["result_origin"] == "primary" and row["correctness"] == "correct" for row in effective),
+        "primary_visible_wrong": sum(row["result_origin"] == "primary" and row["correctness"] == "visible_wrong" for row in effective),
+        "primary_partial": sum(row["result_origin"] == "primary" and isinstance(row.get("effective_score"), (int, float)) and 0 < float(row["effective_score"]) < 100 for row in effective),
+        "recovered_to_correct": sum(row["result_origin"] == "recovered" and row["correctness"] == "correct" for row in effective),
+        "recovered_to_visible_wrong": sum(row["result_origin"] == "recovered" and row["correctness"] == "visible_wrong" for row in effective),
+        "recovery_exhausted": sum(row["result_origin"] == "recovery_terminal" for row in effective),
+        "terminal_thinking_only": dispositions.count("terminal_thinking_only"),
+        "terminal_empty": dispositions.count("terminal_empty"),
+        "terminal_transient": dispositions.count("terminal_transient"),
+        "capability_unavailable": dispositions.count("confirmed_capability_unavailable"),
+        "capability_measured_failure": dispositions.count("capability_measured_failure"),
+        "environment_limited": dispositions.count("environment_limited"),
+        "operator_excluded": dispositions.count("operator_excluded"),
+        "subjective_eligible": sum(bool(row.get("judge_source_row_hash") or row.get("judge_model")) for row in effective),
+        "judged": dispositions.count("judged"),
+        "awaiting_external_judge": dispositions.count("awaiting_external_judge"),
+        "harness_failure": dispositions.count("harness_failure"),
+        "manual_conflicting_items": sum(d in {"conflicting_evidence/manual_review"} for d in dispositions),
+        "blockers": sorted(set(blockers)),
+        "policy_version": RECOVERY_POLICY_VERSION,
+    }
+    candidate_rows = [_candidate_from_effective(row, manifest) for row in effective]
+    _atomic_write_text(paths.candidate_rankings_dir / "master_raw.jsonl", "".join(json.dumps(row, sort_keys=True) + "\n" for row in candidate_rows))
+    _atomic_write_text(paths.candidate_rankings_dir / "master_summary.json", json.dumps({"campaign_id": paths.campaign_id, "rows": len(candidate_rows)}, indent=2, sort_keys=True))
     _atomic_write_text(paths.readiness_json, json.dumps(summary, indent=2, sort_keys=True))
     _atomic_write_text(paths.reports_dir / "readiness.json", json.dumps(summary, indent=2, sort_keys=True))
     _atomic_write_text(paths.reports_dir / "readiness.md", "# Campaign readiness\n\n" + "\n".join(f"- {key}: {value}" for key, value in summary.items()) + "\n")

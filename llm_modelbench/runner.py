@@ -156,6 +156,8 @@ def _harness_error(reason: str, response: Optional[Dict[str, Any]] = None) -> Di
     out = {"score": None, "reason": reason, "output": "", "output_chars": 0,
            "error_kind": "harness_error", "tps": None, "ttft_ms": None, "tokens": 0}
     if response:
+        if response.get("error_kind"):
+            out["error_kind"] = str(response.get("error_kind"))
         for key in ("http_status", "http_reason", "http_url", "http_error_body"):
             if response.get(key) is not None:
                 out[key] = response.get(key)

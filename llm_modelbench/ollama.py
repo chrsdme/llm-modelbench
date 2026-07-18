@@ -9,7 +9,9 @@ pipeline (scoring, aggregation, reporting) can run and be tested without a live 
 """
 from __future__ import annotations
 
+import copy
 import json
+import os
 import statistics
 import time
 import urllib.request
@@ -464,6 +466,8 @@ class MockClient(OllamaClient):
         {"name": "qwen2.5-vl:7b", "size": 6_000_000_000, "digest": "mock-qwen25vl7b"},
         {"name": "nomic-embed-text:latest", "size": 274_000_000, "digest": "mock-nomicembed"},
     ]
+    _SCRIPT_CACHE: Dict[str, Dict[str, Any]] = {}
+    _SCRIPT_COUNTS: Dict[str, Dict[str, int]] = {}
 
     def tags(self):
         return list(self._MODELS)
@@ -504,23 +508,82 @@ class MockClient(OllamaClient):
     def context_length(self, model):
         return 32768
 
+    def _scripted(self, model: str, prompt: str, *, tool: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        script_path = os.environ.get("LLM_MODELBENCH_MOCK_SCRIPT")
+        if not script_path:
+            return None
+        if script_path not in self._SCRIPT_CACHE:
+            try:
+                with open(script_path, "r", encoding="utf-8") as handle:
+                    script = json.load(handle)
+            except Exception:
+                script = {}
+            self._SCRIPT_CACHE[script_path] = script
+            self._SCRIPT_COUNTS[script_path] = {}
+        script = self._SCRIPT_CACHE[script_path]
+        counts = self._SCRIPT_COUNTS[script_path]
+        text = str(prompt or "")
+        for index, rule in enumerate((script or {}).get("rules") or []):
+            if rule.get("tool") and str(rule.get("tool")) != str(tool or ""):
+                continue
+            if rule.get("model") and str(rule.get("model")) != str(model):
+                continue
+            if rule.get("contains") and str(rule.get("contains")).lower() not in text.lower():
+                continue
+            key = json.dumps({"i": index, "model": model, "tool": tool}, sort_keys=True)
+            count = int(counts.get(key, 0))
+            responses = list(rule.get("responses") or [rule.get("response") or {}])
+            response = copy.deepcopy(responses[min(count, len(responses) - 1)])
+            counts[key] = count + 1
+            return response
+        return None
+
+    def _response(self, text: str, *, ok: bool = True, num_predict: int = 1024, num_ctx=None, think="auto", **extra: Any) -> Dict[str, Any]:
+        tokens = max(1, len(text) // 4) if text else 0
+        prompt_tokens = int(extra.pop("prompt_eval_count", 20) or 20)
+        payload = {"ok": ok, "text": text, "thinking": "", "ttft_ms": 120.0 if text else None,
+                   "ttft_visible_ms": 120.0 if text else None, "think_ms": 0.0, "tps": 42.0 if text else None,
+                   "itl_p50_ms": 22.0 if text else None, "itl_p95_ms": 40.0 if text else None,
+                   "tokens": tokens, "eval_count": tokens, "prompt_eval_count": prompt_tokens, "done_reason": "stop",
+                   "num_predict": num_predict, "num_ctx": num_ctx, "thinking_chars": 0,
+                   "think_sent": False, "think_unsupported": think in {"on", "off"}, "think_requested": think}
+        payload.update(extra)
+        return payload
+
     def chat(self, model, prompt, *, images=None, system=None, num_predict=1024, num_ctx=None, think="auto", messages=None):
         if messages is not None and not prompt:
             prompt = "\n".join(str(m.get("content") or "") for m in messages)
+        if "return only valid json" in str(prompt).lower() and "grading a model answer" in str(prompt).lower():
+            return self._response(self._answer(prompt), num_predict=num_predict, num_ctx=num_ctx, think=think,
+                                  prompt_eval_count=max(1, int(len(prompt or "") / 6.85)))
+        scripted = self._scripted(model, prompt)
+        if scripted is not None:
+            if scripted.get("kind") == "thinking_only":
+                return self._response("", num_predict=num_predict, num_ctx=num_ctx, think=think,
+                                      thinking=scripted.get("thinking", "hidden reasoning"),
+                                      thinking_chars=int(scripted.get("thinking_chars") or 32),
+                                      eval_count=int(scripted.get("eval_count") or 8),
+                                      tokens=int(scripted.get("tokens") or 8), tps=42.0,
+                                      ttft_ms=None, ttft_visible_ms=None)
+            if scripted.get("kind") == "empty":
+                return self._response("", num_predict=num_predict, num_ctx=num_ctx, think=think,
+                                      eval_count=0, tokens=0)
+            if scripted.get("ok") is False:
+                payload = self._response(str(scripted.get("text") or ""), ok=False,
+                                         num_predict=num_predict, num_ctx=num_ctx, think=think)
+                payload.update({k: v for k, v in scripted.items() if k not in {"kind", "text"}})
+                return payload
+            return self._response(str(scripted.get("text") or ""), num_predict=num_predict,
+                                  num_ctx=num_ctx, think=think,
+                                  **{k: v for k, v in scripted.items() if k not in {"kind", "text"}})
         if images and "short code shown in the image" in str(prompt).lower():
             text = "V7K9Q2"
         elif "AIW_TEXT_OK" in str(prompt):
             text = "AIW_TEXT_OK"
         else:
             text = self._answer(prompt)
-        tokens = max(1, len(text) // 4) if text else 0
-        prompt_tokens = max(1, int(len(prompt or "") / 6.85))
-        return {"ok": True, "text": text, "thinking": "", "ttft_ms": 120.0 if text else None,
-                "ttft_visible_ms": 120.0 if text else None, "think_ms": 0.0, "tps": 42.0 if text else None,
-                "itl_p50_ms": 22.0 if text else None, "itl_p95_ms": 40.0 if text else None,
-                "tokens": tokens, "eval_count": tokens, "prompt_eval_count": prompt_tokens, "done_reason": "stop",
-                "num_predict": num_predict, "num_ctx": num_ctx, "thinking_chars": 0,
-                "think_sent": False, "think_unsupported": think in {"on", "off"}, "think_requested": think}
+        return self._response(text, num_predict=num_predict, num_ctx=num_ctx, think=think,
+                              prompt_eval_count=max(1, int(len(prompt or "") / 6.85)))
 
     def chat_tools(self, model, prompt, *, tools, system=None, num_predict=512, num_ctx=None, think="auto"):
         tool = (tools[0].get("function") or {}).get("name") if tools else None

@@ -559,6 +559,10 @@ def cmd_campaign(args, cfg):
             cmd_run(args, cfg)
             campaign.sync_primary_reports(paths)
             rows = [json.loads(line) for line in paths.primary_raw_results.read_text(encoding="utf-8").splitlines() if line.strip()]
+            identities = json.loads((paths.primary_dir / "model_identities.json").read_text(encoding="utf-8")) if (paths.primary_dir / "model_identities.json").exists() else {}
+            for row in rows:
+                identity = identities.get(row.get("model")) or {}
+                row["model_digest_resolved"] = identity.get("digest") or row.get("model_digest") or row.get("model")
             retry_rows = [row for row in rows if campaign.classify_recovery_row(row)["retry"]]
             if retry_rows:
                 # Execute the existing bounded repair engine against nested primary evidence.
@@ -584,7 +588,11 @@ def cmd_campaign(args, cfg):
                     if (paths.primary_dir / "judge_results.jsonl").exists():
                         __import__("shutil").copy2(paths.primary_dir / "judge_results.jsonl", paths.judge_results)
                     campaign._atomic_write_text(paths.judge_summary, json.dumps({**judged, "selection": selection}, indent=2, sort_keys=True))
-                    rows = judge_dumps.apply_judgements(paths.primary_dir, rows)
+                    raw_rows = [json.loads(line) for line in paths.primary_raw_results.read_text(encoding="utf-8").splitlines() if line.strip()]
+                    rows = judge_dumps.apply_judgements(paths.primary_dir, raw_rows)
+                    for row in rows:
+                        identity = identities.get(row.get("model")) or {}
+                        row["model_digest_resolved"] = identity.get("digest") or row.get("model_digest") or row.get("model")
                 else:
                     campaign._atomic_write_text(paths.judge_summary, json.dumps({"status": "awaiting_external_judge", "selection": selection}, indent=2, sort_keys=True))
                 campaign.transition(paths, campaign.load_manifest(paths), "packaged")
