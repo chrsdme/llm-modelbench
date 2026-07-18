@@ -637,13 +637,17 @@ def package_campaign(paths: CampaignPaths, *, allow_active_lock: bool = False) -
         raise CampaignError("refusing to package an actively locked campaign")
     package = paths.packages_dir / f"{paths.campaign_id}-review.zip"
     inventory: Dict[str, str] = {}
+    duplicate_primary_reports = {"report.html", "scorecard.md", "scorecard.csv", "routing.md", "prune.md", "clones.md", "regression.md", "summary.json"}
     with zipfile.ZipFile(package, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for source in sorted(paths.root.rglob("*")):
             if not source.is_file() or source == package or paths.packages_dir in source.parents or source == paths.lock_file:
                 continue
+            if source.parent == paths.primary_dir and source.name in duplicate_primary_reports:
+                continue
             relative = source.relative_to(paths.root).as_posix()
             archive.write(source, relative)
             inventory[relative] = _sha256(source)
+        archive.writestr("package/sha256.json", json.dumps({"files": inventory}, indent=2, sort_keys=True))
     _atomic_write_text(paths.checksums_json, json.dumps({"files": inventory, "package": _sha256(package)}, indent=2, sort_keys=True))
     return package
 
@@ -653,7 +657,20 @@ def verify_package(paths: CampaignPaths) -> bool:
         return False
     data = json.loads(paths.checksums_json.read_text(encoding="utf-8"))
     package = paths.packages_dir / f"{paths.campaign_id}-review.zip"
-    return package.exists() and data.get("package") == _sha256(package) and zipfile.is_zipfile(package)
+    if not (package.exists() and data.get("package") == _sha256(package) and zipfile.is_zipfile(package)):
+        return False
+    with zipfile.ZipFile(package) as archive:
+        try:
+            internal = json.loads(archive.read("package/sha256.json"))
+        except (KeyError, ValueError):
+            return False
+        names = set(archive.namelist())
+        if set(internal.get("files", {})) != names - {"package/sha256.json"}:
+            return False
+        for name, digest in internal["files"].items():
+            if hashlib.sha256(archive.read(name)).hexdigest() != digest:
+                return False
+    return True
 
 
 def cleanup_campaign(paths: CampaignPaths, *, apply: bool = False) -> List[Path]:
