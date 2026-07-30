@@ -45,9 +45,18 @@ passed
 
 ## Real-hardware acceptance
 
-The required read-only API call ran in this environment after the focused suite and returned `[]`. Direct `nvidia-smi -L` reported that it could not communicate with the NVIDIA driver. Therefore the requested two-device acceptance target has not been satisfied here: no claim is made for detection of the RTX 5060 Ti or RTX 3060, their UUIDs, PCI bus IDs, VRAM, or ordering.
+The Codex execution environment could not communicate with the NVIDIA driver and returned an empty inventory. Final acceptance was therefore performed separately on the real AI-PC host using the new read-only API.
 
-On a shell with the NVIDIA driver available, re-run the read-only inventory API and verify two ordered devices with distinct UUID/PCI identities before accepting Stage 2 hardware validation. This action does not benchmark, stress, start, stop, or configure GPUs or model services.
+The real host detected two ordered physical NVIDIA devices:
+
+| Physical index | Device | UUID | PCI bus ID | VRAM | Compute capability |
+| ---: | --- | --- | --- | ---: | ---: |
+| 0 | NVIDIA GeForce RTX 5060 Ti | `GPU-78077308-f4b2-3330-6d4e-19581d7b1511` | `00000000:01:00.0` | 16311 MiB | 12.0 |
+| 1 | NVIDIA GeForce RTX 3060 | `GPU-5b99bce2-35ab-f6db-857b-72162069fa72` | `00000000:05:00.0` | 12288 MiB | 8.6 |
+
+Both devices have distinct UUID and PCI identities, the expected stable ordering, correct reported VRAM totals, and correct compute capabilities. Stage 2 real-hardware acceptance therefore passed.
+
+This was an inventory-only validation. It did not benchmark, stress, start, stop, or reconfigure either GPU or any inference service.
 
 ## Known limitations and rollback
 

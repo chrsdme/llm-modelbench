@@ -4,10 +4,10 @@
 
 | Stage | Status | Durable output |
 | --- | --- | --- |
-| 0. Working-tree preparation outside Codex | Pending human action | Clean reviewed working tree |
-| 1. Architecture audit and durable plan | Complete, awaiting human review | This RC21 documentation set |
-| 2. Arbitrary-N real GPU inventory | Implemented; real-hardware acceptance pending | Compatibility inventory API and tests |
-| 3. Backend protocol and Ollama preservation | Not started | Protocol, adapter, compatibility tests |
+| 0. Working-tree preparation outside Codex | Complete | Clean reviewed working tree |
+| 1. Architecture audit and durable plan | Complete | This RC21 documentation set |
+| 2. Arbitrary-N real GPU inventory | Complete | Compatibility inventory API, tests, and real-host acceptance |
+| 3. Backend protocol and Ollama preservation | Implemented; live endpoint smoke unavailable | Protocol, adapter, compatibility tests |
 | 4. Runtime profiles and discovery/selection | Not started | Profile schema and selection workflow |
 | 5. External llama-server backend | Not started | Read-only external backend adapter |
 | 6. Per-GPU/backend-neutral telemetry | Not started | Per-device/process evidence |
@@ -32,7 +32,18 @@ Review `RC21_MASTER_PLAN.md` and `RC21_SOURCE_AUDIT.md`. Do not begin Stage 2 un
 - Added `detect_gpus()` and `GPUDevice` in `llm_modelbench/hardware.py`; `detect_gpu()` remains the first-device `GPUInfo` compatibility wrapper.
 - Added an inventory list to doctor output without changing the existing scalar `GPU:` line.
 - Focused suite passed: 59 tests covering multi-row ordering, identities, optional values, wrapper/no-GPU behavior, and existing scalar consumers.
-- The required local read-only inventory returned `[]`; direct `nvidia-smi -L` could not communicate with the NVIDIA driver. The RTX 5060 Ti plus RTX 3060 acceptance target remains pending on a driver-accessible host.
+- Codex could not access the NVIDIA driver, so final acceptance was run on the real AI-PC host. The new API detected the RTX 5060 Ti and RTX 3060 as separate ordered devices with distinct UUIDs and PCI bus IDs, correct VRAM totals, and compute capabilities 12.0 and 8.6 respectively.
 - See `docs/rc21/stage-02-multigpu-inventory.md` for the compatibility boundary, known limitations, and rollback point.
 
 **Proposed Stage 3 objective:** define a capability-oriented backend protocol while preserving Ollama and Mock client behavior; do not implement a new backend or runtime selection yet.
+
+## Stage 3 record
+
+- Added the `InferenceClient` protocol, backend identity, four-state capability model, and thin Ollama/Mock adapters in `llm_modelbench/backend.py`.
+- `cli._client()` now constructs adapters; the existing Ollama and Mock implementations retain their HTTP and deterministic behavior unchanged.
+- KV/systemd repair is capability-guarded as Ollama-only before a cascade can proceed.
+- Focused suite passed: 102 tests across adapters, CLI construction, capability routing, runner-adjacent behavior, campaigns, judging, and existing Ollama/Mock regression coverage.
+- Read-only local Ollama smoke returned `version: None` and no models; no service or model action occurred, so live acceptance remains unavailable in this environment.
+- See `docs/rc21/stage-03-backend-abstraction.md` for the interface, compatibility boundary, limitations, and rollback point.
+
+**Proposed Stage 4 objective:** add runtime-profile schema plus read-only local discovery/selection while preserving the existing Ollama URL configuration contract.
