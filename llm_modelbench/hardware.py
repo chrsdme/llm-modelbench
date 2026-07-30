@@ -10,6 +10,7 @@ sustained power, and peak temperature. Everything here is best-effort and never 
 """
 from __future__ import annotations
 
+import csv
 import os
 import shutil
 import statistics
@@ -30,6 +31,33 @@ class GPUInfo:
     driver_version: str | None = None
 
 
+@dataclass(frozen=True)
+class GPUDevice:
+    """One physical NVIDIA device reported by ``nvidia-smi``.
+
+    ``physical_index`` is NVIDIA's host-level index. It is deliberately not a
+    CUDA runtime-visible index: a future runtime-profile layer must record any
+    ``CUDA_VISIBLE_DEVICES`` mapping separately.
+    """
+
+    physical_index: int
+    uuid: Optional[str]
+    pci_bus_id: Optional[str]
+    name: str
+    total_vram_mb: Optional[float]
+    driver_version: Optional[str]
+    compute_capability: Optional[str]
+
+
+_NVIDIA_GPU_QUERY_FIELDS = (
+    "index,uuid,pci.bus_id,name,memory.total,driver_version,compute_cap"
+)
+_NVIDIA_GPU_QUERY_FIELDS_LEGACY = (
+    "index,uuid,pci.bus_id,name,memory.total,driver_version"
+)
+_UNKNOWN_NVIDIA_VALUES = {"", "n/a", "na", "[n/a]", "[not supported]", "unknown"}
+
+
 def _run(cmd: List[str], timeout: int = 5) -> Optional[str]:
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -38,17 +66,85 @@ def _run(cmd: List[str], timeout: int = 5) -> Optional[str]:
         return None
 
 
+def _optional_nvidia_value(value: str) -> Optional[str]:
+    text = str(value or "").strip()
+    return None if text.lower() in _UNKNOWN_NVIDIA_VALUES else text
+
+
+def _optional_nvidia_float(value: str) -> Optional[float]:
+    text = _optional_nvidia_value(value)
+    if text is None:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _parse_nvidia_gpu_inventory(output: str, *, has_compute_capability: bool = True) -> List[GPUDevice]:
+    """Parse the ordered output of the NVIDIA physical-device inventory query.
+
+    Rows without a valid physical index cannot be assigned a stable identity
+    and are omitted rather than guessed. Optional values remain ``None`` when
+    the driver reports them as unavailable.
+    """
+    devices: List[GPUDevice] = []
+    expected_fields = 7 if has_compute_capability else 6
+    for row in csv.reader((output or "").splitlines()):
+        if not row or not any(str(value).strip() for value in row):
+            continue
+        if len(row) < expected_fields:
+            continue
+        try:
+            physical_index = int(row[0].strip())
+        except (TypeError, ValueError):
+            continue
+        name = _optional_nvidia_value(row[3]) or "unknown"
+        devices.append(GPUDevice(
+            physical_index=physical_index,
+            uuid=_optional_nvidia_value(row[1]),
+            pci_bus_id=_optional_nvidia_value(row[2]),
+            name=name,
+            total_vram_mb=_optional_nvidia_float(row[4]),
+            driver_version=_optional_nvidia_value(row[5]),
+            compute_capability=(
+                _optional_nvidia_value(row[6]) if has_compute_capability else None
+            ),
+        ))
+    return devices
+
+
+def detect_gpus() -> List[GPUDevice]:
+    """Return every physical NVIDIA GPU in ``nvidia-smi`` output order.
+
+    This is inventory only. It does not infer CUDA runtime-visible indices or
+    a runtime's selected devices. Older drivers which reject ``compute_cap``
+    are retried without that optional field.
+    """
+    if not shutil.which("nvidia-smi"):
+        return []
+    command = ["nvidia-smi", f"--query-gpu={_NVIDIA_GPU_QUERY_FIELDS}",
+               "--format=csv,noheader,nounits"]
+    out = _run(command)
+    if out:
+        return _parse_nvidia_gpu_inventory(out)
+    legacy_command = ["nvidia-smi", f"--query-gpu={_NVIDIA_GPU_QUERY_FIELDS_LEGACY}",
+                      "--format=csv,noheader,nounits"]
+    legacy_out = _run(legacy_command)
+    return _parse_nvidia_gpu_inventory(legacy_out or "", has_compute_capability=False)
+
+
 def detect_gpu() -> GPUInfo:
-    """Best-effort single-GPU detection. Returns a 'none' vendor if nothing is readable."""
-    if shutil.which("nvidia-smi"):
-        out = _run(["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
-                    "--format=csv,noheader,nounits"])
-        if out:
-            line = out.strip().splitlines()[0]
-            parts = [x.strip() for x in line.split(",")]
-            name, mem = parts[:2]
-            driver = parts[2] if len(parts) > 2 else None
-            return GPUInfo("nvidia", name, round(float(mem) / 1024, 1), True, True, driver)
+    """Compatibility projection of the first physical NVIDIA device.
+
+    Existing RC20 callers retain the original first-row behavior. New code
+    must use :func:`detect_gpus` for complete physical inventory.
+    """
+    devices = detect_gpus()
+    if devices:
+        first = devices[0]
+        total_vram_gb = round(first.total_vram_mb / 1024, 1) if first.total_vram_mb is not None else 0.0
+        return GPUInfo("nvidia", first.name, total_vram_gb, True, True, first.driver_version)
     if shutil.which("rocm-smi"):
         out = _run(["rocm-smi", "--showmeminfo", "vram", "--csv"])
         vram = 0.0

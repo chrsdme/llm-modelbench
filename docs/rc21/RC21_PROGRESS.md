@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | 0. Working-tree preparation outside Codex | Pending human action | Clean reviewed working tree |
 | 1. Architecture audit and durable plan | Complete, awaiting human review | This RC21 documentation set |
-| 2. Arbitrary-N real GPU inventory | Not started | Compatibility inventory API and tests |
+| 2. Arbitrary-N real GPU inventory | Implemented; real-hardware acceptance pending | Compatibility inventory API and tests |
 | 3. Backend protocol and Ollama preservation | Not started | Protocol, adapter, compatibility tests |
 | 4. Runtime profiles and discovery/selection | Not started | Profile schema and selection workflow |
 | 5. External llama-server backend | Not started | Read-only external backend adapter |
@@ -26,3 +26,13 @@
 Review `RC21_MASTER_PLAN.md` and `RC21_SOURCE_AUDIT.md`. Do not begin Stage 2 until the operator has prepared a clean reviewed working tree outside Codex and approved the Stage 2 objective below.
 
 **Proposed Stage 2 objective:** replace the single-card hardware discovery internals with arbitrary-N physical GPU inventory while retaining `detect_gpu()` and current scalar fields as compatibility wrappers; no backend/runtime behavior changes in that stage.
+
+## Stage 2 record
+
+- Added `detect_gpus()` and `GPUDevice` in `llm_modelbench/hardware.py`; `detect_gpu()` remains the first-device `GPUInfo` compatibility wrapper.
+- Added an inventory list to doctor output without changing the existing scalar `GPU:` line.
+- Focused suite passed: 59 tests covering multi-row ordering, identities, optional values, wrapper/no-GPU behavior, and existing scalar consumers.
+- The required local read-only inventory returned `[]`; direct `nvidia-smi -L` could not communicate with the NVIDIA driver. The RTX 5060 Ti plus RTX 3060 acceptance target remains pending on a driver-accessible host.
+- See `docs/rc21/stage-02-multigpu-inventory.md` for the compatibility boundary, known limitations, and rollback point.
+
+**Proposed Stage 3 objective:** define a capability-oriented backend protocol while preserving Ollama and Mock client behavior; do not implement a new backend or runtime selection yet.

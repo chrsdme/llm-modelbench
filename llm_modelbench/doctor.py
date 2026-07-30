@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from . import __version__
-from .hardware import detect_gpu, live_snapshot
+from .hardware import detect_gpu, detect_gpus, live_snapshot
 
 
 def _run(cmd: List[str], timeout: int = 5) -> str:
@@ -34,6 +34,7 @@ def collect(cfg: Any) -> Dict[str, Any]:
     exe = shutil.which("llm-modelbench")
     disk = shutil.disk_usage(os.getcwd())
     gpu = detect_gpu()
+    gpus = detect_gpus()
     hw, _ = live_snapshot(None)
     base = cfg.ollama_url.rstrip("/")
     version = _url_json(base + "/api/version")
@@ -58,6 +59,7 @@ def collect(cfg: Any) -> Dict[str, Any]:
         "node": shutil.which("node"),
         "node_version": _run(["node", "--version"]) if shutil.which("node") else None,
         "gpu": gpu.__dict__,
+        "gpus": [device.__dict__ for device in gpus],
         "hardware_live": hw,
         "disk_free_gb": round(disk.free / 1024**3, 1),
         "disk_total_gb": round(disk.total / 1024**3, 1),
@@ -93,9 +95,11 @@ def render(data: Dict[str, Any]) -> str:
     if data.get("ollama_error"):
         lines.append(f"Ollama error:      {data.get('ollama_error')}")
     gpu = data.get("gpu") or {}
+    gpus = data.get("gpus") or []
     lines += [
         "",
         f"GPU:               {ok_gpu}  {gpu.get('vendor')}  {gpu.get('name')}  VRAM={gpu.get('total_vram_gb')}GB",
+        f"GPUs detected:     {len(gpus)} physical NVIDIA device(s)",
         f"nvidia-smi:        {data.get('nvidia_smi') or 'not found'}",
         f"Node.js:           {'ok' if data.get('node') else 'WARN'}  {data.get('node') or 'not found'}  version={data.get('node_version') or 'n/a'}",
     ]
@@ -103,6 +107,15 @@ def render(data: Dict[str, Any]) -> str:
         lines.append("Node warning:      js_debounce will be marked HarnessError/skipped from quality instead of scoring models 0.0.")
     if data.get("nvidia_smi_query"):
         lines.append(f"nvidia-smi query:  {data.get('nvidia_smi_query')}")
+    for device in gpus:
+        lines.append(
+            "GPU device:        "
+            f"index={device.get('physical_index')} name={device.get('name')} "
+            f"uuid={device.get('uuid') or 'unavailable'} "
+            f"pci={device.get('pci_bus_id') or 'unavailable'} "
+            f"vram={device.get('total_vram_mb') if device.get('total_vram_mb') is not None else 'unavailable'} MiB "
+            f"compute_capability={device.get('compute_capability') or 'unavailable'}"
+        )
     hw = data.get("hardware_live") or {}
     if hw:
         lines.append(f"Live telemetry:    GPU {hw.get('gpu_temp_c','n/a')}C, VRAM {hw.get('vram_used_mb','n/a')}/{hw.get('vram_total_mb','n/a')} MiB, RAM {hw.get('ram_used_pct','n/a')}%")
