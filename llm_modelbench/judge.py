@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from typing import Optional, Tuple
 
+from .backend import InferenceClient
 from .scoring import strip_thinking
 
 ANCHORS = """
@@ -71,7 +72,7 @@ def _parse_score(text: str) -> Tuple[Optional[float], str]:
     return round(score_f, 2), reason
 
 
-def judge_single(client, judge_model: str, prompt: str, output: str, rubric: str, *, num_ctx=None, think="auto"):
+def judge_single(client: InferenceClient, judge_model: str, prompt: str, output: str, rubric: str, *, num_ctx=None, think="auto"):
     judge_prompt = f"""You are grading a model answer for a benchmark.
 
 Rubric: {rubric}
@@ -100,7 +101,7 @@ Do not include markdown, prose outside JSON, or hidden reasoning.
     return _parse_score(res.get("text") or "")
 
 
-def judge_panel(client, judge_model: str, prompt: str, output: str, rubric: str, *, num_ctx=None, think="auto"):
+def judge_panel(client: InferenceClient, judge_model: str, prompt: str, output: str, rubric: str, *, num_ctx=None, think="auto"):
     personas = [
         "strict correctness judge: penalize factual errors and missed constraints",
         "pragmatic usefulness judge: reward usable, actionable, well-structured answers",

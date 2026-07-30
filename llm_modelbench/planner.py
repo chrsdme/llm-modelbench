@@ -17,6 +17,7 @@ from .filters import describe_filters, filter_models, filter_tasks, validate_tas
 from .runner import _samples_for_task
 from .tasks import TASKS, tasks_for
 from .progress import seconds_hms
+from .backend import InferenceClient
 
 
 def _rough_seconds(samples_total: int, models_total: int) -> int:
@@ -26,7 +27,7 @@ def _rough_seconds(samples_total: int, models_total: int) -> int:
 
 
 def build_plan(
-    client: Any,
+    client: InferenceClient,
     cfg: Any,
     *,
     level: str = "smoke",

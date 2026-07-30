@@ -29,6 +29,7 @@ from .filters import (
 from .classify import classify_model, size_gb
 from .config import Config
 from .hardware import Telemetry, ProbeTelemetry, detect_gpu, nvidia_live, host_memory_snapshot
+from .backend import BackendCapability, InferenceClient, supports_capability
 from .tasks import Task, tasks_for, make_needle_prompt, TASKS
 from .inline_ui import InlineUI
 
@@ -1015,9 +1016,13 @@ def _run_once(
                 wanted_ctx = int(actual_prompt_tokens) + needle_num_predict + 64
                 kv = _needle_kv_estimate(client, cfg, model, wanted_ctx, measured_estimate)
             err = _model_output_error(res) if res.get("ok") else _harness_error(res.get("error", "failed"), res)
-            loaded_stats = client.loaded_model_stats(model) if hasattr(client, "loaded_model_stats") else None
+            loaded_stats = (
+                client.loaded_model_stats(model)
+                if supports_capability(client, BackendCapability.LOADED_MODEL_STATS)
+                else None
+            )
             offload = (loaded_stats or {}).get("offload_fraction")
-            if offload is None and hasattr(client, "offload_fraction"):
+            if offload is None and supports_capability(client, BackendCapability.OFFLOAD_FRACTION):
                 offload = client.offload_fraction(model)
             vram_probe_mb = probe_hw.get("vram_peak_mb") or _current_vram_used_mb()
             output_text = str(res.get("text") or "")
@@ -1266,7 +1271,7 @@ def _dump_raw(out_dir: Path, task: Task, model: str, output: str, sample_index: 
     return path
 
 
-def run(client, cfg: Config, *, level: str, out_dir: Path,
+def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
         include: Optional[str], exclude: Optional[str], skip_offload: bool,
         categories: Optional[List[str]], task_ids: Optional[List[str]] = None,
         task_regex: Optional[str] = None, family_base_only: bool = False,
@@ -1447,8 +1452,12 @@ def run(client, cfg: Config, *, level: str, out_dir: Path,
             context_length_max = client.context_length(model)
             num_ctx_used = _ctx(cfg)
             display_ctx = num_ctx_used or context_length_max
-            offload = client.offload_fraction(model, exact=True)
-            if offload is None:
+            offload = (
+                client.offload_fraction(model, exact=True)
+                if supports_capability(client, BackendCapability.OFFLOAD_FRACTION)
+                else None
+            )
+            if offload is None and supports_capability(client, BackendCapability.OFFLOAD_FRACTION):
                 offload = client.offload_fraction(model, exact=False)
             model_started_at = time.perf_counter()
             status.start_model(model_index, model, cls, sz, len(all_model_tasks), display_ctx, offload)

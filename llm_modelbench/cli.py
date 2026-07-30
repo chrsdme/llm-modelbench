@@ -30,6 +30,13 @@ from . import __version__
 from .config import Config
 from .classify import classify_model, families_for, size_gb
 from .filters import parse_task_ids
+from .backend import (
+    BackendCapability,
+    InferenceClient,
+    MockBackendAdapter,
+    OllamaBackendAdapter,
+    require_capability,
+)
 
 
 def _ollama_port(url: str) -> int:
@@ -40,12 +47,12 @@ def _ollama_port(url: str) -> int:
         raise SystemExit(f"invalid Ollama URL port in {url!r}") from exc
 
 
-def _client(args, cfg: Config):
+def _client(args, cfg: Config) -> InferenceClient:
     if getattr(args, "mock", False):
         from .ollama import MockClient
-        return MockClient(cfg.ollama_url, cfg.seed, cfg.temperature, cfg.request_timeout)
+        return MockBackendAdapter(MockClient(cfg.ollama_url, cfg.seed, cfg.temperature, cfg.request_timeout))
     from .ollama import OllamaClient
-    return OllamaClient(cfg.ollama_url, cfg.seed, cfg.temperature, cfg.request_timeout)
+    return OllamaBackendAdapter(OllamaClient(cfg.ollama_url, cfg.seed, cfg.temperature, cfg.request_timeout))
 
 
 def _run_dir(args) -> Path:
@@ -786,6 +793,9 @@ def cmd_repair(args, cfg):
         yes=bool(args.yes or auto_confirm),
     )
     client = _client(args, cfg)
+    if args.kv_cascade:
+        require_capability(client, BackendCapability.OLLAMA_SERVICE_REPAIR)
+        require_capability(client, BackendCapability.OLLAMA_KV_REPAIR)
     rankings_dir = _ranking_dir_for(args, run_id=f"repair_{plan.plan_id}")
     ranking_scope = "separate" if getattr(args, "separate_ranking", False) else "canonical"
     if args.kv_cascade:

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from .hardware import ProbeTelemetry, detect_gpu
+from .backend import InferenceClient
 
 
 def _read_rows(path: Path) -> list[dict]:
@@ -116,7 +117,7 @@ def _build_behavior_prompt(target_ctx: int, chars_per_token: float) -> Tuple[str
 
 
 def run_behavior_probe(
-    client: Any,
+    client: InferenceClient,
     *,
     model: str,
     target_ctx: int,
@@ -309,7 +310,7 @@ def validate_context_telemetry(
 
 
 def run_context_profile(
-    client: Any,
+    client: InferenceClient,
     cfg: Any,
     *,
     model: str,
