@@ -61,6 +61,6 @@ Review `RC21_MASTER_PLAN.md` and `RC21_SOURCE_AUDIT.md`. Do not begin Stage 2 un
 
 - Corrected the bounded Ollama `/api/tags` health read: a 4096-byte truncation falsely classified the real 57-model inventory as invalid JSON. Responses now have a deliberate 4 MiB limit and fail explicitly when exceeded.
 - Hardened tags-shape validation, runtime subcommand error boundaries, unknown-profile deletion, and `_client()` so only the documented no-healthy-candidate legacy case can fall back to implicit Ollama. Ambiguous or unhealthy explicit/default selection remains fail-closed.
-- Fixture regression coverage was added for these cases. The operator must rerun real-host acceptance outside Codex; Stage 4 remains pending that confirmation.
+- Regression coverage was added for these cases. Operator acceptance on the AI-PC completed Stage 4: Ollama `0.30.7` was healthy with 57 installed and no loaded models; llama-server was healthy at `127.0.0.1:8081`; two GPUs recommended llama.cpp; interactive selection displayed both runtimes; unattended ambiguity exited 1 requiring `--runtime-profile`; and explicit llama.cpp selection stopped at the Stage 5 boundary. The canonical inventory digest remained `5f553c1450d7f2b1c3e52010bcd0db205a63a9ec42bf037072d795b7972a933c`.
 
 **Proposed Stage 5 objective:** implement the external llama-server inference adapter while preserving Ollama and failing closed for unsupported switching and service operations.

@@ -45,12 +45,6 @@ python3 -m pytest -q tests/test_runtime_profiles.py tests/test_backend.py tests/
 
 It covers serialization, atomic writes, legacy compatibility, precedence, automatic/interactive selection, unattended ambiguity, unhealthy default failure, one/multi-GPU recommendation, deduplication, deletion containment, no-mutation discovery, and pre-Stage-5 llama.cpp rejection.
 
-## Real-host acceptance fix iteration
-
-The initial real-host acceptance found that `/api/tags` for 57 installed models exceeded the former 4096-byte read cap, causing a false `did not return JSON` health result. This iteration replaces that truncation with a deliberate 4 MiB bounded read and adds regression coverage for a valid response above 4096 bytes, a response exceeding the bound, non-object JSON, and an object without a list-valued `models` field.
-
-It also adds regression coverage for clean invalid runtime command exits and for `_client()` remaining fail-closed when both Ollama and llama.cpp are healthy. The full real-host acceptance must be rerun by the operator outside Codex; this document does not claim it passed.
-
 Full validation passed:
 
 ```text
@@ -67,7 +61,7 @@ passed
 
 ## Real-host discovery evidence
 
-Codex could not access the host loopback services, so final acceptance was performed separately on the real AI-PC.
+Codex did not perform the host validation. Operator acceptance on the real AI-PC completed Stage 4.
 
 ### Ollama-only acceptance
 
@@ -96,13 +90,13 @@ After discovery and selection tests:
 
 ## Real-host acceptance fix iteration
 
-Initial host testing exposed three defects that were corrected before acceptance:
+Initial host testing exposed three defects that were corrected before operator acceptance:
 
 - Ollama `/api/tags` responses larger than 4096 bytes were truncated and falsely classified as invalid JSON. Health probes now use a bounded 4 MiB response limit and reject oversized responses explicitly.
 - Unknown profile deletion previously confirmed first and then exposed an uncaught exception. Runtime-profile CLI errors now exit cleanly, and existence is checked before confirmation.
 - The legacy Ollama fallback could absorb an unattended multiple-runtime ambiguity. It now applies only when no healthy candidate and no explicit, default, or saved profile exists.
 
-Regression coverage was added for large and oversized health responses, non-object JSON, invalid tags schemas, clean CLI errors, ambiguity fail-closed behaviour, and the documented legacy fallback.
+Regression coverage covers large and oversized health responses, non-object JSON, invalid tags schemas, clean unknown-profile CLI errors, ambiguity fail-closed behaviour, the documented legacy fallback, and deterministic adapter construction that cannot consult real discovery, loopback health, `/proc`, or local profiles.
 
 ## Known limitations and rollback
 

@@ -16,6 +16,7 @@ from llm_modelbench.backend import (
 )
 from llm_modelbench.config import Config
 from llm_modelbench.ollama import MockClient, OllamaClient
+from llm_modelbench.runtime_profiles import RuntimeCandidate, RuntimeProfile
 
 
 def test_ollama_adapter_conforms_and_delegates_without_network(monkeypatch):
@@ -78,10 +79,27 @@ def test_adapter_preserves_underlying_exception_behavior(monkeypatch):
         adapter.embed("model", ["text"])
 
 
-def test_cli_client_construction_uses_neutral_adapters():
-    from llm_modelbench import cli
+def test_cli_client_construction_uses_neutral_adapters(monkeypatch):
+    from llm_modelbench import cli, runtime_profiles
 
     cfg = Config()
+    candidate = RuntimeCandidate(
+        RuntimeProfile("test-ollama", "ollama", "http://127.0.0.1:11434"),
+        "healthy", ("fixture",), "fixture",
+    )
+    discovery_calls = []
+    def unexpected_host_access(*args, **kwargs):
+        raise AssertionError("adapter construction must not consult host runtime state")
+
+    monkeypatch.setattr(runtime_profiles, "_process_profiles", unexpected_host_access)
+    monkeypatch.setattr("urllib.request.urlopen", unexpected_host_access)
+    monkeypatch.setattr(cli, "load_profiles", lambda path: ([], None))
+    monkeypatch.setattr(
+        cli,
+        "discover_runtimes",
+        lambda received_cfg, store_path: discovery_calls.append((received_cfg, store_path)) or [candidate],
+    )
+
     mock = cli._client(SimpleNamespace(mock=True), cfg)
     real = cli._client(SimpleNamespace(mock=False), cfg)
 
@@ -89,3 +107,4 @@ def test_cli_client_construction_uses_neutral_adapters():
     assert isinstance(real, OllamaBackendAdapter)
     assert mock.backend_identity().backend == "mock"
     assert real.backend_identity().backend == "ollama"
+    assert discovery_calls == [(cfg, cli._runtime_store(SimpleNamespace()))]
