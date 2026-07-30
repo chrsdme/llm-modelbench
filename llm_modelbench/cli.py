@@ -84,9 +84,8 @@ def _client(args, cfg: Config) -> InferenceClient:
     profile = selected.profile
     setattr(args, "_runtime_profile", profile)
     if profile.backend == "llama_cpp":
-        raise SystemExit(
-            f"runtime profile {profile.name!r} selects llama.cpp, but inference is not available until RC21 Stage 5"
-        )
+        from .llama_cpp import LlamaCppBackendAdapter, LlamaCppClient
+        return LlamaCppBackendAdapter(LlamaCppClient(profile.endpoint, cfg.seed, cfg.temperature, cfg.request_timeout))
     cfg.ollama_url = profile.endpoint
     from .ollama import OllamaClient
     return OllamaBackendAdapter(OllamaClient(profile.endpoint, cfg.seed, cfg.temperature, cfg.request_timeout))
@@ -1772,7 +1771,7 @@ def build_parser():
     return p
 
 
-def main(argv=None):
+def _main(argv=None):
     args = build_parser().parse_args(argv)
     if args.selftest or args.cmd == "selftest":
         from . import selftest
@@ -1831,6 +1830,17 @@ def main(argv=None):
     elif args.cmd == "dossier": cmd_dossier(args, cfg)
     else:
         build_parser().print_help()
+
+
+def main(argv=None):
+    """Convert expected external llama-server failures to concise CLI exits."""
+    try:
+        return _main(argv)
+    except Exception as exc:
+        from .llama_cpp import LlamaCppError
+        if isinstance(exc, LlamaCppError):
+            raise SystemExit(f"llama.cpp error: {exc}") from exc
+        raise
 
 
 if __name__ == "__main__":

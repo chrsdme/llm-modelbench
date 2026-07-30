@@ -129,15 +129,15 @@ def test_discovery_is_read_only_and_does_not_probe_nonlocal_or_create_store(tmp_
     assert next(item for item in candidates if item.profile.name == "remote").health == "unsupported"
 
 
-def test_selected_llama_cpp_fails_before_stage_five_client_creation(monkeypatch):
+def test_selected_llama_cpp_creates_stage_five_client(monkeypatch):
     profile = RuntimeProfile("llama", "llama_cpp", "http://127.0.0.1:8081")
     candidate = RuntimeCandidate(profile, "healthy", ("fixture",), "fixture")
     monkeypatch.setattr(cli, "load_profiles", lambda path: ([profile], None))
     monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path: [candidate])
     args = SimpleNamespace(mock=False, runtime_profile="llama", runtime_profiles_file=None)
 
-    with pytest.raises(SystemExit, match="Stage 5"):
-        cli._client(args, _cfg())
+    from llm_modelbench.llama_cpp import LlamaCppBackendAdapter
+    assert isinstance(cli._client(args, _cfg()), LlamaCppBackendAdapter)
 
 
 def test_invalid_profile_is_rejected_without_store_mutation(tmp_path):

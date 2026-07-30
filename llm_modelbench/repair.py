@@ -43,6 +43,7 @@ from .hardware import detect_gpu
 from .judge_dumps import apply_judgements, judge_run
 from .rankings import _CURRENT_HASHES, rank_for_output
 from .tasks import TASKS
+from .backend import BackendCapability, supports_capability
 
 POLICY_VERSION = "2"
 _TASKS = {task.id: task for task in TASKS}
@@ -1415,7 +1416,8 @@ def apply_plan(
                 for task_id in tasks
             }
             try:
-                client.flush_all()
+                if supports_capability(client, BackendCapability.FLUSH_ALL):
+                    client.flush_all()
                 runner.run(
                     client, child_cfg,
                     level="full", out_dir=child_dir,
@@ -1501,7 +1503,8 @@ def apply_plan(
                 action_timed_out = action_timed_out or timed_out
             finally:
                 try:
-                    client.unload(action.model)
+                    if supports_capability(client, BackendCapability.MODEL_UNLOAD):
+                        client.unload(action.model)
                 except Exception:
                     pass
 

@@ -9,7 +9,7 @@
 | 2. Arbitrary-N real GPU inventory | Complete | Compatibility inventory API, tests, and real-host acceptance |
 | 3. Backend protocol and Ollama preservation | Complete | Protocol, adapters, compatibility tests, and real-host Ollama acceptance |
 | 4. Runtime profiles and discovery/selection | Complete | Profiles, bounded discovery, fail-closed selection, and real-host acceptance |
-| 5. External llama-server backend | Not started | Read-only external backend adapter |
+| 5. External llama-server backend | Complete | One-served-model external adapter with completed AI-PC direct and runner acceptance |
 | 6. Per-GPU/backend-neutral telemetry | Not started | Per-device/process evidence |
 | 7. Runtime-fit profiler | Not started | Diagnostic fit evidence lane |
 | 8. Campaign/report/ranking/resume integration | Not started | Frozen runtime identity and migrations |
@@ -64,3 +64,17 @@ Review `RC21_MASTER_PLAN.md` and `RC21_SOURCE_AUDIT.md`. Do not begin Stage 2 un
 - Regression coverage was added for these cases. Operator acceptance on the AI-PC completed Stage 4: Ollama `0.30.7` was healthy with 57 installed and no loaded models; llama-server was healthy at `127.0.0.1:8081`; two GPUs recommended llama.cpp; interactive selection displayed both runtimes; unattended ambiguity exited 1 requiring `--runtime-profile`; and explicit llama.cpp selection stopped at the Stage 5 boundary. The canonical inventory digest remained `5f553c1450d7f2b1c3e52010bcd0db205a63a9ec42bf037072d795b7972a933c`.
 
 **Proposed Stage 5 objective:** implement the external llama-server inference adapter while preserving Ollama and failing closed for unsupported switching and service operations.
+
+## Stage 5 record
+
+- Added a bounded, read-only external llama-server client and protocol adapter. It accepts exactly one served model ID or reported alias and rejects router/multi-model inventory.
+- Chat, structured JSON, reasoning preservation, template-gated tool calls, tokenization, slots, and observed usage/timing normalization are implemented without server lifecycle or property mutation.
+- Ollama and Mock behavior remain unchanged. Embeddings, suffix generation, unload, flush-all, service/KV repair, and unreported offload placement remain unsupported or unavailable.
+- Human review corrective iteration: made non-empty `/v1/models.data` authoritative, removed invented GGUF/vision metadata, hardened endpoint and nested response validation, rejected redirects, preserved tool/message/structured-output compatibility, and added clean selected-llama.cpp CLI error containment with no Ollama fallback.
+- Follow-up review correction: explicit thinking now maps only through `chat_template_kwargs.enable_thinking`; unsupported operations are cold-cache transport-free; and messages, props, slots, tools, and OpenAI response formats receive strict shape validation before HTTP. The redirect/error-size and no-Ollama-fallback containment remains covered.
+- Final closeout correction rejects Python boolean values for every interpreted integer request and endpoint field, including context/token controls, model metadata, slots, usage, and timing counters.
+- Direct AI-PC adapter acceptance at `/tmp/llmb-rc21-stage5-live-20260730T221916` passed: exactly one served model, build `b10086-66e4bf7e5`, active/training contexts `65536`/`262144`, one slot, tokenization, `think=off` with no separate or visible reasoning, structured JSON `{"status":"ok","value":5}`, a normalized but unexecuted `stage5_probe` tool call, and direct timing evidence. llama-server was healthy and idle afterward.
+- The first normal runner attempt failed before generation because `runner.py` called `flush_all()` unconditionally. Runner and reachable repair lifecycle calls are capability-gated before invocation. Unsupported llama.cpp cache/model lifecycle skips are backend routing, not harness or model-quality failures; supported Ollama, Mock, and legacy direct-client lifecycle behavior remains preserved.
+- Normal AI-PC runner acceptance at `/tmp/llmb-rc21-stage5-runner-20260730T234849` completed with run ID `rc21_stage5_runner_20260730T234849`: one served model and `json_extract`, exit `0`, score `100.0`, valid run, approximately `23.1 tok/s`, prompt-token metric `380 -> 455`, and predicted-token metric `59 -> 88`. The llama-server was healthy and idle afterward; Ollama remained at 57 installed models and zero loaded models; the canonical inventory digest remained `5f553c1450d7f2b1c3e52010bcd0db205a63a9ec42bf037072d795b7972a933c`; isolated profile stores ended empty. Final closeout validation passed: 136 focused tests and 613 full-suite tests. Stage 6 has not started. See `docs/rc21/stage-05-external-llama-server-backend.md`.
+
+**Proposed Stage 6 objective:** collect per-GPU and backend-neutral server-process telemetry without changing benchmark scoring or runtime lifecycle behavior.

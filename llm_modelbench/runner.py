@@ -1440,7 +1440,8 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
             model_tasks = [t for t in all_model_tasks if (model, t.id, _task_hash(t)) not in done]
             if not model_tasks:
                 continue
-            client.flush_all()
+            if supports_capability(client, BackendCapability.FLUSH_ALL):
+                client.flush_all()
             # Warm up through a compatible provider path. Embedding-only models
             # must not be forced through chat, and insert-only models use suffix generation.
             if "text" in fams:
@@ -1640,7 +1641,8 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
                         for p in fingerprint.PROBES]
                 fingerprints[model] = outs
             status.finish_model(model)
-            client.unload(model)
+            if supports_capability(client, BackendCapability.MODEL_UNLOAD):
+                client.unload(model)
 
     (out_dir / "fingerprints.json").write_text(json.dumps(fingerprints, indent=2))
     (out_dir / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2))
