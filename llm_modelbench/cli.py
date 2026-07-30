@@ -37,6 +37,18 @@ from .backend import (
     OllamaBackendAdapter,
     require_capability,
 )
+from .runtime_profiles import (
+    RuntimeProfile,
+    RuntimeProfileError,
+    RuntimeSelectionError,
+    delete_profile,
+    discover_runtimes,
+    implicit_ollama_profile,
+    load_profiles,
+    profile_store_path,
+    save_profile,
+    select_runtime,
+)
 
 
 def _ollama_port(url: str) -> int:
@@ -51,8 +63,122 @@ def _client(args, cfg: Config) -> InferenceClient:
     if getattr(args, "mock", False):
         from .ollama import MockClient
         return MockBackendAdapter(MockClient(cfg.ollama_url, cfg.seed, cfg.temperature, cfg.request_timeout))
+    try:
+        profiles, default = load_profiles(_runtime_store(args))
+        candidates = discover_runtimes(cfg, store_path=_runtime_store(args))
+        explicit = getattr(args, "runtime_profile", None)
+        try:
+            selected = select_runtime(
+                candidates, explicit_profile=explicit, default_profile=default,
+                interactive=bool(sys.stdin.isatty()),
+            )
+        except RuntimeSelectionError as exc:
+            # Preserve the established no-profile Ollama behavior when the local
+            # service is down. Any explicit, saved, or ambiguous selection is
+            # fail-closed and must not silently choose Ollama.
+            if (exc.reason != "no_healthy_candidates" or explicit or default or profiles):
+                raise
+            selected = type("LegacySelection", (), {"profile": implicit_ollama_profile(cfg)})()
+    except RuntimeProfileError as exc:
+        raise SystemExit(f"runtime selection failed: {exc}") from exc
+    profile = selected.profile
+    setattr(args, "_runtime_profile", profile)
+    if profile.backend == "llama_cpp":
+        raise SystemExit(
+            f"runtime profile {profile.name!r} selects llama.cpp, but inference is not available until RC21 Stage 5"
+        )
+    cfg.ollama_url = profile.endpoint
     from .ollama import OllamaClient
-    return OllamaBackendAdapter(OllamaClient(cfg.ollama_url, cfg.seed, cfg.temperature, cfg.request_timeout))
+    return OllamaBackendAdapter(OllamaClient(profile.endpoint, cfg.seed, cfg.temperature, cfg.request_timeout))
+
+
+def _runtime_store(args) -> Path:
+    value = getattr(args, "runtime_profiles_file", None)
+    return Path(value) if value else profile_store_path()
+
+
+def _confirm_profile_change(message: str, *, yes: bool) -> None:
+    if yes:
+        return
+    if not sys.stdin.isatty():
+        raise SystemExit(message + " Re-run with --yes after reviewing the change.")
+    if input(message + " Type y to continue: ").strip().lower() not in {"y", "yes"}:
+        raise SystemExit("runtime profile change cancelled")
+
+
+def cmd_runtime(args, cfg) -> None:
+    """Keep runtime-management failures at the CLI boundary, not as tracebacks."""
+    try:
+        _cmd_runtime(args, cfg)
+    except RuntimeProfileError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def _cmd_runtime(args, cfg) -> None:
+    store = _runtime_store(args)
+    if args.runtime_cmd == "list":
+        profiles, default = load_profiles(store)
+        print(json.dumps({"store": str(store), "default_profile": default,
+                          "profiles": [profile.to_dict() for profile in profiles]}, indent=2))
+        return
+    if args.runtime_cmd == "show":
+        profiles, default = load_profiles(store)
+        profile = next((item for item in profiles if item.name == args.name), None)
+        if profile is None:
+            raise SystemExit(f"unknown runtime profile: {args.name}")
+        print(json.dumps({"profile": profile.to_dict(), "default": default == profile.name}, indent=2))
+        return
+    if args.runtime_cmd == "discover":
+        print(json.dumps([candidate.to_dict() for candidate in discover_runtimes(cfg, store_path=store)], indent=2))
+        return
+    if args.runtime_cmd == "save":
+        profile = RuntimeProfile(
+            args.name, args.backend, args.endpoint, physical_gpu_uuids=tuple(args.gpu_uuid or ()),
+            description=args.description, provenance=args.provenance,
+        )
+        profiles, _ = load_profiles(store)
+        existing = any(item.name == profile.name for item in profiles)
+        if existing and not args.replace:
+            raise SystemExit(f"runtime profile already exists: {profile.name}; use --replace to replace it")
+        if existing:
+            _confirm_profile_change(f"Replace saved runtime profile {profile.name!r}?", yes=args.yes)
+        save_profile(profile, path=store, replace=args.replace, set_default=args.set_default)
+        print(json.dumps(profile.to_dict(), indent=2))
+        return
+    if args.runtime_cmd == "delete":
+        profiles, _ = load_profiles(store)
+        if not any(profile.name == args.name for profile in profiles):
+            raise RuntimeProfileError(f"unknown runtime profile: {args.name}")
+        _confirm_profile_change(f"Delete saved runtime profile {args.name!r}? This does not affect a runtime service or models.", yes=args.yes)
+        delete_profile(args.name, path=store)
+        print(f"deleted runtime profile {args.name}")
+        return
+    if args.runtime_cmd == "select":
+        profiles, default = load_profiles(store)
+        candidates = discover_runtimes(cfg, store_path=store)
+        try:
+            selected = select_runtime(
+                candidates, explicit_profile=args.runtime_profile, default_profile=default,
+                interactive=bool(sys.stdin.isatty()),
+            )
+        except RuntimeSelectionError as exc:
+            raise SystemExit(str(exc)) from exc
+        profile = selected.profile
+        if args.save_name:
+            saved = RuntimeProfile(
+                args.save_name, profile.backend, profile.endpoint,
+                physical_gpu_uuids=profile.physical_gpu_uuids,
+                description=profile.description, provenance="discovered",
+            )
+            existing = any(item.name == saved.name for item in profiles)
+            if existing and not args.replace:
+                raise SystemExit(f"runtime profile already exists: {saved.name}; use --replace to replace it")
+            if existing:
+                _confirm_profile_change(f"Replace saved runtime profile {saved.name!r}?", yes=args.yes)
+            save_profile(saved, path=store, replace=args.replace, set_default=args.set_default)
+            profile = saved
+        print(json.dumps({"selected": profile.to_dict(), "recommended": selected.recommended}, indent=2))
+        return
 
 
 def _run_dir(args) -> Path:
@@ -1196,6 +1322,7 @@ def _add_run_filters(
     r, *, include_model_selection: bool = True, include_auto: bool = True,
     auto_default: bool = False,
 ):
+    r.add_argument("--runtime-profile", help="saved runtime profile; explicit selection takes precedence")
     r.add_argument("--level", choices=["smoke", "short", "full"], default="smoke")
     r.add_argument("--categories", help="comma-separated category filter")
     r.add_argument("--tasks", help="comma-separated task IDs to run, e.g. py_anagram,json_extract,needle")
@@ -1252,6 +1379,7 @@ def build_parser():
                                 description="Hardware-adaptive benchmark suite for local Ollama models.")
     p.add_argument("--version", action="version", version=f"llm-modelbench {__version__}")
     p.add_argument("--config", help="path to a JSON or YAML config file")
+    p.add_argument("--runtime-profiles-file", help=argparse.SUPPRESS)
     p.add_argument("--selftest", action="store_true", help="run offline scorer tests and exit")
     sub = p.add_subparsers(dest="cmd")
 
@@ -1259,9 +1387,36 @@ def build_parser():
     inv.add_argument("--json", action="store_true")
     inv.add_argument("--mock", action="store_true", help="use offline stub model list")
     inv.add_argument("--auto", action="store_true", help="also run functional capability probes")
+    inv.add_argument("--runtime-profile", help="saved runtime profile; explicit selection takes precedence")
 
     doc = sub.add_parser("doctor", help="preflight environment, import path, Ollama, GPU, disk")
     doc.add_argument("--json", action="store_true")
+
+    runtime = sub.add_parser("runtime", help="discover and manage external local runtime profiles")
+    runtime_sub = runtime.add_subparsers(dest="runtime_cmd", required=True)
+    runtime_sub.add_parser("discover", help="bounded read-only local runtime discovery")
+    runtime_sub.add_parser("list", help="list saved runtime profiles")
+    runtime_show = runtime_sub.add_parser("show", help="show one saved runtime profile")
+    runtime_show.add_argument("name")
+    runtime_save = runtime_sub.add_parser("save", help="save one external runtime profile")
+    runtime_save.add_argument("--name", required=True)
+    runtime_save.add_argument("--backend", required=True, choices=["ollama", "llama_cpp"])
+    runtime_save.add_argument("--endpoint", required=True)
+    runtime_save.add_argument("--gpu-uuid", action="append")
+    runtime_save.add_argument("--description")
+    runtime_save.add_argument("--provenance", choices=["configured", "discovered", "legacy-default"], default="configured")
+    runtime_save.add_argument("--set-default", action="store_true")
+    runtime_save.add_argument("--replace", action="store_true")
+    runtime_save.add_argument("--yes", action="store_true")
+    runtime_delete = runtime_sub.add_parser("delete", help="delete only one saved runtime profile")
+    runtime_delete.add_argument("name")
+    runtime_delete.add_argument("--yes", action="store_true")
+    runtime_select = runtime_sub.add_parser("select", help="select a healthy discovered runtime")
+    runtime_select.add_argument("--runtime-profile")
+    runtime_select.add_argument("--save-name")
+    runtime_select.add_argument("--set-default", action="store_true")
+    runtime_select.add_argument("--replace", action="store_true")
+    runtime_select.add_argument("--yes", action="store_true")
 
     pl = sub.add_parser("plan", help="show active models, skipped models, tasks, samples, and rough ETA without running")
     _add_run_filters(pl)
@@ -1275,6 +1430,7 @@ def build_parser():
     camp_status.add_argument("campaign_id")
     camp_resume = camp_sub.add_parser("resume", help="resume the exact recorded interrupted campaign phase")
     camp_resume.add_argument("campaign_id")
+    camp_resume.add_argument("--runtime-profile", help="saved runtime profile; explicit selection takes precedence")
     camp_package = camp_sub.add_parser("package", help="write one campaign review package")
     camp_package.add_argument("campaign_id")
     camp_clean = camp_sub.add_parser("clean", help="preview or apply conservative retained-evidence cleanup")
@@ -1408,6 +1564,7 @@ def build_parser():
 
     cp = sub.add_parser("context-profile", help="run one controlled 64k-class needle telemetry profile")
     cp.add_argument("--model", required=True, help="exact installed Ollama model name")
+    cp.add_argument("--runtime-profile", help="saved runtime profile; explicit selection takes precedence")
     cp.add_argument("--run-id")
     cp.add_argument("--runs-dir", default="runs")
     cp.add_argument("--rankings-out", help="rankings directory refreshed after the profile; default: rankings")
@@ -1479,6 +1636,7 @@ def build_parser():
     jd.add_argument("--force", action="store_true", help="rejudge rows already judged by the same model/mode")
     jd.add_argument("--yes", action="store_true", help="approve the printed judge batch without an interactive prompt")
     jd.add_argument("--mock", action="store_true", help="offline deterministic judge for pipeline testing")
+    jd.add_argument("--runtime-profile", help="saved runtime profile; explicit selection takes precedence")
     jd.add_argument("--no-ranking-update", action="store_true", help="write judgements but skip automatic rankings refresh")
     jd.add_argument("--separate-ranking", action="store_true", help="generate an isolated rankings-separate/<run-id> report after judging")
 
@@ -1532,6 +1690,7 @@ def build_parser():
     rp.add_argument("--live-ui", choices=["off", "compact", "full", "log"], default="compact",
                     help="inline repair-aware dashboard for child runs; detached llmb-watch remains supported")
     rp.add_argument("--mock", action="store_true", help="offline deterministic repair pipeline test")
+    rp.add_argument("--runtime-profile", help="saved runtime profile; explicit selection takes precedence")
     rp.add_argument("--no-ranking-update", action="store_true", help="write repair evidence but skip automatic rankings refresh")
     rp.add_argument("--separate-ranking", action="store_true", help="generate an isolated rankings-separate/<plan-id> report for repair children")
 
@@ -1619,7 +1778,9 @@ def main(argv=None):
         from . import selftest
         sys.exit(selftest.run())
     cfg = Config.load(args.config)
-    if args.cmd == "doctor":
+    if args.cmd == "runtime":
+        cmd_runtime(args, cfg)
+    elif args.cmd == "doctor":
         cmd_doctor(args, cfg)
     elif args.cmd == "inventory":
         cmd_inventory(args, cfg)

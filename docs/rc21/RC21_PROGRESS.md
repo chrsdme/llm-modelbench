@@ -8,7 +8,7 @@
 | 1. Architecture audit and durable plan | Complete | This RC21 documentation set |
 | 2. Arbitrary-N real GPU inventory | Complete | Compatibility inventory API, tests, and real-host acceptance |
 | 3. Backend protocol and Ollama preservation | Complete | Protocol, adapters, compatibility tests, and real-host Ollama acceptance |
-| 4. Runtime profiles and discovery/selection | Implemented; real-host health acceptance pending | Profile schema and selection workflow |
+| 4. Runtime profiles and discovery/selection | Complete | Profiles, bounded discovery, fail-closed selection, and real-host acceptance |
 | 5. External llama-server backend | Not started | Read-only external backend adapter |
 | 6. Per-GPU/backend-neutral telemetry | Not started | Per-device/process evidence |
 | 7. Runtime-fit profiler | Not started | Diagnostic fit evidence lane |
@@ -53,8 +53,14 @@ Review `RC21_MASTER_PLAN.md` and `RC21_SOURCE_AUDIT.md`. Do not begin Stage 2 un
 - Added atomic JSON-backed external runtime profiles, bounded local discovery, backend-specific read-only health states, and selection precedence in `llm_modelbench/runtime_profiles.py`.
 - Added `llmb runtime discover|list|show|select|save|delete` and `--runtime-profile` wiring for inference commands; selecting llama.cpp before Stage 5 fails clearly.
 - Focused suite passed: 90 tests covering profile persistence, selection, recommendation, fail-closed cases, deduplication, and containment.
-- This execution environment could not reach the loopback Ollama health endpoint (`[Errno 1] Operation not permitted`) and saw no llama-server process. Healthy endpoint/multiple-runtime acceptance remains pending on the AI-PC shell.
-- An isolated temporary profile was saved, shown, deleted, and verified absent without any service or model mutation.
+- Final real-host acceptance detected healthy Ollama and llama-server endpoints, recommended llama.cpp on the dual-GPU host, displayed both interactive choices, and failed closed during unattended ambiguity.
+- Isolated Ollama and llama.cpp profiles were saved, shown, deleted, and verified absent. Ollama remained unloaded and its canonical 57-model inventory digest remained unchanged.
 - See `docs/rc21/stage-04-runtime-profiles-discovery.md` for storage, discovery bounds, health/selection policy, limitations, and rollback.
+
+### Stage 4 real-host acceptance fix iteration
+
+- Corrected the bounded Ollama `/api/tags` health read: a 4096-byte truncation falsely classified the real 57-model inventory as invalid JSON. Responses now have a deliberate 4 MiB limit and fail explicitly when exceeded.
+- Hardened tags-shape validation, runtime subcommand error boundaries, unknown-profile deletion, and `_client()` so only the documented no-healthy-candidate legacy case can fall back to implicit Ollama. Ambiguous or unhealthy explicit/default selection remains fail-closed.
+- Fixture regression coverage was added for these cases. The operator must rerun real-host acceptance outside Codex; Stage 4 remains pending that confirmation.
 
 **Proposed Stage 5 objective:** implement the external llama-server inference adapter while preserving Ollama and failing closed for unsupported switching and service operations.
