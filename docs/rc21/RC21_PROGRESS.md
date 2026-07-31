@@ -10,7 +10,7 @@
 | 3. Backend protocol and Ollama preservation | Complete | Protocol, adapters, compatibility tests, and real-host Ollama acceptance |
 | 4. Runtime profiles and discovery/selection | Complete | Profiles, bounded discovery, fail-closed selection, and real-host acceptance |
 | 5. External llama-server backend | Complete | One-served-model external adapter with completed AI-PC direct and runner acceptance |
-| 6. Per-GPU/backend-neutral telemetry | Audit/planning in progress | Stage 6A telemetry architecture audit and implementation plan |
+| 6. Per-GPU/backend-neutral telemetry | Stage 6B complete; ready for commit; Stage 6C not started | Pure UUID-keyed physical GPU sampling, not integrated |
 | 7. Runtime-fit profiler | Not started | Diagnostic fit evidence lane |
 | 8. Campaign/report/ranking/resume integration | Not started | Frozen runtime identity and migrations |
 | 9. Real acceptance and RC21 release | Not started | Acceptance record and release documentation |
@@ -89,3 +89,13 @@ Review `RC21_MASTER_PLAN.md` and `RC21_SOURCE_AUDIT.md`. Do not begin Stage 2 un
 - Stage 6A made no telemetry implementation, benchmark, service, model, runtime-profile, score, ranking, campaign-schema, version, or release changes. Stage 7 has not started.
 
 **Exact next action:** begin Stage 6B only after review with a new pure telemetry module, explicit field states, fixed query tiers, deterministic UUID join to existing inventory, and fixtures; do not integrate a legacy collector or add process attribution.
+
+## Stage 6B record
+
+- Added the standalone `llm_modelbench.telemetry` module with immutable physical sample/state structures, deterministic serialization, fixed extended/baseline NVIDIA query tiers, bounded injected subprocess collection, strict CSV parsing, and pure UUID-only inventory joins.
+- Review correction: duplicate live UUID groups are excluded rather than first-row-wins; every fixed-tier CSV row requires the exact column count; and `successful_tier` now means command completion plus CSV syntax and fixed schema success.
+- Review correction: ambiguous duplicate inventory UUID groups are excluded from enrichment, optional identity markers normalize to `None`, and `GPUCollectionResult` invariants reject contradictory evidence construction.
+- Offline fixture validation is complete: focused validation `57 passed`, full validation `664 passed`, compileall passed, selftest passed, release check passed, and `git diff --check` passed.
+- Real-host acceptance passed at `/tmp/llmb-rc21-stage6b-live-20260731T162617`: extended succeeded without fallback, exactly two samples were returned, expected UUID and PCI mappings and deterministic UUID ordering passed, inventory enrichment supplied driver and compute capability, and collection/join errors were empty. Collection left repository state unchanged.
+- Existing `detect_gpu`, `detect_gpus`, `Telemetry`, `ProbeTelemetry`, `nvidia_live`, `live_snapshot`, runner, reports, status, doctor, watcher, context profiling, ranking, campaigns, and repair were not changed or redirected. No scoring, ranking, report-schema, campaign-schema, or lifecycle behavior changed.
+- Stage 6B is complete and ready for commit. Stage 6 overall is not complete. Stage 6C has not started; its objective is bounded process discovery and process-to-GPU attribution.
