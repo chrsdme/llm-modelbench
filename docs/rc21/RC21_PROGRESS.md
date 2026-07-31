@@ -10,7 +10,7 @@
 | 3. Backend protocol and Ollama preservation | Complete | Protocol, adapters, compatibility tests, and real-host Ollama acceptance |
 | 4. Runtime profiles and discovery/selection | Complete | Profiles, bounded discovery, fail-closed selection, and real-host acceptance |
 | 5. External llama-server backend | Complete | One-served-model external adapter with completed AI-PC direct and runner acceptance |
-| 6. Per-GPU/backend-neutral telemetry | Not started | Per-device/process evidence |
+| 6. Per-GPU/backend-neutral telemetry | Audit/planning in progress | Stage 6A telemetry architecture audit and implementation plan |
 | 7. Runtime-fit profiler | Not started | Diagnostic fit evidence lane |
 | 8. Campaign/report/ranking/resume integration | Not started | Frozen runtime identity and migrations |
 | 9. Real acceptance and RC21 release | Not started | Acceptance record and release documentation |
@@ -78,3 +78,14 @@ Review `RC21_MASTER_PLAN.md` and `RC21_SOURCE_AUDIT.md`. Do not begin Stage 2 un
 - Normal AI-PC runner acceptance at `/tmp/llmb-rc21-stage5-runner-20260730T234849` completed with run ID `rc21_stage5_runner_20260730T234849`: one served model and `json_extract`, exit `0`, score `100.0`, valid run, approximately `23.1 tok/s`, prompt-token metric `380 -> 455`, and predicted-token metric `59 -> 88`. The llama-server was healthy and idle afterward; Ollama remained at 57 installed models and zero loaded models; the canonical inventory digest remained `5f553c1450d7f2b1c3e52010bcd0db205a63a9ec42bf037072d795b7972a933c`; isolated profile stores ended empty. Final closeout validation passed: 136 focused tests and 613 full-suite tests. Stage 6 has not started. See `docs/rc21/stage-05-external-llama-server-backend.md`.
 
 **Proposed Stage 6 objective:** collect per-GPU and backend-neutral server-process telemetry without changing benchmark scoring or runtime lifecycle behavior.
+
+## Stage 6A record
+
+- Completed the read-only architecture audit and staged implementation plan in `docs/rc21/stage-06-telemetry-audit-and-plan.md`.
+- The audit confirms that `detect_gpus()` already provides arbitrary-N physical inventory, but current live telemetry and scalar compatibility consumers still sample the first NVIDIA row. Stage 6B will add a UUID-keyed physical sample model without changing those existing fields.
+- The planned canonical physical identity is NVIDIA UUID, with PCI bus ID as supporting evidence and physical index only as a sample-time locator. CUDA ordinals and profile-declared GPU UUIDs are not proof of actual process placement.
+- The correction adds deterministic per-field telemetry states, moves confidence to per-runtime/GPU attribution records, and fixes Stage 6B to join live rows only to existing `GPUDevice` inventory by UUID. Its fixed extended/baseline `nvidia-smi` query tiers use bounded injected subprocess collection; Stage 6B does not integrate or replace any legacy collector.
+- Later process attribution will use bounded read-only local process/port evidence plus `nvidia-smi` compute-process UUID/memory records, and will report confirmed, probable, profile-declared-only, or unavailable confidence per GPU rather than guessing.
+- Stage 6A made no telemetry implementation, benchmark, service, model, runtime-profile, score, ranking, campaign-schema, version, or release changes. Stage 7 has not started.
+
+**Exact next action:** begin Stage 6B only after review with a new pure telemetry module, explicit field states, fixed query tiers, deterministic UUID join to existing inventory, and fixtures; do not integrate a legacy collector or add process attribution.
