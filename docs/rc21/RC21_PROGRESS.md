@@ -10,7 +10,7 @@
 | 3. Backend protocol and Ollama preservation | Complete | Protocol, adapters, compatibility tests, and real-host Ollama acceptance |
 | 4. Runtime profiles and discovery/selection | Complete | Profiles, bounded discovery, fail-closed selection, and real-host acceptance |
 | 5. External llama-server backend | Complete | One-served-model external adapter with completed AI-PC direct and runner acceptance |
-| 6. Per-GPU/backend-neutral telemetry | Stage 6B complete; ready for commit; Stage 6C not started | Pure UUID-keyed physical GPU sampling, not integrated |
+| 6. Per-GPU/backend-neutral telemetry | Stage 6C implemented; fixture validation complete; real-host attribution pending | Isolated UUID-keyed physical and process attribution evidence, not integrated |
 | 7. Runtime-fit profiler | Not started | Diagnostic fit evidence lane |
 | 8. Campaign/report/ranking/resume integration | Not started | Frozen runtime identity and migrations |
 | 9. Real acceptance and RC21 release | Not started | Acceptance record and release documentation |
@@ -98,4 +98,13 @@ Review `RC21_MASTER_PLAN.md` and `RC21_SOURCE_AUDIT.md`. Do not begin Stage 2 un
 - Offline fixture validation is complete: focused validation `57 passed`, full validation `664 passed`, compileall passed, selftest passed, release check passed, and `git diff --check` passed.
 - Real-host acceptance passed at `/tmp/llmb-rc21-stage6b-live-20260731T162617`: extended succeeded without fallback, exactly two samples were returned, expected UUID and PCI mappings and deterministic UUID ordering passed, inventory enrichment supplied driver and compute capability, and collection/join errors were empty. Collection left repository state unchanged.
 - Existing `detect_gpu`, `detect_gpus`, `Telemetry`, `ProbeTelemetry`, `nvidia_live`, `live_snapshot`, runner, reports, status, doctor, watcher, context profiling, ranking, campaigns, and repair were not changed or redirected. No scoring, ranking, report-schema, campaign-schema, or lifecycle behavior changed.
-- Stage 6B is complete and ready for commit. Stage 6 overall is not complete. Stage 6C has not started; its objective is bounded process discovery and process-to-GPU attribution.
+- Stage 6B is complete and ready for commit. Stage 6 overall is not complete. Stage 6C subsequently implemented isolated bounded process discovery and process-to-GPU attribution without redirecting this collector or any consumer.
+
+## Stage 6C record
+
+- Added the standalone `llm_modelbench.process_telemetry` module with bounded injected procfs discovery, stable PID/start-time identity, socket-inode ownership evidence, fixed NVIDIA compute-process CSV parsing, and deterministic per-runtime/per-GPU attribution.
+- Declared profile UUIDs and observed process UUIDs remain distinct. Attribution is `confirmed`, `probable`, `profile-declared only`, or `unavailable`; CUDA ordinals and runtime command-line placement options are never mapped to physical UUIDs.
+- Review correction: runtime observed UUIDs derive only from unambiguous confirmed/probable runtime matches; stable PID/start-time revalidation and unique compatible endpoint ownership are required for confirmed attribution. Procfs truncation, malformed socket rows, and ambiguous PID/owner groups remain bounded diagnostic evidence.
+- Live-evidence correction: empty procfs command lines are valid absent command identity rather than malformed evidence; non-empty malformed or truncated command lines remain bounded diagnostics. The authoritative manual before/query/after rerun passed at `/tmp/llmb-rc21-stage6c-manual-live-20260731T220628Z`: NVIDIA returned a successful empty idle result; Ollama was listening with two processes but no compute allocation; llama-server was unavailable and not started; reconciliation/attribution remained empty; bounded `proc_fd` limitations correctly kept socket evidence incomplete; repository state was unchanged.
+- No existing collector or consumer was redirected. `detect_gpu`, `detect_gpus`, `Telemetry`, `ProbeTelemetry`, `nvidia_live`, `live_snapshot`, runner, reports, status, doctor, watcher, context profiling, rankings, campaigns, and repair remain unchanged. No scoring, ranking, report-schema, campaign-schema, or lifecycle behavior changed.
+- Fixture validation is complete: the required Stage 6C/Stage 6B/inventory focused set has `104 passed`; the full suite has `711 passed`; compileall, selftest, release check, import side-effect check, and `git diff --check` passed. Stage 6C is complete; Stage 6 overall remains incomplete; Stage 6D has not started.

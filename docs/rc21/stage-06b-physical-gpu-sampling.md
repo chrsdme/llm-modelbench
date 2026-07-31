@@ -51,4 +51,4 @@ Real-host acceptance passed at `/tmp/llmb-rc21-stage6b-live-20260731T162617`. Th
 
 Rollback is removal of `telemetry.py`, its focused tests, and this document. No existing collector or consumer needs reversal because none was redirected.
 
-Stage 6B is complete and ready for commit. Stage 6 overall is not complete. Stage 6C has not started; its objective is bounded process discovery and process-to-GPU attribution.
+Stage 6B is complete and ready for commit. Stage 6 overall is not complete. Stage 6C subsequently implemented isolated bounded process discovery and process-to-GPU attribution; it did not redirect this collector or any consumer.
