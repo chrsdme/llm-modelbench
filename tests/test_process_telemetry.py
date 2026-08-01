@@ -332,3 +332,43 @@ def test_direct_result_invariants_reject_conflicting_query_and_relationships():
     second = pt.RuntimeProcessIdentity(10, 100, 1, None, None, (), (), "ollama", (), STAMP)
     result = pt.attribute_runtime_gpus(backend="ollama", endpoint_port=None, processes=(first, second), gpu_process_samples=(), timestamp_utc=STAMP)
     assert any(error.operation == "runtime_pid" for error in result.errors)
+
+
+def test_endpoint_owner_filters_exact_requested_port_before_ambiguity():
+    owner = pt.RuntimeProcessIdentity(10, 100, 1, "/x/ollama", "ollama", ("ollama", "serve"), (11434,), "ollama", ("proc_stat",), STAMP)
+    other = pt.RuntimeProcessIdentity(11, 101, 1, "/x/ollama", "ollama", ("ollama", "serve"), (11435,), "ollama", ("proc_stat",), STAMP)
+    result = pt.attribute_runtime_gpus(backend="ollama", endpoint_port=11434, processes=(owner, other), gpu_process_samples=(_sample("GPU-a", 10, start=100),), timestamp_utc=STAMP, socket_evidence_complete=True)
+    assert result.attributions[0].confidence == "confirmed"
+    assert not any(error.operation == "endpoint_owner" for error in result.errors)
+
+
+def test_ollama_worker_requires_proven_lineage_and_is_probable_when_socket_partial():
+    owner = pt.RuntimeProcessIdentity(10, 100, 1, "/x/ollama", "ollama", ("ollama", "serve"), (11434,), "ollama", ("proc_stat",), STAMP)
+    worker = pt.RuntimeProcessIdentity(20, 200, 10, "/usr/local/lib/ollama/llama-server", "llama-server", ("llama-server",), (), None, ("proc_stat", "proc_exe"), STAMP)
+    result = pt.attribute_runtime_gpus(backend="ollama", endpoint_port=11434, processes=(owner, worker), gpu_process_samples=(_sample("GPU-a", 20, start=200),), timestamp_utc=STAMP, socket_evidence_complete=False)
+    assert result.attributions[0].confidence == "probable"
+    assert "ollama_worker_lineage" in result.attributions[0].evidence_sources
+    standalone = pt.RuntimeProcessIdentity(21, 201, 1, "/usr/local/lib/ollama/llama-server", "llama-server", ("llama-server",), (), None, ("proc_stat",), STAMP)
+    blocked = pt.attribute_runtime_gpus(backend="ollama", endpoint_port=11434, processes=(owner, standalone), gpu_process_samples=(_sample("GPU-b", 21, start=201),), timestamp_utc=STAMP)
+    assert blocked.attributions == ()
+    assert any(error.operation == "runtime_lineage" for error in blocked.errors)
+
+
+def test_timestamp_only_duplicate_identity_deduplicates_to_later_observation():
+    early = pt.RuntimeProcessIdentity(10, 100, 1, "/x/ollama", "ollama", ("ollama", "serve"), (11434,), "ollama", ("proc_stat",), "2026-08-01T12:00:00Z")
+    late = pt.RuntimeProcessIdentity(10, 100, 1, "/x/ollama", "ollama", ("ollama", "serve"), (11434,), "ollama", ("proc_stat",), "2026-08-01T12:01:00Z")
+    result = pt.attribute_runtime_gpus(backend="ollama", endpoint_port=11434, processes=(early, late), gpu_process_samples=(), timestamp_utc=STAMP)
+    assert result.processes == (late,)
+    assert not any(error.operation == "runtime_identity" for error in result.errors)
+
+
+@pytest.mark.parametrize("field, value", [
+    ("executable", "/x/other"), ("command_line", ("ollama", "other")),
+    ("parent_pid", 2), ("listening_ports", (11435,)),
+])
+def test_substantive_identity_conflicts_remain_ambiguous(field, value):
+    base = pt.RuntimeProcessIdentity(10, 100, 1, "/x/ollama", "ollama", ("ollama", "serve"), (11434,), "ollama", ("proc_stat",), STAMP)
+    values = base.to_dict(); values[field] = value; values["timestamp_utc"] = "2026-08-01T12:01:00Z"
+    conflict = pt.RuntimeProcessIdentity(**values)
+    result = pt.attribute_runtime_gpus(backend="ollama", endpoint_port=11434, processes=(base, conflict), gpu_process_samples=(), timestamp_utc=STAMP)
+    assert any(error.operation == "runtime_identity" for error in result.errors)

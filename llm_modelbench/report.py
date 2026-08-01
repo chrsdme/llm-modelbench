@@ -132,6 +132,24 @@ def _load_json(path: Path) -> dict:
         return {}
 
 
+def _load_runtime_telemetry(path: Path) -> Dict[str, Any]:
+    """Read optional evidence only; malformed/future forms never break reports."""
+    if not path.exists():
+        return {}
+    try:
+        if path.stat().st_size > 4 * 1024 * 1024:
+            raise ValueError("runtime telemetry artifact exceeds bounded size")
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("runtime telemetry artifact is not an object")
+        version = value.get("schema_version")
+        if version != 1:
+            return {"status": "unavailable", "warning": "unsupported runtime telemetry schema"}
+        return value
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {"status": "unavailable", "warning": "runtime telemetry artifact is unreadable"}
+
+
 def build(out_dir: Path, cfg) -> None:
     raw_rows = _load(out_dir)
     rows, duplicate_rows = _dedupe_report_rows(raw_rows)
@@ -203,6 +221,7 @@ def _embed_model_from_reason(reason: str) -> Optional[str]:
 def _report_context(out_dir: Path, rows: List[Dict[str, Any]], cfg, raw_row_count: Optional[int] = None, duplicate_rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     filters = _load_json(out_dir / "filters.json")
     status = _load_json(out_dir / "status.json")
+    runtime_telemetry = _load_runtime_telemetry(out_dir / "runtime_telemetry.json")
     task_ids = sorted({r.get("task") for r in rows if r.get("task")})
     models = sorted({r.get("model") for r in rows if r.get("model")})
     by_cat: Dict[str, set] = {}
@@ -232,6 +251,7 @@ def _report_context(out_dir: Path, rows: List[Dict[str, Any]], cfg, raw_row_coun
         "duplicate_cells_deduped": duplicate_rows or [],
         "filters": filters,
         "status": status,
+        "runtime_telemetry": runtime_telemetry,
     }
 
 
@@ -246,6 +266,20 @@ def _header_lines(context: Dict[str, Any]) -> List[str]:
             f"Duplicate result rows dropped from report: {context.get('duplicate_rows_dropped')} "
             f"(raw rows {context.get('raw_row_count')}, report rows {context.get('report_row_count')})"
         )
+    telemetry = context.get("runtime_telemetry") or {}
+    if telemetry:
+        if telemetry.get("status") == "unavailable":
+            lines.append(f"Runtime telemetry: unavailable ({telemetry.get('warning') or 'collection unavailable'})")
+            lines.append("")
+            return lines
+        declared = ", ".join(telemetry.get("declared_gpu_uuids") or []) or "none"
+        observed = ", ".join(telemetry.get("observed_gpu_uuids") or []) or "none"
+        endpoint = "available" if telemetry.get("endpoint_available") else "unavailable/partial"
+        lines.append(
+            f"Runtime telemetry: backend=`{telemetry.get('backend') or 'unavailable'}` endpoint={endpoint} "
+            f"declared UUIDs=`{declared}` observed UUIDs=`{observed}`"
+        )
+        lines.append("Runtime telemetry is allocation evidence only; it does not prove layer, tensor-split, KV-cache, or offload placement.")
     lines.append("")
     return lines
 
@@ -284,6 +318,7 @@ def _metadata(out_dir: Path, rows: List[Dict[str, Any]], cfg, context: Dict[str,
         "gpu_vendor": hc.get("gpu_vendor"),
         "gpu_driver": hc.get("gpu_driver"),
         "vram_budget_gb": hc.get("vram_budget_gb"),
+        "runtime_telemetry": context.get("runtime_telemetry") or None,
         "note": "Deterministic agentic_tool tasks, repeatability reporting, and probe-aligned needle/RAG ctx guidance are part of this report. Arbitrary explicit ctx values are measurement-window diagnostics, not model-ranking diagnostics.",
         "measurement_rule": "A measurement the harness declined to take must never become a leaderboard number.",
         "scorer_rule": "A check the scorer cannot fail must never become a leaderboard number.",
@@ -537,4 +572,3 @@ code{{color:#cbd5e1}}
 <th>Value/GB</th><th>Blended</th><th>Size</th><th>Err</th><th>Completion</th></tr>{''.join(rows_html)}</table>
 </div></body></html>"""
     path.write_text(doc)
-

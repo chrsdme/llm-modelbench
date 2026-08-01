@@ -40,6 +40,13 @@ def collect(cfg: Any) -> Dict[str, Any]:
     version = _url_json(base + "/api/version")
     tags = _url_json(base + "/api/tags")
     ps = _url_json(base + "/api/ps")
+    # One bounded, observational Stage 6D capability probe.  It never starts
+    # or reconfigures a runtime; failures remain diagnostics.
+    try:
+        from .runtime_telemetry import collect_runtime_telemetry
+        runtime_telemetry = collect_runtime_telemetry(backend="ollama", endpoint=base).to_dict()
+    except Exception as exc:
+        runtime_telemetry = {"status": "unavailable", "errors": [{"detail": str(exc)[:512]}]}
     return {
         "llm_version": __version__,
         "python": sys.version.split()[0],
@@ -61,6 +68,7 @@ def collect(cfg: Any) -> Dict[str, Any]:
         "gpu": gpu.__dict__,
         "gpus": [device.__dict__ for device in gpus],
         "hardware_live": hw,
+        "runtime_telemetry": runtime_telemetry,
         "disk_free_gb": round(disk.free / 1024**3, 1),
         "disk_total_gb": round(disk.total / 1024**3, 1),
     }
@@ -119,6 +127,22 @@ def render(data: Dict[str, Any]) -> str:
     hw = data.get("hardware_live") or {}
     if hw:
         lines.append(f"Live telemetry:    GPU {hw.get('gpu_temp_c','n/a')}C, VRAM {hw.get('vram_used_mb','n/a')}/{hw.get('vram_total_mb','n/a')} MiB, RAM {hw.get('ram_used_pct','n/a')}%")
+    telemetry = data.get("runtime_telemetry") or {}
+    if telemetry:
+        process_query = (telemetry.get("gpu_processes") or {}).get("successful")
+        socket_complete = (telemetry.get("process_discovery") or {}).get("socket_evidence_complete")
+        query_errors = (telemetry.get("gpu_processes") or {}).get("errors") or []
+        query_state = "supported/idle" if process_query else (
+            "failed" if any(item.get("state") == "failed" for item in query_errors if isinstance(item, dict)) else "unavailable/limited"
+        )
+        schema_state = "readable" if telemetry.get("schema_version") == 1 else "unavailable"
+        lines.append(
+            "Runtime telemetry: "
+            f"endpoint={'available' if telemetry.get('endpoint_available') else 'unavailable/idle'} "
+            f"inventory={len(telemetry.get('physical_inventory') or [])} "
+            f"compute-query={query_state} "
+            f"socket-evidence={'complete' if socket_complete else 'partial'} schema={schema_state}"
+        )
     lines += [
         "",
         f"Disk free:         {data.get('disk_free_gb')}GB / {data.get('disk_total_gb')}GB",

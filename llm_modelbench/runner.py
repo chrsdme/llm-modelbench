@@ -15,6 +15,7 @@ import math
 import os
 import re
 import statistics
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -1271,6 +1272,47 @@ def _dump_raw(out_dir: Path, task: Task, model: str, output: str, sample_index: 
     return path
 
 
+def _capture_runtime_telemetry(out_dir: Path, client: InferenceClient, factory, *, runtime_profile=None) -> Optional[Dict[str, Any]]:
+    """Persist optional Stage 6 evidence without changing run semantics.
+
+    The factory is injected for tests.  It is deliberately called once before
+    benchmark work and cannot affect scores, prompts, lifecycle operations, or
+    result preservation if local telemetry is unavailable.
+    """
+    try:
+        identity = client.backend_identity() if hasattr(client, "backend_identity") else None
+        backend = getattr(identity, "backend", None)
+        endpoint = getattr(identity, "endpoint", None)
+        if backend not in {"ollama", "llama_cpp"}:
+            return None
+        snapshot = factory(backend=backend, endpoint=endpoint,
+                           runtime_profile=getattr(runtime_profile, "name", None),
+                           declared_gpu_uuids=getattr(runtime_profile, "physical_gpu_uuids", ()))
+        value = snapshot.to_dict() if hasattr(snapshot, "to_dict") else dict(snapshot)
+        if not isinstance(value, dict):
+            raise ValueError("runtime telemetry snapshot must serialize to an object")
+    except Exception as exc:
+        value = {"schema_version": 1, "status": "unavailable",
+                 "errors": [{"operation": "runtime_telemetry", "state": "failed", "detail": str(exc)[:512], "query_tier": None}]}
+    temporary = None
+    try:
+        target = out_dir / "runtime_telemetry.json"
+        encoded = json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n"
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=out_dir, prefix=".runtime_telemetry.", suffix=".tmp", delete=False) as handle:
+            handle.write(encoded)
+            temporary = Path(handle.name)
+        temporary.replace(target)
+    except Exception:
+        try:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
+    return {"artifact": "runtime_telemetry.json", "schema_version": value.get("schema_version"),
+            "status": value.get("status") or "collected"}
+
+
 def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
         include: Optional[str], exclude: Optional[str], skip_offload: bool,
         categories: Optional[List[str]], task_ids: Optional[List[str]] = None,
@@ -1283,9 +1325,19 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
         selected_models: Optional[List[str]] = None,
         capability_profiles: Optional[Dict[str, Dict[str, Any]]] = None,
         auto_probe: bool = False,
-        row_metadata_by_task: Optional[Dict[str, Dict[str, Any]]] = None) -> Path:
+        row_metadata_by_task: Optional[Dict[str, Dict[str, Any]]] = None,
+        capture_runtime_telemetry: bool = False,
+        runtime_telemetry_factory=None,
+        runtime_profile=None) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     raw = out_dir / "raw_results.jsonl"
+    telemetry_ref = None
+    if capture_runtime_telemetry:
+        if runtime_telemetry_factory is None:
+            from .runtime_telemetry import collect_runtime_telemetry
+            runtime_telemetry_factory = collect_runtime_telemetry
+        telemetry_ref = _capture_runtime_telemetry(out_dir, client, runtime_telemetry_factory,
+                                                   runtime_profile=runtime_profile)
     gpu = detect_gpu()
     ollama_version = client.version() if hasattr(client, "version") else None
 
@@ -1585,6 +1637,8 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
                     "vram_peak_mb": hw["vram_peak_mb"], "power_mean_w": hw["power_mean_w"],
                     "temp_peak_c": hw["temp_peak_c"],
                 }
+                if telemetry_ref is not None:
+                    row["runtime_telemetry"] = dict(telemetry_ref)
                 if row_metadata_by_task and task.id in row_metadata_by_task:
                     # Repair/recovery provenance is additive and written only to the
                     # new child run. Source run evidence remains immutable.

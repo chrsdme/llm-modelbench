@@ -2,11 +2,13 @@ import json
 
 import pytest
 
-from llm_modelbench.backend import BackendCapabilities, BackendCapability, CapabilityStatus
+from llm_modelbench.backend import BackendCapabilities, BackendCapability, CapabilityStatus, BackendIdentity
 from llm_modelbench.config import Config
 from llm_modelbench.llama_cpp import LlamaCppBackendAdapter, LlamaCppClient
 from llm_modelbench.ollama import MockClient
 from llm_modelbench import runner
+from llm_modelbench.cli import _host_code_tasks
+from llm_modelbench.tasks import TASKS
 
 
 MODEL = "qwen2.5-coder:14b"
@@ -91,3 +93,63 @@ def test_fixture_llama_cpp_adapter_runs_without_lifecycle_calls(tmp_path):
                capability_profiles=profile, auto_probe=False)
     assert all(path not in {"/api/ps", "/api/chat"} for _, path, _ in calls)
     assert not hasattr(adapter.client, "flushes")
+
+
+def test_runner_attaches_optional_runtime_telemetry_without_extra_generation(tmp_path):
+    class RuntimeMock(_CountingMock):
+        backend_capabilities = None
+        def backend_identity(self):
+            return BackendIdentity("ollama", "fixture", "http://127.0.0.1:11434")
+    client = RuntimeMock()
+    calls = []
+    def factory(**kwargs):
+        calls.append(kwargs)
+        return {"schema_version": 1, "backend": "ollama", "observed_gpu_uuids": []}
+    runner.run(client, Config(fingerprint=False), level="smoke", out_dir=tmp_path,
+               include=None, exclude=None, skip_offload=False, categories=None,
+               task_ids=["py_anagram"], resume=False, live_ui="off", fingerprint_enabled=False,
+               selected_models=[MODEL], capability_profiles=_profile(), auto_probe=False,
+               capture_runtime_telemetry=True, runtime_telemetry_factory=factory)
+    row = json.loads((tmp_path / "raw_results.jsonl").read_text().splitlines()[0])
+    assert calls == [{"backend": "ollama", "endpoint": "http://127.0.0.1:11434", "runtime_profile": None,
+                      "declared_gpu_uuids": ()}]
+    assert row["runtime_telemetry"]["artifact"] == "runtime_telemetry.json"
+    assert (tmp_path / "runtime_telemetry.json").exists()
+
+
+def test_runner_preserves_result_when_runtime_telemetry_fails(tmp_path):
+    class RuntimeMock(_CountingMock):
+        backend_capabilities = None
+        def backend_identity(self):
+            return BackendIdentity("ollama", "fixture", "http://127.0.0.1:11434")
+    client = RuntimeMock()
+    def broken(**kwargs):
+        raise OSError("telemetry unavailable")
+    runner.run(client, Config(fingerprint=False), level="smoke", out_dir=tmp_path,
+               include=None, exclude=None, skip_offload=False, categories=None,
+               task_ids=["py_anagram"], resume=False, live_ui="off", fingerprint_enabled=False,
+               selected_models=[MODEL], capability_profiles=_profile(), auto_probe=False,
+               capture_runtime_telemetry=True, runtime_telemetry_factory=broken)
+    row = json.loads((tmp_path / "raw_results.jsonl").read_text().splitlines()[0])
+    evidence = json.loads((tmp_path / "runtime_telemetry.json").read_text())
+    assert isinstance(row["score"], (int, float))
+    assert evidence["status"] == "unavailable"
+
+
+def test_runner_does_not_reference_partially_written_telemetry(tmp_path, monkeypatch):
+    class RuntimeMock(_CountingMock):
+        backend_capabilities = None
+        def backend_identity(self):
+            return BackendIdentity("ollama", "fixture", "http://127.0.0.1:11434")
+    monkeypatch.setattr("pathlib.Path.replace", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("replace failed")))
+    reference = runner._capture_runtime_telemetry(
+        tmp_path, RuntimeMock(), lambda **kwargs: {"schema_version": 1}
+    )
+    assert reference is None
+    assert not (tmp_path / "runtime_telemetry.json").exists()
+
+
+def test_stage6g_safe_json_extract_task_needs_no_host_code_override():
+    task = next(item for item in TASKS if item.id == "json_extract")
+    assert task.level == "smoke"
+    assert _host_code_tasks({"active_models": [{"tasks": ["json_extract"]}]}) == []

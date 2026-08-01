@@ -30,6 +30,7 @@ MAX_PROCESS_CMDLINE_BYTES = 8 * 1024
 MAX_PROCESS_CMDLINE_ARGS = 64
 MAX_PROCESS_FDS = 256
 MAX_PROCESS_SOCKETS = 128
+MAX_OLLAMA_WORKER_ANCESTOR_DEPTH = 8
 NVIDIA_PROCESS_TIMEOUT_SECONDS = 5.0
 MAX_NVIDIA_PROCESS_STDOUT_BYTES = 1024 * 1024
 MAX_NVIDIA_PROCESS_STDERR_BYTES = 64 * 1024
@@ -51,16 +52,23 @@ def _normalise_sources(values: Iterable[object]) -> Tuple[str, ...]:
     return tuple(sorted({text for value in values if (text := _bounded_text(value))}))
 
 
+def _substantive_process_identity(item: "RuntimeProcessIdentity") -> Tuple[object, ...]:
+    """Identity evidence excludes the time at which that evidence was observed."""
+    return (item.pid, item.start_time_ticks, item.parent_pid, item.executable,
+            item.command_name, item.command_line, item.listening_ports,
+            item.backend_hint, item.discovery_sources)
+
+
 def _normalise_processes(values: Iterable["RuntimeProcessIdentity"], *, reject_ambiguous: bool) -> Tuple[Tuple["RuntimeProcessIdentity", ...], Tuple[TelemetryCollectionError, ...]]:
     groups, errors = {}, []
     for item in values:
         groups.setdefault(item.stable_identity, []).append(item)
     normalized = []
     for identity, group in sorted(groups.items(), key=lambda pair: (pair[0][0], -1 if pair[0][1] is None else pair[0][1])):
-        if len(set(group)) != 1:
+        if len({_substantive_process_identity(item) for item in group}) != 1:
             if reject_ambiguous: raise ValueError("conflicting duplicate stable process identity")
             errors.append(TelemetryCollectionError("runtime_identity", "malformed", f"ambiguous stable runtime identity: {identity[0]}")); continue
-        normalized.append(group[0])
+        normalized.append(max(group, key=lambda item: item.timestamp_utc))
     by_pid = {}
     for item in normalized: by_pid.setdefault(item.pid, []).append(item)
     for pid, group in sorted(by_pid.items()):
@@ -363,7 +371,7 @@ def _classify(backend: Optional[str], executable: Optional[str], command_name: O
 
 def discover_runtime_processes(*, proc_root: Path = PROC_ROOT, backend: Optional[str] = None,
                                endpoint_port: Optional[int] = None, timestamp_utc: Optional[object] = None,
-                               pid_hints: Iterable[int] = ()) -> ProcessDiscoveryResult:
+                               pid_hints: Iterable[int] = (), retain_pid_hints: bool = False) -> ProcessDiscoveryResult:
     """Read bounded procfs evidence only; expected access failures are structured."""
     if backend is not None and backend not in {"ollama", "llama_cpp"}:
         raise ValueError("backend must be ollama, llama_cpp, or None")
@@ -458,11 +466,32 @@ def discover_runtime_processes(*, proc_root: Path = PROC_ROOT, backend: Optional
         except (OSError, ValueError) as exc:
             errors.append(TelemetryCollectionError("proc_pid_reuse", "unavailable", f"cannot revalidate PID {pid}: {exc}")); continue
         hint = _classify(backend, executable, command_name, command_line)
-        if hint is None and not (endpoint_port is not None and endpoint_port in ports):
+        if hint is None and not (endpoint_port is not None and endpoint_port in ports) and not (retain_pid_hints and pid in hints):
             continue
         processes.append(RuntimeProcessIdentity(pid, start, ppid, executable, command_name, command_line,
                                                 tuple(sorted(ports))[:MAX_PROCESS_SOCKETS], hint, tuple(sources), timestamp))
     return ProcessDiscoveryResult(tuple(processes), tuple(errors), timestamp, inspected_pid_count=len(selected), socket_evidence_complete=socket_complete)
+
+
+def _ollama_worker_lineage(worker: RuntimeProcessIdentity, owners: Iterable[RuntimeProcessIdentity],
+                           processes: Iterable[RuntimeProcessIdentity]) -> Tuple[bool, Optional[str]]:
+    """Prove bounded parentage to an Ollama endpoint owner; never use name alone."""
+    owner_ids = {item.stable_identity for item in owners}
+    by_pid = {item.pid: item for item in processes}
+    current, seen = worker, set()
+    for _ in range(MAX_OLLAMA_WORKER_ANCESTOR_DEPTH):
+        if current.stable_identity in owner_ids:
+            return True, None
+        if current.pid in seen:
+            return False, "Ollama worker ancestry loop"
+        seen.add(current.pid)
+        if current.parent_pid is None or current.parent_pid <= 0:
+            return False, "Ollama worker ancestry unavailable"
+        parent = by_pid.get(current.parent_pid)
+        if parent is None:
+            return False, "Ollama worker ancestry unavailable"
+        current = parent
+    return False, "Ollama worker ancestry exceeded bounded depth"
 
 
 def nvidia_process_command() -> Tuple[str, ...]:
@@ -604,10 +633,10 @@ def attribute_runtime_gpus(*, backend: str, endpoint_port: Optional[int], proces
     for process in processes: identity_groups.setdefault(process.stable_identity, []).append(process)
     process_values, diagnostic_errors = [], list(errors)
     for identity, group in sorted(identity_groups.items(), key=lambda item: (item[0][0], -1 if item[0][1] is None else item[0][1])):
-        rendered = {str(item.to_dict()) for item in group}
+        rendered = {_substantive_process_identity(item) for item in group}
         if len(rendered) != 1:
             diagnostic_errors.append(TelemetryCollectionError("runtime_identity", "malformed", f"ambiguous stable runtime identity: {identity[0]}")); continue
-        process_values.append(group[0])
+        process_values.append(max(group, key=lambda item: item.timestamp_utc))
     process_values = tuple(process_values)
     sample_values = tuple(gpu_process_samples)
     declared = {str(value).strip() for value in declared_gpu_uuids if str(value).strip() and not _marker_state(str(value))}
@@ -621,14 +650,26 @@ def attribute_runtime_gpus(*, backend: str, endpoint_port: Optional[int], proces
     compatible = {pid: group[0] for pid, group in pid_groups.items() if len(group) == 1 and pid not in ambiguous_pids and group[0].backend_hint == backend}
     endpoint_owners = [p for p in process_values if endpoint_port is not None and endpoint_port in p.listening_ports]
     compatible_owners = [p for p in endpoint_owners if p.pid in compatible]
-    endpoint_unique = socket_evidence_complete and len(compatible_owners) == 1 and len(endpoint_owners) == 1
-    if endpoint_owners and not endpoint_unique:
+    owners_unambiguous = len(compatible_owners) == 1 and len(endpoint_owners) == 1
+    endpoint_unique = socket_evidence_complete and owners_unambiguous
+    if endpoint_owners and not owners_unambiguous:
         diagnostic_errors.append(TelemetryCollectionError("endpoint_owner", "malformed", "endpoint ownership is ambiguous or incompatible"))
     matched = []
     for sample in sample_values:
         process = compatible.get(sample.pid)
+        worker = False
         if process is None:
-            diagnostic_errors.append(TelemetryCollectionError("runtime_match", "unavailable", f"GPU process PID is not a compatible runtime: {sample.pid}")); continue
+            candidate = next((item for item in process_values if item.pid == sample.pid), None)
+            if backend != "ollama" or candidate is None:
+                diagnostic_errors.append(TelemetryCollectionError("runtime_match", "unavailable", f"GPU process PID is not a compatible runtime: {sample.pid}")); continue
+            executable = os.path.basename(candidate.executable or "").replace(" (deleted)", "").lower()
+            command = os.path.basename(candidate.command_line[0]).lower() if candidate.command_line else ""
+            if executable not in {"llama-server", "llama_server"} and command not in {"llama-server", "llama_server"}:
+                diagnostic_errors.append(TelemetryCollectionError("runtime_match", "unavailable", f"GPU process PID is not an Ollama worker form: {sample.pid}")); continue
+            proven, detail = _ollama_worker_lineage(candidate, compatible_owners, process_values)
+            if not proven:
+                diagnostic_errors.append(TelemetryCollectionError("runtime_lineage", "unavailable", detail or f"cannot prove Ollama worker lineage: {sample.pid}")); continue
+            process, worker = candidate, True
         starts_present = process.start_time_ticks is not None and sample.process_start_time_ticks is not None
         if starts_present and sample.process_start_time_ticks != process.start_time_ticks:
             diagnostic_errors.append(TelemetryCollectionError("runtime_pid_reuse", "malformed", f"GPU process PID start time mismatch: {sample.pid}")); continue
@@ -636,6 +677,8 @@ def attribute_runtime_gpus(*, backend: str, endpoint_port: Optional[int], proces
         endpoint_owned = endpoint_unique and compatible_owners[0].pid == process.pid
         confidence = "confirmed" if endpoint_owned and stable else "probable"
         sources = ["nvidia_compute_apps", *process.discovery_sources]
+        if worker:
+            sources.append("ollama_worker_lineage")
         detail = None if confidence == "confirmed" else "unique endpoint ownership or verified matching process start time is unavailable"
         matched.append(RuntimeGPUAttribution(process.pid, process.start_time_ticks, sample.gpu_uuid, sample, confidence, sources, detail))
     matched_uuids = {item.gpu_uuid for item in matched if item.confidence in {"confirmed", "probable"}}

@@ -397,7 +397,9 @@ def cmd_run(args, cfg):
                    sample_mode=args.sample_mode, fingerprint_enabled=args.fingerprint,
                    selected_models=selected_models,
                    capability_profiles=plan.get("capability_profiles") or capability_profiles,
-                   auto_probe=bool(getattr(args, "auto", False)))
+                   auto_probe=bool(getattr(args, "auto", False)),
+                   capture_runtime_telemetry=True,
+                   runtime_profile=getattr(args, "_runtime_profile", None))
     except ValueError as exc:
         raise SystemExit(f"run refused: {exc}")
     except KeyboardInterrupt:

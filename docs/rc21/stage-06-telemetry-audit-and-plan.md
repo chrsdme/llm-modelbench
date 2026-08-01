@@ -2,7 +2,7 @@
 
 ## Status and boundary
 
-This is the Stage 6A audit and implementation plan. Its conclusions remain the boundary for later work. Stages 6B and 6C subsequently implemented only isolated physical-GPU and process-attribution evidence layers; neither integrated telemetry into existing collectors or consumers. Stage 7 has not started, and this document does not claim fresh hardware evidence. Collection in later Stage 6 work must be read-only, bounded, timeout-controlled, and diagnostic unless an existing explicit preflight already declares a required measurement.
+This is the Stage 6A audit and implementation plan. Its conclusions remain the boundary for later work. Stages 6B through 6G completed additive physical/process evidence, snapshot assembly, optional run artifacts, conservative report/doctor exposure, and real-host acceptance. Existing scalar collectors remain compatible; Stage 6 does not change scores or infer placement. Stage 7 has not started. Collection remains read-only, bounded, timeout-controlled, and diagnostic unless an existing explicit preflight already declares a required measurement.
 
 The target AI-PC has two physical NVIDIA devices: RTX 5060 Ti (`GPU-78077308-f4b2-3330-6d4e-19581d7b1511`, `00000000:01:00.0`) and RTX 3060 (`GPU-5b99bce2-35ab-f6db-857b-72162069fa72`, `00000000:05:00.0`). These are acceptance expectations, not constants to encode. Ollama and the external llama-server remain independent, operator-managed local runtimes.
 
