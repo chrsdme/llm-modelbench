@@ -1,0 +1,15 @@
+# RC21 Stage 7: Runtime-fit profiling
+
+Stage 7 adds `llm_modelbench.runtime_fit`: a pure evaluator plus an explicit read-only collection wrapper and `./llmb runtime-fit`. It does not start a runtime, load a model, issue inference, mutate a model/profile, or make routing decisions.
+
+The schema is version 1. `RuntimeFitModel` preserves model-weight provenance; `RuntimeFitProfile` carries only an invocation-local explicit strategy when one is supplied; `DeviceFitAssessment` is keyed by canonical NVIDIA UUID; and `RuntimeFitResult` records decision, deterministic reasons, installed and live capacity separately, reserve, and unknown requirements. JSON is deterministic and `allow_nan=False` compatible.
+
+The default reserve is 512 MiB per device and is an explicit CLI override. Fit states are `confirmed_fit`, `candidate_fit`, `conditional_fit`, `confirmed_no_fit`, and `unknown`. A known model-weight lower bound exceeding a reserved device capacity is `confirmed_no_fit`; a lower bound that fits while overhead/KV is unknown is only `candidate_fit`; CPU spill and multi-device layer split are conditional; missing evidence is unknown. A multi-GPU aggregate is informational only unless an explicit strategy and UUID-keyed per-device allocation map are supplied; positional allocation weights are refused.
+
+KV is derived only as `2 * layers * kv_heads * head_dimension * requested_context * kv_dtype_bytes * parallel_sequences`; otherwise it is unknown, never zero. Requested context above a known model maximum is not silently clamped. No layer, tensor, KV-cache, or offload placement is inferred.
+
+Offline fixtures cover arbitrary-N UUID ordering, capacity boundaries, reserves, missing live evidence, lower-bound no-fit, context/KV unknown and derived cases, explicit layer split, spill, malformed identity, serialization, and CLI parsing. The initial focused validation passed (`159 passed`); the full suite passed (`742 passed`), along with compileall, selftest, release check, diff check, and import-side-effect/secret review.
+
+Read-only real-host acceptance is complete at `/tmp/llmb-rc21-stage7-acceptance-20260802T135500Z`. It passed UUID identity, capacity separation, conservative multi-device, spill, serialization, and non-mutation checks. Ollama 0.32.5 had zero installed models and `/api/tags` entries; llama.cpp `/v1/models` had zero entries; and no configured UUID-bound llama.cpp profile existed. The optional small, near-12-GiB, larger-than-single-GPU, external-model, configured-layer-split, and real-model CLI scenarios therefore remain explicitly `environmentally_unavailable`. The pure arbitrary-N fixture supplies the required non-runtime proof. Stage 7 implementation and acceptance are complete; Stage 8 is ready for planning/review and has not started.
+
+Final closeout validation passed: the focused Stage 7 evaluator/CLI suite had `9 passed`; the full suite had `743 passed`; compileall, selftest, release check, diff check, import side-effect guard, and added-lines secret/environment-value review all passed.

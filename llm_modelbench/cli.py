@@ -249,6 +249,45 @@ def cmd_inventory(args, cfg):
         print(f"{it['class']:<11} {it['size_gb']:>6}GB  {flag:<8} {it['name']}")
 
 
+def cmd_runtime_fit(args, cfg):
+    """Read-only Stage 7 assessment; it does not issue a generation request."""
+    from .runtime_fit import RuntimeFitProfile, collect_runtime_fit
+    client = _client(args, cfg)
+    selected = getattr(args, "_runtime_profile", None)
+    if selected is None and getattr(args, "mock", False):
+        selected = implicit_ollama_profile(cfg)
+    if selected is None:
+        raise SystemExit("runtime-fit requires a selected runtime profile")
+    try:
+        weights = {key.strip(): float(value) for item in (args.allocation_weights or "").split(",") if item.strip()
+                   for key, value in (item.split("=", 1),)}
+    except ValueError as exc:
+        raise SystemExit("--allocation-weights must be comma-separated GPU-UUID=positive-number pairs") from exc
+    try:
+        profile = RuntimeFitProfile(
+            selected.name, selected.backend, tuple(selected.physical_gpu_uuids),
+            strategy=args.strategy, allocation_weights=weights,
+            allow_cpu_spill=True if args.allow_cpu_spill else None,
+        )
+        result = collect_runtime_fit(client=client, model_name=args.model, profile=profile,
+                                     requested_context=args.context, reserve_mib=args.reserve_mib)
+    except ValueError as exc:
+        raise SystemExit(f"runtime-fit refused: {exc}") from exc
+    value = result.to_dict()
+    payload = json.dumps(value, indent=2, sort_keys=True, allow_nan=False)
+    if args.out:
+        Path(args.out).write_text(payload + "\n", encoding="utf-8")
+    if args.json:
+        print(payload)
+        return
+    print(f"Runtime fit: {result.decision} ({', '.join(result.reasons)})")
+    print(f"Model: {result.model.name} size={result.model.weight_bytes} bytes ({result.model.weight_provenance})")
+    print(f"Profile: {result.profile.name} backend={result.profile.backend} strategy={result.profile.strategy or 'none'}")
+    print(f"Reserve: {result.reserve_bytes} bytes; KV: {result.kv_cache_bytes if result.kv_cache_bytes is not None else 'unknown'} ({result.kv_provenance})")
+    for item in result.device_assessments:
+        print(f"  {item.gpu_uuid}: {item.decision}; installed={item.installed_capacity_bytes}; live_free={item.live_free_capacity_bytes}; {item.detail}")
+
+
 
 
 def _safe_run_id(value: str) -> str:
@@ -1390,6 +1429,18 @@ def build_parser():
     inv.add_argument("--auto", action="store_true", help="also run functional capability probes")
     inv.add_argument("--runtime-profile", help="saved runtime profile; explicit selection takes precedence")
 
+    fit = sub.add_parser("runtime-fit", help="read-only conservative model-to-runtime GPU capacity assessment")
+    fit.add_argument("--model", required=True, help="exact model name already known to the selected runtime")
+    fit.add_argument("--runtime-profile", help="saved runtime profile; explicit selection takes precedence")
+    fit.add_argument("--context", type=int, help="requested context; never silently clamped")
+    fit.add_argument("--reserve-mib", type=float, default=512.0, help="per-device safety reserve in MiB")
+    fit.add_argument("--strategy", choices=["layer_split", "tensor_split"], help="explicit multi-GPU strategy declaration")
+    fit.add_argument("--allocation-weights", help="comma-separated GPU-UUID=weight layer allocations; never positional")
+    fit.add_argument("--allow-cpu-spill", action="store_true", help="record CPU/RAM spill as an explicit conditional policy")
+    fit.add_argument("--json", action="store_true", help="write deterministic JSON to stdout")
+    fit.add_argument("--out", help="optional JSON output path")
+    fit.add_argument("--mock", action="store_true", help="use the offline deterministic model client")
+
     doc = sub.add_parser("doctor", help="preflight environment, import path, Ollama, GPU, disk")
     doc.add_argument("--json", action="store_true")
 
@@ -1785,6 +1836,8 @@ def _main(argv=None):
         cmd_doctor(args, cfg)
     elif args.cmd == "inventory":
         cmd_inventory(args, cfg)
+    elif args.cmd == "runtime-fit":
+        cmd_runtime_fit(args, cfg)
     elif args.cmd == "plan":
         cmd_plan(args, cfg)
     elif args.cmd == "campaign":
