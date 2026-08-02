@@ -397,7 +397,9 @@ def write_manifest(
     )
 
 
-def _campaign_plan_payload(paths: CampaignPaths, plan: Dict[str, Any], *, configuration: Dict[str, Any], created_at: Optional[str] = None) -> Dict[str, Any]:
+def _campaign_plan_payload(paths: CampaignPaths, plan: Dict[str, Any], *, configuration: Dict[str, Any], created_at: Optional[str] = None,
+                           runtime_identities: Optional[Dict[str, Dict[str, Any]]] = None,
+                           judge_runtime_identity: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Build the persisted pre-generation contract without writing it."""
     from .runner import _task_hash
     from .tasks import TASKS
@@ -411,12 +413,19 @@ def _campaign_plan_payload(paths: CampaignPaths, plan: Dict[str, Any], *, config
         "created_at": created_at or datetime.now(timezone.utc).isoformat(),
         "recovery_policy_version": RECOVERY_POLICY_VERSION if "RECOVERY_POLICY_VERSION" in globals() else "pending",
     })
+    if runtime_identities is not None:
+        accepted["runtime_identity_schema_version"] = 1
+        accepted["runtime_identities"] = runtime_identities
+        accepted["judge_runtime_identity"] = judge_runtime_identity or {"state": "judge_not_required"}
     return accepted
 
 
-def write_campaign_plan(paths: CampaignPaths, plan: Dict[str, Any], *, inventory: List[Dict[str, Any]], capabilities: Dict[str, Any], configuration: Dict[str, Any]) -> Dict[str, Any]:
+def write_campaign_plan(paths: CampaignPaths, plan: Dict[str, Any], *, inventory: List[Dict[str, Any]], capabilities: Dict[str, Any], configuration: Dict[str, Any],
+                        runtime_identities: Optional[Dict[str, Dict[str, Any]]] = None,
+                        judge_runtime_identity: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Persist the accepted pre-generation contract atomically."""
-    accepted = _campaign_plan_payload(paths, plan, configuration=configuration)
+    accepted = _campaign_plan_payload(paths, plan, configuration=configuration, runtime_identities=runtime_identities,
+                                      judge_runtime_identity=judge_runtime_identity)
     _atomic_write_text(paths.plan_json, json.dumps(accepted, indent=2, sort_keys=True))
     _atomic_write_text(paths.inventory_json, json.dumps(inventory, indent=2, sort_keys=True))
     _atomic_write_text(paths.capabilities_json, json.dumps(capabilities, indent=2, sort_keys=True))

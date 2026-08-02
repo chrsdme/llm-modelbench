@@ -1328,9 +1328,16 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
         row_metadata_by_task: Optional[Dict[str, Dict[str, Any]]] = None,
         capture_runtime_telemetry: bool = False,
         runtime_telemetry_factory=None,
-        runtime_profile=None) -> Path:
+        runtime_profile=None, runtime_identity=None) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     raw = out_dir / "raw_results.jsonl"
+    runtime_identity_value = None
+    if runtime_identity is not None:
+        if not hasattr(runtime_identity, "to_dict"):
+            raise ValueError("runtime_identity must be an immutable RuntimeIdentity")
+        from .runtime_identity import write_runtime_identity_artifact
+        runtime_identity_value = runtime_identity.to_dict()
+        write_runtime_identity_artifact(out_dir / "runtime_identity.json", runtime_identity)
     telemetry_ref = None
     if capture_runtime_telemetry:
         if runtime_telemetry_factory is None:
@@ -1637,6 +1644,13 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
                     "vram_peak_mb": hw["vram_peak_mb"], "power_mean_w": hw["power_mean_w"],
                     "temp_peak_c": hw["temp_peak_c"],
                 }
+                if runtime_identity_value is not None:
+                    row.update({"runtime_identity_schema_version": runtime_identity_value.get("schema_version"),
+                                "runtime_identity_hash": runtime_identity_value.get("identity_hash"),
+                                "runtime_variant_id": runtime_identity_value.get("identity_hash"),
+                                "backend": runtime_identity_value.get("backend"),
+                                "runtime_profile": runtime_identity_value.get("profile_name"),
+                                "model_artifact_digest": (runtime_identity_value.get("model") or {}).get("artifact_digest")})
                 if telemetry_ref is not None:
                     row["runtime_telemetry"] = dict(telemetry_ref)
                 if row_metadata_by_task and task.id in row_metadata_by_task:

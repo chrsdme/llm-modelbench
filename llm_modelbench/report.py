@@ -21,7 +21,7 @@ def _load(out_dir: Path) -> List[Dict[str, Any]]:
     return rows
 
 
-def _duplicate_key(r: Dict[str, Any]) -> Tuple[str, str, str, str]:
+def _duplicate_key(r: Dict[str, Any]) -> Tuple[str, str, str, str, str]:
     """One report cell is one model/task/task_hash/sample aggregate.
 
     Runner rows are already aggregated across repeated samples, so absent sample_index
@@ -30,6 +30,7 @@ def _duplicate_key(r: Dict[str, Any]) -> Tuple[str, str, str, str]:
     """
     return (
         str(r.get("model") or ""),
+        str(r.get("runtime_variant_id") or r.get("runtime_identity_hash") or "legacy"),
         str(r.get("task") or ""),
         str(r.get("task_hash") or ""),
         str(r.get("sample_index") if r.get("sample_index") is not None else ""),
@@ -58,7 +59,7 @@ def _dedupe_report_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
     model/task. If quality-relevant fields differ, refusing the report is safer than
     silently choosing a leaderboard number.
     """
-    seen: Dict[Tuple[str, str, str, str], Tuple[int, Dict[str, Any]]] = {}
+    seen: Dict[Tuple[str, str, str, str, str], Tuple[int, Dict[str, Any]]] = {}
     dropped: List[Dict[str, Any]] = []
     conflicts: List[str] = []
     for idx, row in enumerate(rows):
@@ -70,11 +71,11 @@ def _dedupe_report_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
         prev_idx, prev_row = prev
         if _duplicate_signature(prev_row) != _duplicate_signature(row):
             conflicts.append(
-                f"model={key[0]!r} task={key[1]!r} prev_index={prev_idx} new_index={idx} "
+                f"model={key[0]!r} runtime_variant={key[1]!r} task={key[2]!r} prev_index={prev_idx} new_index={idx} "
                 f"prev_score={prev_row.get('score')!r} new_score={row.get('score')!r}"
             )
             continue
-        dropped.append({"model": key[0], "task": key[1], "kept_index": idx, "dropped_index": prev_idx})
+        dropped.append({"model": key[0], "runtime_variant_id": key[1], "task": key[2], "kept_index": idx, "dropped_index": prev_idx})
         seen[key] = (idx, row)
     if conflicts:
         preview = "; ".join(conflicts[:5])
@@ -150,6 +151,23 @@ def _load_runtime_telemetry(path: Path) -> Dict[str, Any]:
         return {"status": "unavailable", "warning": "runtime telemetry artifact is unreadable"}
 
 
+def _load_runtime_identity_artifact_summary(out_dir: Path) -> Dict[str, Any]:
+    from .runtime_identity import load_runtime_identity_artifact
+    value = load_runtime_identity_artifact(out_dir / "runtime_identity.json")
+    return {"status": value.get("status"), "warning": value.get("warning")}
+
+
+def _load_runtime_fit_state(out_dir: Path) -> Dict[str, Any]:
+    """Read optional fit evidence as advisory metadata, never as a score input."""
+    value = _load_json(out_dir / "runtime_fit.json")
+    if not value:
+        return {"status": "unavailable", "advisory": True}
+    if not isinstance(value, dict):
+        return {"status": "unavailable", "advisory": True,
+                "warning": "runtime fit artifact is not an object"}
+    return {"status": str(value.get("status") or "available"), "advisory": True}
+
+
 def build(out_dir: Path, cfg) -> None:
     raw_rows = _load(out_dir)
     rows, duplicate_rows = _dedupe_report_rows(raw_rows)
@@ -159,6 +177,7 @@ def build(out_dir: Path, cfg) -> None:
     _enrich_agentic_rows(out_dir, rows, TASKS)
     difficulty = {t.id: t.difficulty for t in TASKS}
     lb, per_cat = aggregate(rows, cfg.weights, difficulty)
+    _attach_runtime_identity_summary(lb, rows, out_dir)
 
     fp_path = out_dir / "fingerprints.json"
     ident_path = out_dir / "model_identities.json"
@@ -178,11 +197,31 @@ def build(out_dir: Path, cfg) -> None:
     (out_dir / "summary.json").write_text(json.dumps(lb, indent=2))
     _retrieval_diagnostics(out_dir, rows)
     meta = _metadata(out_dir, rows, cfg, context)
+    meta["runtime_provenance"] = {"runtime_variant_count": sum(item.get("runtime_variant_count", 0) for item in lb), "runtime_variant_counts_by_model": {str(item.get("model")): item.get("runtime_variant_count", 0) for item in lb}, "runtime_backends": sorted({value for item in lb for value in item.get("runtime_backends", [])}), "runtime_profiles": sorted({value for item in lb for value in item.get("runtime_profiles", [])}), "legacy_identity_row_count": sum(1 for row in rows if not row.get("runtime_identity_hash")), "identity_bearing_row_count": sum(1 for row in rows if row.get("runtime_identity_hash")), "runtime_identity_artifact": _load_runtime_identity_artifact_summary(out_dir), "runtime_telemetry_state": (context.get("runtime_telemetry") or {}).get("status", "unavailable"), "runtime_fit_state": _load_runtime_fit_state(out_dir)}
     (out_dir / "summary_meta.json").write_text(json.dumps(meta, indent=2))
     _regression(out_dir, lb, meta)
     _html(out_dir / "report.html", lb, per_cat, rows, cfg, context)
     print(f"reports -> {out_dir}/ (report.html, scorecard.md/.csv, routing.md, prune.md, "
           f"clones.md, summary.json)")
+
+
+def _attach_runtime_identity_summary(leaderboard: List[Dict[str, Any]], rows: List[Dict[str, Any]], out_dir: Path) -> None:
+    """Add provenance summaries without changing aggregate score inputs."""
+    from .runtime_identity import load_runtime_identity_artifact
+    artifact = load_runtime_identity_artifact(out_dir / "runtime_identity.json")
+    for item in leaderboard:
+        model_rows = [row for row in rows if row.get("model") == item.get("model")]
+        variants = {}
+        for row in model_rows:
+            key = str(row.get("runtime_variant_id") or row.get("runtime_identity_hash") or "legacy")
+            variants.setdefault(key, row)
+        values = [variants[key] for key in sorted(variants)]
+        item["runtime_variant_count"] = len(values)
+        item["runtime_identity_state"] = "legacy_unknown" if not any(v.get("runtime_identity_hash") for v in values) else "available"
+        item["runtime_variants"] = [{key: row.get(key) for key in ("runtime_identity_schema_version", "runtime_identity_hash", "runtime_variant_id", "backend", "runtime_profile", "model_artifact_digest", "physical_gpu_uuids", "declared_device_order", "execution_strategy", "allocation_weights", "context_size", "batch_size", "micro_batch_size", "kv_cache_type", "parallel_sequences", "allow_cpu_spill", "offload_layers")} for row in values]
+        item["runtime_backends"] = sorted({str(row.get("backend")) for row in values if row.get("backend")})
+        item["runtime_profiles"] = sorted({str(row.get("runtime_profile")) for row in values if row.get("runtime_profile")})
+        item["runtime_identity_artifact"] = artifact if any(row.get("runtime_identity_hash") == (artifact.get("identity") or {}).get("identity_hash") for row in values) else {"status": "legacy_unknown", "warning": "no matching run-level identity artifact for this model"}
 
 
 def _retrieval_diagnostics(out_dir: Path, rows: List[Dict[str, Any]]) -> None:
@@ -252,6 +291,7 @@ def _report_context(out_dir: Path, rows: List[Dict[str, Any]], cfg, raw_row_coun
         "filters": filters,
         "status": status,
         "runtime_telemetry": runtime_telemetry,
+        "runtime_variant_summary": {model: len({str(row.get("runtime_variant_id") or row.get("runtime_identity_hash") or "legacy") for row in rows if row.get("model") == model}) for model in models},
     }
 
 
@@ -261,6 +301,8 @@ def _header_lines(context: Dict[str, Any]) -> List[str]:
         f"Tasks: {len(context.get('task_ids') or [])} | task_ids: `{', '.join(context.get('task_ids') or [])}`",
         f"num_ctx_used: `{context.get('num_ctx_used') or 'server-default'}` | num_predict: `{context.get('num_predict') or 'task-default'}` | think: `{context.get('think') or 'auto'}` | needle_max_ctx: `{context.get('needle_max_ctx') or 'none'}`",
     ]
+    if context.get("runtime_variant_summary"):
+        lines.append("Runtime variants: " + "; ".join(f"{model}={count}" for model, count in sorted(context["runtime_variant_summary"].items())))
     if context.get("duplicate_rows_dropped"):
         lines.append(
             f"Duplicate result rows dropped from report: {context.get('duplicate_rows_dropped')} "
@@ -356,7 +398,7 @@ def _csv(path: Path, lb, context):
         w.writerow(["rank", "model", "class", "quality", "score_blended", "tok_s", "offload",
                     "value_per_gb", "value_per_gb_blended", "size_gb", "err", "completion_rate",
                     "format_strict_rate", "format_modal_deviation", "format_mean_multiplier",
-                    "over_refusal_count", "disallowed_tool_count", "thinking_only_count", "agentic_caps_fired"])
+                    "over_refusal_count", "disallowed_tool_count", "thinking_only_count", "agentic_caps_fired", "runtime_identity_state", "runtime_variant_count", "runtime_backends", "runtime_profiles", "runtime_identity_hashes"])
         ranks = _rank_cells(lb, context)
         for r in lb:
             w.writerow([ranks.get(r["model"], ""), r["model"], r["class"], r["quality"], r.get("score_blended"),
@@ -365,11 +407,17 @@ def _csv(path: Path, lb, context):
                         r.get("agentic_format_strict_rate"), r.get("agentic_format_modal_deviation"),
                         r.get("agentic_format_mean_multiplier"), r.get("over_refusal_count"),
                         r.get("disallowed_tool_count"), r.get("thinking_only_count"),
-                        json.dumps(r.get("agentic_caps_fired") or {}, sort_keys=True)])
+                        json.dumps(r.get("agentic_caps_fired") or {}, sort_keys=True), r.get("runtime_identity_state"), r.get("runtime_variant_count"), json.dumps(r.get("runtime_backends") or [], sort_keys=True), json.dumps(r.get("runtime_profiles") or [], sort_keys=True), json.dumps([v.get("runtime_identity_hash") for v in r.get("runtime_variants") or []], sort_keys=True)])
 
 
 def _md(path: Path, lb, per_cat, context):
     L = ["# Scorecard", ""] + _header_lines(context)
+    for item in lb:
+        variants = item.get("runtime_variants") or []
+        if variants:
+            first = variants[0]
+            digest = str(first.get("runtime_identity_hash") or "")
+            L.append(f"Runtime identity `{digest[:12] or 'legacy'}` backend={first.get('backend') or 'legacy'} profile={first.get('runtime_profile') or 'unknown'} variants={item.get('runtime_variant_count')}")
     L += ["Quality is pure task correctness. For agentic_tool, quality uses decision_score; the legacy blended score is shown separately. Empty or thinking-only model outputs score 0.0 and remain visible through Err/completion_rate.", "",
           "| # | Model | Class | Quality | Blended | tok/s | Offload | Value/GB | Blended V/GB | Size | Err | Completion | Strict fmt | Modal fmt | Over-refusal | Disallowed tool | Thinking-only |",
           "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|"]
