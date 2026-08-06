@@ -185,6 +185,26 @@ class RuntimeIdentity:
                 "identity_hash": self.identity_hash, "completeness": self.completeness,
                 "evidence_provenance": self.evidence_provenance}
 
+    @classmethod
+    def from_dict(cls, value: object) -> "RuntimeIdentity":
+        """Strict, bounded reconstruction for resume gates (never trust JSON directly)."""
+        if not isinstance(value, Mapping) or len(value) > 32:
+            raise ValueError("runtime identity must be a bounded object")
+        if value.get("schema_version") != RUNTIME_IDENTITY_SCHEMA_VERSION:
+            raise ValueError("unsupported runtime identity schema")
+        model=value.get("model"); execution=value.get("execution")
+        if not isinstance(model, Mapping) or not isinstance(execution, Mapping):
+            raise ValueError("runtime identity nested fields are malformed")
+        if len(model)>8 or len(execution)>16:
+            raise ValueError("runtime identity nested object too large")
+        pci=value.get("pci_bus_ids") or {}
+        if not isinstance(pci, Mapping): raise ValueError("PCI identity evidence malformed")
+        return cls(backend=value.get("backend"), adapter_identity=value.get("adapter_identity"), endpoint=value.get("endpoint"),
+            profile_name=value.get("profile_name"), profile_provenance=value.get("profile_provenance"), profile_schema_version=value.get("profile_schema_version"),
+            server_version=value.get("server_version"), model=RuntimeModelIdentity(**dict(model)), physical_gpu_uuids=tuple(value.get("physical_gpu_uuids") or ()),
+            pci_bus_ids=tuple(pci.items()), declared_device_order=tuple(value.get("declared_device_order") or ()), execution=RuntimeExecutionSettings(**dict(execution)),
+            evidence_provenance=value.get("evidence_provenance", "frozen"), schema_version=value.get("schema_version"))
+
 
 @dataclass(frozen=True)
 class RuntimeIdentityMismatch:
@@ -251,13 +271,82 @@ def write_runtime_identity_artifact(path: Path, identity: RuntimeIdentity) -> di
         Path(tmp).unlink(missing_ok=True); raise
     return row_identity_reference(identity)
 
+def write_runtime_identity_map_artifact(path: Path, identities: Mapping[str, RuntimeIdentity]) -> None:
+    if not identities or len(identities) > 512:
+        raise ValueError("runtime identity map must contain 1..512 models")
+    normalized = {}
+    for name, identity in identities.items():
+        if not isinstance(name, str) or not name.strip() or len(name) > _MAX_TEXT or not isinstance(identity, RuntimeIdentity):
+            raise ValueError("runtime identity map is malformed")
+        normalized[name] = identity.to_dict()
+    payload={"schema_version": RUNTIME_IDENTITY_SCHEMA_VERSION, "identities": dict(sorted(normalized.items()))}
+    text=json.dumps(payload,indent=2,sort_keys=True,allow_nan=False)+"\n"; path=Path(path); path.parent.mkdir(parents=True,exist_ok=True)
+    fd,tmp=tempfile.mkstemp(dir=str(path.parent),prefix=f".{path.name}.",suffix=".tmp")
+    try:
+        with os.fdopen(fd,"w",encoding="utf-8") as handle: handle.write(text); handle.flush(); os.fsync(handle.fileno())
+        Path(tmp).replace(path)
+    except BaseException: Path(tmp).unlink(missing_ok=True); raise
+
+def validate_resume_runtime_identities(out_dir: Path, current_identities: Mapping[str, RuntimeIdentity], selected_models: Iterable[str]) -> RuntimeIdentityCompatibility:
+    """Read-only fail-closed resume gate shared by CLI and runner."""
+    models=tuple(selected_models)
+    if len(models)!=len(set(models)): raise ValueError("runtime identity mismatch: runtime_identity_model_unexpected")
+    if any(not isinstance(current_identities.get(model), RuntimeIdentity) for model in models):
+        raise ValueError("runtime identity mismatch: current_runtime_identity_missing")
+    artifact=load_runtime_identity_artifact(Path(out_dir)/"runtime_identity.json")
+    if artifact.get("status") == "legacy_unknown": raise ValueError("runtime identity mismatch: legacy_runtime_identity_missing")
+    if artifact.get("status") != "available": raise ValueError("runtime identity mismatch: runtime_identity_artifact_unavailable")
+    raw=artifact.get("identities")
+    if raw is None:
+        if len(models)!=1: raise ValueError("runtime identity mismatch: runtime_identity_model_missing")
+        raw={models[0]:artifact.get("identity")}
+    codes=[]
+    for model in models:
+        item=raw.get(model)
+        try: frozen=RuntimeIdentity.from_dict(item) if item else None
+        except Exception: raise ValueError("runtime identity mismatch: runtime_identity_artifact_unavailable")
+        if item and item.get("identity_hash") != frozen.identity_hash: raise ValueError("runtime identity mismatch: runtime_identity_artifact_unavailable")
+        codes.extend(x.code for x in compare_runtime_identities(frozen,current_identities[model]).mismatches)
+    extra=set(raw)-set(models)
+    if extra:
+        # Extra identities are safe only if raw rows do not belong to them.
+        rows=Path(out_dir,"raw_results.jsonl")
+        if rows.exists() and any(json.loads(x).get("model") in extra for x in rows.read_text().splitlines() if x.strip()): codes.append("runtime_identity_model_unexpected")
+    if codes: raise ValueError("runtime identity mismatch: "+", ".join(sorted(set(codes))))
+    return RuntimeIdentityCompatibility(True)
+
+def validate_frozen_runtime_identity_map(frozen_values: object, current_identities: Mapping[str, RuntimeIdentity], selected_models: Iterable[str]) -> RuntimeIdentityCompatibility:
+    """Read-only campaign/runner mapping comparison with the standard codes."""
+    if not isinstance(frozen_values, Mapping): raise ValueError("runtime identity mismatch: legacy_runtime_identity_missing")
+    models=tuple(selected_models); codes=[]
+    for model in models:
+        value=frozen_values.get(model)
+        if not isinstance(current_identities.get(model), RuntimeIdentity): codes.append("current_runtime_identity_missing"); continue
+        if value is None: codes.append("runtime_identity_model_missing"); continue
+        try:
+            frozen=RuntimeIdentity.from_dict(value)
+            if value.get("identity_hash") != frozen.identity_hash: raise ValueError("hash")
+        except Exception: codes.append("runtime_identity_artifact_unavailable"); continue
+        codes.extend(x.code for x in compare_runtime_identities(frozen,current_identities[model]).mismatches)
+    if set(frozen_values)-set(models): codes.append("runtime_identity_model_unexpected")
+    if codes: raise ValueError("runtime identity mismatch: "+", ".join(sorted(set(codes))))
+    return RuntimeIdentityCompatibility(True)
+
 
 def load_runtime_identity_artifact(path: Path) -> dict:
     """Bounded compatibility reader; reports never invent missing identity."""
     try:
         if Path(path).stat().st_size > 4 * 1024 * 1024: raise ValueError("identity artifact too large")
         value=json.loads(Path(path).read_text(encoding="utf-8"))
-        if not isinstance(value, dict) or value.get("schema_version") != RUNTIME_IDENTITY_SCHEMA_VERSION: raise ValueError("unsupported runtime identity schema")
+        if not isinstance(value, dict): raise ValueError("identity artifact malformed")
+        if "identities" in value:
+            identities=value.get("identities")
+            if not isinstance(identities, Mapping) or len(identities)>512: raise ValueError("identity map malformed")
+            for key, item in identities.items():
+                if not isinstance(key,str) or len(key)>_MAX_TEXT: raise ValueError("identity map key malformed")
+                RuntimeIdentity.from_dict(item)
+            return {"status":"available", "identities":identities}
+        RuntimeIdentity.from_dict(value)
         return {"status":"available", "identity":value}
     except FileNotFoundError: return {"status":"legacy_unknown", "warning":"runtime identity artifact missing"}
     except Exception: return {"status":"unavailable", "warning":"runtime identity artifact unreadable or unsupported"}

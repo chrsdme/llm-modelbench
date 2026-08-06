@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.0rc21
+
+### RC21 runtime multi-GPU closeout
+
+- Add dynamic runtime and NVIDIA multi-GPU inventory with stable physical GPU
+  UUID and PCI identity.
+- Add runtime-profile discovery, persistence, selection, and explicit Ollama
+  and llama.cpp routing.
+- Persist runtime identity and refuse standard-run and campaign resume when the
+  selected runtime identity differs.
+- Record Stage 9 replay evidence reconciliation, final validation, and release
+  closeout documentation.
+
 ## 1.0.0rc20.post1
 
 ### RC20 post-release lifecycle hotfix

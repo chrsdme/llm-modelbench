@@ -1331,20 +1331,9 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
         runtime_profile=None, runtime_identity=None) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     raw = out_dir / "raw_results.jsonl"
-    runtime_identity_value = None
-    if runtime_identity is not None:
-        if not hasattr(runtime_identity, "to_dict"):
-            raise ValueError("runtime_identity must be an immutable RuntimeIdentity")
-        from .runtime_identity import write_runtime_identity_artifact
-        runtime_identity_value = runtime_identity.to_dict()
-        write_runtime_identity_artifact(out_dir / "runtime_identity.json", runtime_identity)
-    telemetry_ref = None
-    if capture_runtime_telemetry:
-        if runtime_telemetry_factory is None:
-            from .runtime_telemetry import collect_runtime_telemetry
-            runtime_telemetry_factory = collect_runtime_telemetry
-        telemetry_ref = _capture_runtime_telemetry(out_dir, client, runtime_telemetry_factory,
-                                                   runtime_profile=runtime_profile)
+    # Identity must be checked before telemetry, status, reports, or reusable rows.
+    # A mapping is required for multi-model runs; a single identity remains readable.
+    runtime_identity_values = {}
     gpu = detect_gpu()
     ollama_version = client.version() if hasattr(client, "version") else None
 
@@ -1368,6 +1357,33 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
         before = list(models)
         models = [m for m in models if not rx.search(m)]
         skipped_models.extend({"model": m, "reason": "exclude_regex_match"} for m in before if m not in models)
+
+    from .runtime_identity import RuntimeIdentity, validate_resume_runtime_identities, write_runtime_identity_map_artifact
+    if runtime_identity is not None:
+        if isinstance(runtime_identity, RuntimeIdentity):
+            if len(models) != 1: raise ValueError("single RuntimeIdentity is only valid for one selected model")
+            runtime_identity_values = {models[0]: runtime_identity}
+        elif isinstance(runtime_identity, dict) and all(isinstance(v, RuntimeIdentity) for v in runtime_identity.values()):
+            runtime_identity_values = dict(runtime_identity)
+        else:
+            raise ValueError("runtime_identity must be RuntimeIdentity or a model-keyed RuntimeIdentity mapping")
+        missing = [model for model in models if model not in runtime_identity_values]
+        if missing: raise ValueError("current_runtime_identity_missing: " + ", ".join(missing))
+
+    # Gate an existing run before reading raw rows into done and before any write.
+    if resume and raw.exists():
+        validate_resume_runtime_identities(out_dir, runtime_identity_values, models)
+    elif runtime_identity_values:
+        # New evidence only: immutable model-keyed artifact. Never rewrite a resume artifact.
+        write_runtime_identity_map_artifact(out_dir / "runtime_identity.json", runtime_identity_values)
+
+    telemetry_ref = None
+    if capture_runtime_telemetry:
+        if runtime_telemetry_factory is None:
+            from .runtime_telemetry import collect_runtime_telemetry
+            runtime_telemetry_factory = collect_runtime_telemetry
+        telemetry_ref = _capture_runtime_telemetry(out_dir, client, runtime_telemetry_factory,
+                                                   runtime_profile=runtime_profile)
     if skip_offload:
         before = list(models)
         models = [m for m in models if size_gb(models_rows[m]) <= cfg.vram_budget_gb]
@@ -1644,13 +1660,9 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
                     "vram_peak_mb": hw["vram_peak_mb"], "power_mean_w": hw["power_mean_w"],
                     "temp_peak_c": hw["temp_peak_c"],
                 }
-                if runtime_identity_value is not None:
-                    row.update({"runtime_identity_schema_version": runtime_identity_value.get("schema_version"),
-                                "runtime_identity_hash": runtime_identity_value.get("identity_hash"),
-                                "runtime_variant_id": runtime_identity_value.get("identity_hash"),
-                                "backend": runtime_identity_value.get("backend"),
-                                "runtime_profile": runtime_identity_value.get("profile_name"),
-                                "model_artifact_digest": (runtime_identity_value.get("model") or {}).get("artifact_digest")})
+                if model in runtime_identity_values:
+                    from .runtime_identity import row_identity_reference
+                    row.update(row_identity_reference(runtime_identity_values[model]))
                 if telemetry_ref is not None:
                     row["runtime_telemetry"] = dict(telemetry_ref)
                 if row_metadata_by_task and task.id in row_metadata_by_task:

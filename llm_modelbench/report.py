@@ -221,7 +221,8 @@ def _attach_runtime_identity_summary(leaderboard: List[Dict[str, Any]], rows: Li
         item["runtime_variants"] = [{key: row.get(key) for key in ("runtime_identity_schema_version", "runtime_identity_hash", "runtime_variant_id", "backend", "runtime_profile", "model_artifact_digest", "physical_gpu_uuids", "declared_device_order", "execution_strategy", "allocation_weights", "context_size", "batch_size", "micro_batch_size", "kv_cache_type", "parallel_sequences", "allow_cpu_spill", "offload_layers")} for row in values]
         item["runtime_backends"] = sorted({str(row.get("backend")) for row in values if row.get("backend")})
         item["runtime_profiles"] = sorted({str(row.get("runtime_profile")) for row in values if row.get("runtime_profile")})
-        item["runtime_identity_artifact"] = artifact if any(row.get("runtime_identity_hash") == (artifact.get("identity") or {}).get("identity_hash") for row in values) else {"status": "legacy_unknown", "warning": "no matching run-level identity artifact for this model"}
+        frozen = (artifact.get("identities") or {}).get(str(item.get("model"))) or artifact.get("identity")
+        item["runtime_identity_artifact"] = artifact if frozen and any(row.get("runtime_identity_hash") == frozen.get("identity_hash") for row in values) else {"status": "legacy_unknown", "warning": "no matching run-level identity artifact for this model"}
 
 
 def _retrieval_diagnostics(out_dir: Path, rows: List[Dict[str, Any]]) -> None:

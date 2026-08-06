@@ -13,7 +13,7 @@
 | 6. Per-GPU/backend-neutral telemetry | Complete; ready for Stage 7 planning/review | UUID-keyed physical/process evidence, snapshot, run artifact, and conservative exposure |
 | 7. Runtime-fit profiler | Complete; ready for Stage 8 planning/review | Conservative UUID-keyed capacity and requirement evidence with completed real-host acceptance |
 | 8. Campaign/report/ranking/resume integration | Complete; ready for Stage 9 review | Frozen runtime-identity contracts, variant row provenance, compatibility readers, and accepted fixture-only harness |
-| 9. Real acceptance and RC21 release | Not started | Acceptance record and release documentation |
+| 9. Real acceptance and RC21 release | Complete; release closeout pending | Accepted evidence, reconciliation, validation, scope audit, and release documentation |
 
 ## Stage 1 record
 
@@ -140,3 +140,22 @@ Review `RC21_MASTER_PLAN.md` and `RC21_SOURCE_AUDIT.md`. Do not begin Stage 2 un
 - Offline validation passed before the harness hardening: focused identity/Stage 7 tests `13 passed`; full suite `746 passed`; compileall, selftest, release check, diff check, import-side-effect guard, and added-lines secret/environment review passed. Stage 8 implementation remains pending hardened acceptance. Stage 9 has not started.
 - Subsequent non-authoritative harness roots through `/tmp/llmb-rc21-stage8-acceptance-20260802T144647Z` found acceptance-only evidence gaps and a report-provenance presentation defect: legacy aggregates could show an unrelated run-level identity artifact. The correction only attaches a run-level artifact to a model aggregate when a matching row hash exists, adds run-level `runtime_provenance` in `summary_meta.json`, and adds deterministic CSV provenance columns. Scores, canonical weighting, ranking eligibility, and legacy score values remain unchanged.
 - Fixture-only Stage 8 acceptance passed at `/tmp/llmb-rc21-stage8-acceptance-20260802T150345Z`: all 28 Stage 8 and 28 report checks passed, the populated two-record ranking fixture and bounded runtime/repository snapshots were unchanged, and no inference, lifecycle action, or persistent mutation occurred. See `docs/rc21/stage-08-live-acceptance-and-closeout.md`. Stage 8 is complete and ready for Stage 9 review; Stage 9 has not started.
+
+## Stage 9 record
+
+- Stage 9 acceptance, evidence reconciliation, repository validation, and
+  documentation closeout are complete. The accepted evidence covers preflight,
+  dry run, Ollama and llama.cpp GPU lanes, ThinkingCap exact 64K, runtime
+  contract/selection, resume-gate tests, and live standard/campaign runtime
+  identity mismatch refusals.
+- Phase 1A reconciled 13 accepted areas: 11 native passing summaries and two
+  explicit adjudications. Phase 2 passed 172 focused tests and a clean 763-test
+  full suite; doctor and self-test passed. Phase 3 produced a safe seven-path
+  source/test allowlist with no unresolved path or unapproved evidence package.
+- See `docs/rc21/stage-09-release-closeout.md`,
+  `docs/rc21/stage-09-evidence-index.md`, and
+  `docs/handovers/RC21_STAGE9_RELEASE_HANDOVER.md`. RC21 has not been
+  versioned, committed, tagged, pushed, or released.
+
+**Next action:** validate the Phase 4 documentation and final release allowlist
+in Phase 5 before preparing the version, commit and tag plan.

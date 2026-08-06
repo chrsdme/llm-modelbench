@@ -389,6 +389,8 @@ def _confirm_plan(args, plan):
 
 def cmd_run(args, cfg):
     from . import runner, report
+    from .runtime_identity import collect_runtime_identity, validate_resume_runtime_identities
+    from .hardware import detect_gpus
     if args.family_base_only and args.context_aliases_only:
         raise SystemExit("--family-base-only and --context-aliases-only cannot be used together")
     if args.samples is not None:
@@ -410,11 +412,29 @@ def cmd_run(args, cfg):
     client = _client(args, cfg)
     out_dir = _run_dir(args)
     rankings_dir = _ranking_dir_for(args, run_id=out_dir.name)
-    _write_run_ranking_scope(out_dir, args, rankings_dir=rankings_dir)
     task_ids = _task_ids(args)
     selected_models = getattr(args, "_selected_models", None)
     if selected_models is None:
         selected_models = _resolve_model_selection(args, client)
+    # Read-only selected-runtime metadata, collected per model.  This is passed
+    # into runner before it may inspect resumable evidence.
+    profile = getattr(args, "_runtime_profile", None) or implicit_ollama_profile(cfg)
+    try:
+        tag_rows = {str(row.get("name")): row for row in client.tags()}
+        inventory = detect_gpus()
+        current_runtime_identities = {
+            model: collect_runtime_identity(client=client, profile=profile, model_name=model,
+                                            model_row=tag_rows.get(model), config=cfg, inventory=inventory)
+            for model in selected_models
+        }
+    except Exception as exc:
+        raise SystemExit(f"run refused: current_runtime_identity_missing: {exc}") from exc
+    # The CLI gate is intentionally before ranking scope, plan construction,
+    # --auto probes, plan JSON, confirmation, telemetry, and runner execution.
+    if args.resume and (out_dir / "raw_results.jsonl").exists():
+        try: validate_resume_runtime_identities(out_dir, current_runtime_identities, selected_models)
+        except ValueError as exc: raise SystemExit(f"run refused: {exc}") from None
+    _write_run_ranking_scope(out_dir, args, rankings_dir=rankings_dir)
     capability_profiles = getattr(args, "_capability_profiles", None)
     plan = getattr(args, "_accepted_plan", None) or _plan_for_args(
         args, cfg, client, selected_models=selected_models, capability_profiles=capability_profiles
@@ -438,7 +458,8 @@ def cmd_run(args, cfg):
                    capability_profiles=plan.get("capability_profiles") or capability_profiles,
                    auto_probe=bool(getattr(args, "auto", False)),
                    capture_runtime_telemetry=True,
-                   runtime_profile=getattr(args, "_runtime_profile", None))
+                   runtime_profile=getattr(args, "_runtime_profile", None),
+                   runtime_identity=current_runtime_identities)
     except ValueError as exc:
         raise SystemExit(f"run refused: {exc}")
     except KeyboardInterrupt:
@@ -648,6 +669,30 @@ def _campaign_paths_or_exit(campaign_id: str):
         raise SystemExit(f"unknown campaign {campaign_id!r}")
     return paths, campaign.load_manifest(paths)
 
+def _campaign_runtime_identities(args, cfg, selected, client):
+    """Bounded metadata only; never probes or generates."""
+    from .hardware import detect_gpus
+    from .runtime_identity import collect_runtime_identity
+    profile=getattr(args,"_runtime_profile",None) or implicit_ollama_profile(cfg)
+    rows={str(x.get("name")):x for x in client.tags()}
+    inventory=detect_gpus()
+    return {model:collect_runtime_identity(client=client,profile=profile,model_name=model,model_row=rows.get(model),inventory=inventory,config=cfg) for model in selected}
+
+def _validate_campaign_generation_identities(paths, args, cfg, manifest):
+    """Called before interrupted state transition/lock; recovering shares generation cohort."""
+    from .runtime_identity import validate_frozen_runtime_identity_map
+    try: plan=json.loads(paths.plan_json.read_text(encoding="utf-8"))
+    except Exception: raise SystemExit("campaign resume refused: runtime identity mismatch: runtime_identity_artifact_unavailable")
+    if manifest.resume_state == "judging":
+        judge=plan.get("judge_runtime_identity")
+        if not isinstance(judge,dict) or judge.get("state") in {None,"judge_not_required"}: raise SystemExit("campaign resume refused: judge_runtime_identity_missing")
+    frozen=plan.get("runtime_identities")
+    if frozen is None: raise SystemExit("campaign resume refused: runtime identity mismatch: legacy_runtime_identity_missing")
+    client=_client(args,cfg); selected=[str(x) for x in frozen]
+    try: validate_frozen_runtime_identity_map(frozen,_campaign_runtime_identities(args,cfg,selected,client),selected)
+    except ValueError as exc: raise SystemExit("campaign resume refused: "+str(exc)) from None
+    return client, selected
+
 
 def cmd_campaign(args, cfg):
     """Thin compatibility layer: existing runners receive a normal nested run dir."""
@@ -661,6 +706,7 @@ def cmd_campaign(args, cfg):
         paths, manifest = _campaign_paths_or_exit(args.campaign_id)
         if manifest.state != "interrupted" or not manifest.resume_state:
             raise SystemExit("campaign resume requires an interrupted campaign with a recorded resume phase")
+        _validate_campaign_generation_identities(paths,args,cfg,manifest)
         resumed = campaign.transition(paths, manifest, manifest.resume_state)
         print(json.dumps({"campaign_id": resumed.campaign_id, "state": resumed.state,
                           "resumed_phase": resumed.state, "root": str(paths.root)}, indent=2))
@@ -696,14 +742,15 @@ def cmd_campaign(args, cfg):
             models = [value.strip() for value in (args.models or "").split(";") if value.strip()]
             paths, manifest = campaign.create_campaign(args.campaign_id, models=models, level=args.level, version=__version__)
         client = _client(args, cfg)
-        selected = _resolve_model_selection(args, client)
+        selected = _resolve_model_selection(args, client) or []
+        identities=_campaign_runtime_identities(args,cfg,selected,client)
         plan = _plan_for_args(args, cfg, client, selected_models=selected)
         configuration = {"level": args.level, "models": args.models, "judge_policy": getattr(args, "judge", "off"), "samples": args.samples, "think": args.think, "ctx": args.ctx, "num_predict": args.num_predict}
         if manifest.state == "planned":
             if not paths.plan_json.exists():
                 raise SystemExit(campaign.campaign_replan_refusal(manifest))
             existing = json.loads(paths.plan_json.read_text(encoding="utf-8"))
-            proposed = campaign._campaign_plan_payload(paths, plan, configuration=configuration, created_at=existing.get("created_at"))
+            proposed = campaign._campaign_plan_payload(paths, plan, configuration=configuration, created_at=existing.get("created_at"), runtime_identities={k:v.to_dict() for k,v in identities.items()})
             if campaign.campaign_plan_equivalent(existing, proposed):
                 print(json.dumps({
                     "campaign_id": manifest.campaign_id,
@@ -714,7 +761,7 @@ def cmd_campaign(args, cfg):
                 }, indent=2))
                 return
             raise SystemExit(campaign.campaign_replan_refusal(manifest))
-        campaign.write_campaign_plan(paths, plan, inventory=client.tags(), capabilities=plan.get("capability_profiles") or {}, configuration=configuration)
+        campaign.write_campaign_plan(paths, plan, inventory=client.tags(), capabilities=plan.get("capability_profiles") or {}, configuration=configuration, runtime_identities={k:v.to_dict() for k,v in identities.items()})
         if manifest.state == "created":
             campaign.transition(paths, manifest, "planned")
         print(f"campaign plan -> {paths.plan_json}")
@@ -730,6 +777,7 @@ def cmd_campaign(args, cfg):
         if manifest.state == "planned":
             manifest = campaign.transition(paths, manifest, "generating")
         elif manifest.state == "interrupted" and manifest.resume_state == "generating":
+            _validate_campaign_generation_identities(paths,args,cfg,manifest)
             manifest = campaign.transition(paths, manifest, "generating")
         elif manifest.state != "generating":
             raise SystemExit(f"campaign {args.campaign_id!r} cannot run from state {manifest.state!r}")
