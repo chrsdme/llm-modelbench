@@ -3,10 +3,10 @@ set -euo pipefail
 
 # LLM ModelBench Git sync helper for Linux.
 # Usage:
-#   scripts/llmb-git-sync.sh pull
-#   scripts/llmb-git-sync.sh push
-#   scripts/llmb-git-sync.sh sync
-#   scripts/llmb-git-sync.sh status
+#   scripts/llmb-git-sync.sh pull [branch]
+#   scripts/llmb-git-sync.sh push [branch]
+#   scripts/llmb-git-sync.sh sync [branch]
+#   scripts/llmb-git-sync.sh status [branch]
 #
 # Safety:
 # - Pull/rebase refuses to run with a dirty worktree.
@@ -15,7 +15,7 @@ set -euo pipefail
 
 MODE="${1:-sync}"
 REMOTE="origin"
-BRANCH="main"
+BRANCH="${2:-main}"
 REMOTE_URL="git@github.com:chrsdme/llm-modelbench.git"
 SSH_KEY="${HOME}/.ssh/id_ed25519"
 
@@ -115,8 +115,12 @@ push_current() {
   echo "Pushing $BRANCH..."
   git push -u "$REMOTE" "$BRANCH"
 
-  echo "Pushing tags..."
-  git push "$REMOTE" --tags
+  if [[ "$BRANCH" == "main" ]]; then
+    echo "Pushing tags..."
+    git push "$REMOTE" --tags
+  else
+    echo "Non-main branch: tags are not pushed."
+  fi
 
   echo "Push sync complete."
   show_status
