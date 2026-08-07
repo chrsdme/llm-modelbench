@@ -30,6 +30,25 @@ from . import __version__
 from .config import Config
 from .classify import classify_model, families_for, size_gb
 from .filters import parse_task_ids
+from .backend import (
+    BackendCapability,
+    InferenceClient,
+    MockBackendAdapter,
+    OllamaBackendAdapter,
+    require_capability,
+)
+from .runtime_profiles import (
+    RuntimeProfile,
+    RuntimeProfileError,
+    RuntimeSelectionError,
+    delete_profile,
+    discover_runtimes,
+    implicit_ollama_profile,
+    load_profiles,
+    profile_store_path,
+    save_profile,
+    select_runtime,
+)
 
 
 def _ollama_port(url: str) -> int:
@@ -40,12 +59,125 @@ def _ollama_port(url: str) -> int:
         raise SystemExit(f"invalid Ollama URL port in {url!r}") from exc
 
 
-def _client(args, cfg: Config):
+def _client(args, cfg: Config) -> InferenceClient:
     if getattr(args, "mock", False):
         from .ollama import MockClient
-        return MockClient(cfg.ollama_url, cfg.seed, cfg.temperature, cfg.request_timeout)
+        return MockBackendAdapter(MockClient(cfg.ollama_url, cfg.seed, cfg.temperature, cfg.request_timeout))
+    try:
+        profiles, default = load_profiles(_runtime_store(args))
+        candidates = discover_runtimes(cfg, store_path=_runtime_store(args))
+        explicit = getattr(args, "runtime_profile", None)
+        try:
+            selected = select_runtime(
+                candidates, explicit_profile=explicit, default_profile=default,
+                interactive=bool(sys.stdin.isatty()),
+            )
+        except RuntimeSelectionError as exc:
+            # Preserve the established no-profile Ollama behavior when the local
+            # service is down. Any explicit, saved, or ambiguous selection is
+            # fail-closed and must not silently choose Ollama.
+            if (exc.reason != "no_healthy_candidates" or explicit or default or profiles):
+                raise
+            selected = type("LegacySelection", (), {"profile": implicit_ollama_profile(cfg)})()
+    except RuntimeProfileError as exc:
+        raise SystemExit(f"runtime selection failed: {exc}") from exc
+    profile = selected.profile
+    setattr(args, "_runtime_profile", profile)
+    if profile.backend == "llama_cpp":
+        from .llama_cpp import LlamaCppBackendAdapter, LlamaCppClient
+        return LlamaCppBackendAdapter(LlamaCppClient(profile.endpoint, cfg.seed, cfg.temperature, cfg.request_timeout))
+    cfg.ollama_url = profile.endpoint
     from .ollama import OllamaClient
-    return OllamaClient(cfg.ollama_url, cfg.seed, cfg.temperature, cfg.request_timeout)
+    return OllamaBackendAdapter(OllamaClient(profile.endpoint, cfg.seed, cfg.temperature, cfg.request_timeout))
+
+
+def _runtime_store(args) -> Path:
+    value = getattr(args, "runtime_profiles_file", None)
+    return Path(value) if value else profile_store_path()
+
+
+def _confirm_profile_change(message: str, *, yes: bool) -> None:
+    if yes:
+        return
+    if not sys.stdin.isatty():
+        raise SystemExit(message + " Re-run with --yes after reviewing the change.")
+    if input(message + " Type y to continue: ").strip().lower() not in {"y", "yes"}:
+        raise SystemExit("runtime profile change cancelled")
+
+
+def cmd_runtime(args, cfg) -> None:
+    """Keep runtime-management failures at the CLI boundary, not as tracebacks."""
+    try:
+        _cmd_runtime(args, cfg)
+    except RuntimeProfileError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def _cmd_runtime(args, cfg) -> None:
+    store = _runtime_store(args)
+    if args.runtime_cmd == "list":
+        profiles, default = load_profiles(store)
+        print(json.dumps({"store": str(store), "default_profile": default,
+                          "profiles": [profile.to_dict() for profile in profiles]}, indent=2))
+        return
+    if args.runtime_cmd == "show":
+        profiles, default = load_profiles(store)
+        profile = next((item for item in profiles if item.name == args.name), None)
+        if profile is None:
+            raise SystemExit(f"unknown runtime profile: {args.name}")
+        print(json.dumps({"profile": profile.to_dict(), "default": default == profile.name}, indent=2))
+        return
+    if args.runtime_cmd == "discover":
+        print(json.dumps([candidate.to_dict() for candidate in discover_runtimes(cfg, store_path=store)], indent=2))
+        return
+    if args.runtime_cmd == "save":
+        profile = RuntimeProfile(
+            args.name, args.backend, args.endpoint, physical_gpu_uuids=tuple(args.gpu_uuid or ()),
+            description=args.description, provenance=args.provenance,
+        )
+        profiles, _ = load_profiles(store)
+        existing = any(item.name == profile.name for item in profiles)
+        if existing and not args.replace:
+            raise SystemExit(f"runtime profile already exists: {profile.name}; use --replace to replace it")
+        if existing:
+            _confirm_profile_change(f"Replace saved runtime profile {profile.name!r}?", yes=args.yes)
+        save_profile(profile, path=store, replace=args.replace, set_default=args.set_default)
+        print(json.dumps(profile.to_dict(), indent=2))
+        return
+    if args.runtime_cmd == "delete":
+        profiles, _ = load_profiles(store)
+        if not any(profile.name == args.name for profile in profiles):
+            raise RuntimeProfileError(f"unknown runtime profile: {args.name}")
+        _confirm_profile_change(f"Delete saved runtime profile {args.name!r}? This does not affect a runtime service or models.", yes=args.yes)
+        delete_profile(args.name, path=store)
+        print(f"deleted runtime profile {args.name}")
+        return
+    if args.runtime_cmd == "select":
+        profiles, default = load_profiles(store)
+        candidates = discover_runtimes(cfg, store_path=store)
+        try:
+            selected = select_runtime(
+                candidates, explicit_profile=args.runtime_profile, default_profile=default,
+                interactive=bool(sys.stdin.isatty()),
+            )
+        except RuntimeSelectionError as exc:
+            raise SystemExit(str(exc)) from exc
+        profile = selected.profile
+        if args.save_name:
+            saved = RuntimeProfile(
+                args.save_name, profile.backend, profile.endpoint,
+                physical_gpu_uuids=profile.physical_gpu_uuids,
+                description=profile.description, provenance="discovered",
+            )
+            existing = any(item.name == saved.name for item in profiles)
+            if existing and not args.replace:
+                raise SystemExit(f"runtime profile already exists: {saved.name}; use --replace to replace it")
+            if existing:
+                _confirm_profile_change(f"Replace saved runtime profile {saved.name!r}?", yes=args.yes)
+            save_profile(saved, path=store, replace=args.replace, set_default=args.set_default)
+            profile = saved
+        print(json.dumps({"selected": profile.to_dict(), "recommended": selected.recommended}, indent=2))
+        return
 
 
 def _run_dir(args) -> Path:
@@ -115,6 +247,45 @@ def cmd_inventory(args, cfg):
     for it in items:
         flag = "OFFLOAD" if it["will_offload"] else "fits"
         print(f"{it['class']:<11} {it['size_gb']:>6}GB  {flag:<8} {it['name']}")
+
+
+def cmd_runtime_fit(args, cfg):
+    """Read-only Stage 7 assessment; it does not issue a generation request."""
+    from .runtime_fit import RuntimeFitProfile, collect_runtime_fit
+    client = _client(args, cfg)
+    selected = getattr(args, "_runtime_profile", None)
+    if selected is None and getattr(args, "mock", False):
+        selected = implicit_ollama_profile(cfg)
+    if selected is None:
+        raise SystemExit("runtime-fit requires a selected runtime profile")
+    try:
+        weights = {key.strip(): float(value) for item in (args.allocation_weights or "").split(",") if item.strip()
+                   for key, value in (item.split("=", 1),)}
+    except ValueError as exc:
+        raise SystemExit("--allocation-weights must be comma-separated GPU-UUID=positive-number pairs") from exc
+    try:
+        profile = RuntimeFitProfile(
+            selected.name, selected.backend, tuple(selected.physical_gpu_uuids),
+            strategy=args.strategy, allocation_weights=weights,
+            allow_cpu_spill=True if args.allow_cpu_spill else None,
+        )
+        result = collect_runtime_fit(client=client, model_name=args.model, profile=profile,
+                                     requested_context=args.context, reserve_mib=args.reserve_mib)
+    except ValueError as exc:
+        raise SystemExit(f"runtime-fit refused: {exc}") from exc
+    value = result.to_dict()
+    payload = json.dumps(value, indent=2, sort_keys=True, allow_nan=False)
+    if args.out:
+        Path(args.out).write_text(payload + "\n", encoding="utf-8")
+    if args.json:
+        print(payload)
+        return
+    print(f"Runtime fit: {result.decision} ({', '.join(result.reasons)})")
+    print(f"Model: {result.model.name} size={result.model.weight_bytes} bytes ({result.model.weight_provenance})")
+    print(f"Profile: {result.profile.name} backend={result.profile.backend} strategy={result.profile.strategy or 'none'}")
+    print(f"Reserve: {result.reserve_bytes} bytes; KV: {result.kv_cache_bytes if result.kv_cache_bytes is not None else 'unknown'} ({result.kv_provenance})")
+    for item in result.device_assessments:
+        print(f"  {item.gpu_uuid}: {item.decision}; installed={item.installed_capacity_bytes}; live_free={item.live_free_capacity_bytes}; {item.detail}")
 
 
 
@@ -218,6 +389,8 @@ def _confirm_plan(args, plan):
 
 def cmd_run(args, cfg):
     from . import runner, report
+    from .runtime_identity import collect_runtime_identity, validate_resume_runtime_identities
+    from .hardware import detect_gpus
     if args.family_base_only and args.context_aliases_only:
         raise SystemExit("--family-base-only and --context-aliases-only cannot be used together")
     if args.samples is not None:
@@ -239,11 +412,29 @@ def cmd_run(args, cfg):
     client = _client(args, cfg)
     out_dir = _run_dir(args)
     rankings_dir = _ranking_dir_for(args, run_id=out_dir.name)
-    _write_run_ranking_scope(out_dir, args, rankings_dir=rankings_dir)
     task_ids = _task_ids(args)
     selected_models = getattr(args, "_selected_models", None)
     if selected_models is None:
         selected_models = _resolve_model_selection(args, client)
+    # Read-only selected-runtime metadata, collected per model.  This is passed
+    # into runner before it may inspect resumable evidence.
+    profile = getattr(args, "_runtime_profile", None) or implicit_ollama_profile(cfg)
+    try:
+        tag_rows = {str(row.get("name")): row for row in client.tags()}
+        inventory = detect_gpus()
+        current_runtime_identities = {
+            model: collect_runtime_identity(client=client, profile=profile, model_name=model,
+                                            model_row=tag_rows.get(model), config=cfg, inventory=inventory)
+            for model in selected_models
+        }
+    except Exception as exc:
+        raise SystemExit(f"run refused: current_runtime_identity_missing: {exc}") from exc
+    # The CLI gate is intentionally before ranking scope, plan construction,
+    # --auto probes, plan JSON, confirmation, telemetry, and runner execution.
+    if args.resume and (out_dir / "raw_results.jsonl").exists():
+        try: validate_resume_runtime_identities(out_dir, current_runtime_identities, selected_models)
+        except ValueError as exc: raise SystemExit(f"run refused: {exc}") from None
+    _write_run_ranking_scope(out_dir, args, rankings_dir=rankings_dir)
     capability_profiles = getattr(args, "_capability_profiles", None)
     plan = getattr(args, "_accepted_plan", None) or _plan_for_args(
         args, cfg, client, selected_models=selected_models, capability_profiles=capability_profiles
@@ -265,7 +456,10 @@ def cmd_run(args, cfg):
                    sample_mode=args.sample_mode, fingerprint_enabled=args.fingerprint,
                    selected_models=selected_models,
                    capability_profiles=plan.get("capability_profiles") or capability_profiles,
-                   auto_probe=bool(getattr(args, "auto", False)))
+                   auto_probe=bool(getattr(args, "auto", False)),
+                   capture_runtime_telemetry=True,
+                   runtime_profile=getattr(args, "_runtime_profile", None),
+                   runtime_identity=current_runtime_identities)
     except ValueError as exc:
         raise SystemExit(f"run refused: {exc}")
     except KeyboardInterrupt:
@@ -475,6 +669,30 @@ def _campaign_paths_or_exit(campaign_id: str):
         raise SystemExit(f"unknown campaign {campaign_id!r}")
     return paths, campaign.load_manifest(paths)
 
+def _campaign_runtime_identities(args, cfg, selected, client):
+    """Bounded metadata only; never probes or generates."""
+    from .hardware import detect_gpus
+    from .runtime_identity import collect_runtime_identity
+    profile=getattr(args,"_runtime_profile",None) or implicit_ollama_profile(cfg)
+    rows={str(x.get("name")):x for x in client.tags()}
+    inventory=detect_gpus()
+    return {model:collect_runtime_identity(client=client,profile=profile,model_name=model,model_row=rows.get(model),inventory=inventory,config=cfg) for model in selected}
+
+def _validate_campaign_generation_identities(paths, args, cfg, manifest):
+    """Called before interrupted state transition/lock; recovering shares generation cohort."""
+    from .runtime_identity import validate_frozen_runtime_identity_map
+    try: plan=json.loads(paths.plan_json.read_text(encoding="utf-8"))
+    except Exception: raise SystemExit("campaign resume refused: runtime identity mismatch: runtime_identity_artifact_unavailable")
+    if manifest.resume_state == "judging":
+        judge=plan.get("judge_runtime_identity")
+        if not isinstance(judge,dict) or judge.get("state") in {None,"judge_not_required"}: raise SystemExit("campaign resume refused: judge_runtime_identity_missing")
+    frozen=plan.get("runtime_identities")
+    if frozen is None: raise SystemExit("campaign resume refused: runtime identity mismatch: legacy_runtime_identity_missing")
+    client=_client(args,cfg); selected=[str(x) for x in frozen]
+    try: validate_frozen_runtime_identity_map(frozen,_campaign_runtime_identities(args,cfg,selected,client),selected)
+    except ValueError as exc: raise SystemExit("campaign resume refused: "+str(exc)) from None
+    return client, selected
+
 
 def cmd_campaign(args, cfg):
     """Thin compatibility layer: existing runners receive a normal nested run dir."""
@@ -488,6 +706,7 @@ def cmd_campaign(args, cfg):
         paths, manifest = _campaign_paths_or_exit(args.campaign_id)
         if manifest.state != "interrupted" or not manifest.resume_state:
             raise SystemExit("campaign resume requires an interrupted campaign with a recorded resume phase")
+        _validate_campaign_generation_identities(paths,args,cfg,manifest)
         resumed = campaign.transition(paths, manifest, manifest.resume_state)
         print(json.dumps({"campaign_id": resumed.campaign_id, "state": resumed.state,
                           "resumed_phase": resumed.state, "root": str(paths.root)}, indent=2))
@@ -523,14 +742,15 @@ def cmd_campaign(args, cfg):
             models = [value.strip() for value in (args.models or "").split(";") if value.strip()]
             paths, manifest = campaign.create_campaign(args.campaign_id, models=models, level=args.level, version=__version__)
         client = _client(args, cfg)
-        selected = _resolve_model_selection(args, client)
+        selected = _resolve_model_selection(args, client) or []
+        identities=_campaign_runtime_identities(args,cfg,selected,client)
         plan = _plan_for_args(args, cfg, client, selected_models=selected)
         configuration = {"level": args.level, "models": args.models, "judge_policy": getattr(args, "judge", "off"), "samples": args.samples, "think": args.think, "ctx": args.ctx, "num_predict": args.num_predict}
         if manifest.state == "planned":
             if not paths.plan_json.exists():
                 raise SystemExit(campaign.campaign_replan_refusal(manifest))
             existing = json.loads(paths.plan_json.read_text(encoding="utf-8"))
-            proposed = campaign._campaign_plan_payload(paths, plan, configuration=configuration, created_at=existing.get("created_at"))
+            proposed = campaign._campaign_plan_payload(paths, plan, configuration=configuration, created_at=existing.get("created_at"), runtime_identities={k:v.to_dict() for k,v in identities.items()})
             if campaign.campaign_plan_equivalent(existing, proposed):
                 print(json.dumps({
                     "campaign_id": manifest.campaign_id,
@@ -541,7 +761,7 @@ def cmd_campaign(args, cfg):
                 }, indent=2))
                 return
             raise SystemExit(campaign.campaign_replan_refusal(manifest))
-        campaign.write_campaign_plan(paths, plan, inventory=client.tags(), capabilities=plan.get("capability_profiles") or {}, configuration=configuration)
+        campaign.write_campaign_plan(paths, plan, inventory=client.tags(), capabilities=plan.get("capability_profiles") or {}, configuration=configuration, runtime_identities={k:v.to_dict() for k,v in identities.items()})
         if manifest.state == "created":
             campaign.transition(paths, manifest, "planned")
         print(f"campaign plan -> {paths.plan_json}")
@@ -557,6 +777,7 @@ def cmd_campaign(args, cfg):
         if manifest.state == "planned":
             manifest = campaign.transition(paths, manifest, "generating")
         elif manifest.state == "interrupted" and manifest.resume_state == "generating":
+            _validate_campaign_generation_identities(paths,args,cfg,manifest)
             manifest = campaign.transition(paths, manifest, "generating")
         elif manifest.state != "generating":
             raise SystemExit(f"campaign {args.campaign_id!r} cannot run from state {manifest.state!r}")
@@ -786,6 +1007,9 @@ def cmd_repair(args, cfg):
         yes=bool(args.yes or auto_confirm),
     )
     client = _client(args, cfg)
+    if args.kv_cascade:
+        require_capability(client, BackendCapability.OLLAMA_SERVICE_REPAIR)
+        require_capability(client, BackendCapability.OLLAMA_KV_REPAIR)
     rankings_dir = _ranking_dir_for(args, run_id=f"repair_{plan.plan_id}")
     ranking_scope = "separate" if getattr(args, "separate_ranking", False) else "canonical"
     if args.kv_cascade:
@@ -1186,6 +1410,7 @@ def _add_run_filters(
     r, *, include_model_selection: bool = True, include_auto: bool = True,
     auto_default: bool = False,
 ):
+    r.add_argument("--runtime-profile", help="saved runtime profile; explicit selection takes precedence")
     r.add_argument("--level", choices=["smoke", "short", "full"], default="smoke")
     r.add_argument("--categories", help="comma-separated category filter")
     r.add_argument("--tasks", help="comma-separated task IDs to run, e.g. py_anagram,json_extract,needle")
@@ -1242,6 +1467,7 @@ def build_parser():
                                 description="Hardware-adaptive benchmark suite for local Ollama models.")
     p.add_argument("--version", action="version", version=f"llm-modelbench {__version__}")
     p.add_argument("--config", help="path to a JSON or YAML config file")
+    p.add_argument("--runtime-profiles-file", help=argparse.SUPPRESS)
     p.add_argument("--selftest", action="store_true", help="run offline scorer tests and exit")
     sub = p.add_subparsers(dest="cmd")
 
@@ -1249,9 +1475,48 @@ def build_parser():
     inv.add_argument("--json", action="store_true")
     inv.add_argument("--mock", action="store_true", help="use offline stub model list")
     inv.add_argument("--auto", action="store_true", help="also run functional capability probes")
+    inv.add_argument("--runtime-profile", help="saved runtime profile; explicit selection takes precedence")
+
+    fit = sub.add_parser("runtime-fit", help="read-only conservative model-to-runtime GPU capacity assessment")
+    fit.add_argument("--model", required=True, help="exact model name already known to the selected runtime")
+    fit.add_argument("--runtime-profile", help="saved runtime profile; explicit selection takes precedence")
+    fit.add_argument("--context", type=int, help="requested context; never silently clamped")
+    fit.add_argument("--reserve-mib", type=float, default=512.0, help="per-device safety reserve in MiB")
+    fit.add_argument("--strategy", choices=["layer_split", "tensor_split"], help="explicit multi-GPU strategy declaration")
+    fit.add_argument("--allocation-weights", help="comma-separated GPU-UUID=weight layer allocations; never positional")
+    fit.add_argument("--allow-cpu-spill", action="store_true", help="record CPU/RAM spill as an explicit conditional policy")
+    fit.add_argument("--json", action="store_true", help="write deterministic JSON to stdout")
+    fit.add_argument("--out", help="optional JSON output path")
+    fit.add_argument("--mock", action="store_true", help="use the offline deterministic model client")
 
     doc = sub.add_parser("doctor", help="preflight environment, import path, Ollama, GPU, disk")
     doc.add_argument("--json", action="store_true")
+
+    runtime = sub.add_parser("runtime", help="discover and manage external local runtime profiles")
+    runtime_sub = runtime.add_subparsers(dest="runtime_cmd", required=True)
+    runtime_sub.add_parser("discover", help="bounded read-only local runtime discovery")
+    runtime_sub.add_parser("list", help="list saved runtime profiles")
+    runtime_show = runtime_sub.add_parser("show", help="show one saved runtime profile")
+    runtime_show.add_argument("name")
+    runtime_save = runtime_sub.add_parser("save", help="save one external runtime profile")
+    runtime_save.add_argument("--name", required=True)
+    runtime_save.add_argument("--backend", required=True, choices=["ollama", "llama_cpp"])
+    runtime_save.add_argument("--endpoint", required=True)
+    runtime_save.add_argument("--gpu-uuid", action="append")
+    runtime_save.add_argument("--description")
+    runtime_save.add_argument("--provenance", choices=["configured", "discovered", "legacy-default"], default="configured")
+    runtime_save.add_argument("--set-default", action="store_true")
+    runtime_save.add_argument("--replace", action="store_true")
+    runtime_save.add_argument("--yes", action="store_true")
+    runtime_delete = runtime_sub.add_parser("delete", help="delete only one saved runtime profile")
+    runtime_delete.add_argument("name")
+    runtime_delete.add_argument("--yes", action="store_true")
+    runtime_select = runtime_sub.add_parser("select", help="select a healthy discovered runtime")
+    runtime_select.add_argument("--runtime-profile")
+    runtime_select.add_argument("--save-name")
+    runtime_select.add_argument("--set-default", action="store_true")
+    runtime_select.add_argument("--replace", action="store_true")
+    runtime_select.add_argument("--yes", action="store_true")
 
     pl = sub.add_parser("plan", help="show active models, skipped models, tasks, samples, and rough ETA without running")
     _add_run_filters(pl)
@@ -1265,6 +1530,7 @@ def build_parser():
     camp_status.add_argument("campaign_id")
     camp_resume = camp_sub.add_parser("resume", help="resume the exact recorded interrupted campaign phase")
     camp_resume.add_argument("campaign_id")
+    camp_resume.add_argument("--runtime-profile", help="saved runtime profile; explicit selection takes precedence")
     camp_package = camp_sub.add_parser("package", help="write one campaign review package")
     camp_package.add_argument("campaign_id")
     camp_clean = camp_sub.add_parser("clean", help="preview or apply conservative retained-evidence cleanup")
@@ -1398,6 +1664,7 @@ def build_parser():
 
     cp = sub.add_parser("context-profile", help="run one controlled 64k-class needle telemetry profile")
     cp.add_argument("--model", required=True, help="exact installed Ollama model name")
+    cp.add_argument("--runtime-profile", help="saved runtime profile; explicit selection takes precedence")
     cp.add_argument("--run-id")
     cp.add_argument("--runs-dir", default="runs")
     cp.add_argument("--rankings-out", help="rankings directory refreshed after the profile; default: rankings")
@@ -1469,6 +1736,7 @@ def build_parser():
     jd.add_argument("--force", action="store_true", help="rejudge rows already judged by the same model/mode")
     jd.add_argument("--yes", action="store_true", help="approve the printed judge batch without an interactive prompt")
     jd.add_argument("--mock", action="store_true", help="offline deterministic judge for pipeline testing")
+    jd.add_argument("--runtime-profile", help="saved runtime profile; explicit selection takes precedence")
     jd.add_argument("--no-ranking-update", action="store_true", help="write judgements but skip automatic rankings refresh")
     jd.add_argument("--separate-ranking", action="store_true", help="generate an isolated rankings-separate/<run-id> report after judging")
 
@@ -1522,6 +1790,7 @@ def build_parser():
     rp.add_argument("--live-ui", choices=["off", "compact", "full", "log"], default="compact",
                     help="inline repair-aware dashboard for child runs; detached llmb-watch remains supported")
     rp.add_argument("--mock", action="store_true", help="offline deterministic repair pipeline test")
+    rp.add_argument("--runtime-profile", help="saved runtime profile; explicit selection takes precedence")
     rp.add_argument("--no-ranking-update", action="store_true", help="write repair evidence but skip automatic rankings refresh")
     rp.add_argument("--separate-ranking", action="store_true", help="generate an isolated rankings-separate/<plan-id> report for repair children")
 
@@ -1603,16 +1872,20 @@ def build_parser():
     return p
 
 
-def main(argv=None):
+def _main(argv=None):
     args = build_parser().parse_args(argv)
     if args.selftest or args.cmd == "selftest":
         from . import selftest
         sys.exit(selftest.run())
     cfg = Config.load(args.config)
-    if args.cmd == "doctor":
+    if args.cmd == "runtime":
+        cmd_runtime(args, cfg)
+    elif args.cmd == "doctor":
         cmd_doctor(args, cfg)
     elif args.cmd == "inventory":
         cmd_inventory(args, cfg)
+    elif args.cmd == "runtime-fit":
+        cmd_runtime_fit(args, cfg)
     elif args.cmd == "plan":
         cmd_plan(args, cfg)
     elif args.cmd == "campaign":
@@ -1660,6 +1933,17 @@ def main(argv=None):
     elif args.cmd == "dossier": cmd_dossier(args, cfg)
     else:
         build_parser().print_help()
+
+
+def main(argv=None):
+    """Convert expected external llama-server failures to concise CLI exits."""
+    try:
+        return _main(argv)
+    except Exception as exc:
+        from .llama_cpp import LlamaCppError
+        if isinstance(exc, LlamaCppError):
+            raise SystemExit(f"llama.cpp error: {exc}") from exc
+        raise
 
 
 if __name__ == "__main__":

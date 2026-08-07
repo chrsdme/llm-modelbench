@@ -15,6 +15,7 @@ import math
 import os
 import re
 import statistics
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -29,6 +30,7 @@ from .filters import (
 from .classify import classify_model, size_gb
 from .config import Config
 from .hardware import Telemetry, ProbeTelemetry, detect_gpu, nvidia_live, host_memory_snapshot
+from .backend import BackendCapability, InferenceClient, supports_capability
 from .tasks import Task, tasks_for, make_needle_prompt, TASKS
 from .inline_ui import InlineUI
 
@@ -1015,9 +1017,13 @@ def _run_once(
                 wanted_ctx = int(actual_prompt_tokens) + needle_num_predict + 64
                 kv = _needle_kv_estimate(client, cfg, model, wanted_ctx, measured_estimate)
             err = _model_output_error(res) if res.get("ok") else _harness_error(res.get("error", "failed"), res)
-            loaded_stats = client.loaded_model_stats(model) if hasattr(client, "loaded_model_stats") else None
+            loaded_stats = (
+                client.loaded_model_stats(model)
+                if supports_capability(client, BackendCapability.LOADED_MODEL_STATS)
+                else None
+            )
             offload = (loaded_stats or {}).get("offload_fraction")
-            if offload is None and hasattr(client, "offload_fraction"):
+            if offload is None and supports_capability(client, BackendCapability.OFFLOAD_FRACTION):
                 offload = client.offload_fraction(model)
             vram_probe_mb = probe_hw.get("vram_peak_mb") or _current_vram_used_mb()
             output_text = str(res.get("text") or "")
@@ -1266,7 +1272,48 @@ def _dump_raw(out_dir: Path, task: Task, model: str, output: str, sample_index: 
     return path
 
 
-def run(client, cfg: Config, *, level: str, out_dir: Path,
+def _capture_runtime_telemetry(out_dir: Path, client: InferenceClient, factory, *, runtime_profile=None) -> Optional[Dict[str, Any]]:
+    """Persist optional Stage 6 evidence without changing run semantics.
+
+    The factory is injected for tests.  It is deliberately called once before
+    benchmark work and cannot affect scores, prompts, lifecycle operations, or
+    result preservation if local telemetry is unavailable.
+    """
+    try:
+        identity = client.backend_identity() if hasattr(client, "backend_identity") else None
+        backend = getattr(identity, "backend", None)
+        endpoint = getattr(identity, "endpoint", None)
+        if backend not in {"ollama", "llama_cpp"}:
+            return None
+        snapshot = factory(backend=backend, endpoint=endpoint,
+                           runtime_profile=getattr(runtime_profile, "name", None),
+                           declared_gpu_uuids=getattr(runtime_profile, "physical_gpu_uuids", ()))
+        value = snapshot.to_dict() if hasattr(snapshot, "to_dict") else dict(snapshot)
+        if not isinstance(value, dict):
+            raise ValueError("runtime telemetry snapshot must serialize to an object")
+    except Exception as exc:
+        value = {"schema_version": 1, "status": "unavailable",
+                 "errors": [{"operation": "runtime_telemetry", "state": "failed", "detail": str(exc)[:512], "query_tier": None}]}
+    temporary = None
+    try:
+        target = out_dir / "runtime_telemetry.json"
+        encoded = json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n"
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=out_dir, prefix=".runtime_telemetry.", suffix=".tmp", delete=False) as handle:
+            handle.write(encoded)
+            temporary = Path(handle.name)
+        temporary.replace(target)
+    except Exception:
+        try:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
+    return {"artifact": "runtime_telemetry.json", "schema_version": value.get("schema_version"),
+            "status": value.get("status") or "collected"}
+
+
+def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
         include: Optional[str], exclude: Optional[str], skip_offload: bool,
         categories: Optional[List[str]], task_ids: Optional[List[str]] = None,
         task_regex: Optional[str] = None, family_base_only: bool = False,
@@ -1278,9 +1325,15 @@ def run(client, cfg: Config, *, level: str, out_dir: Path,
         selected_models: Optional[List[str]] = None,
         capability_profiles: Optional[Dict[str, Dict[str, Any]]] = None,
         auto_probe: bool = False,
-        row_metadata_by_task: Optional[Dict[str, Dict[str, Any]]] = None) -> Path:
+        row_metadata_by_task: Optional[Dict[str, Dict[str, Any]]] = None,
+        capture_runtime_telemetry: bool = False,
+        runtime_telemetry_factory=None,
+        runtime_profile=None, runtime_identity=None) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     raw = out_dir / "raw_results.jsonl"
+    # Identity must be checked before telemetry, status, reports, or reusable rows.
+    # A mapping is required for multi-model runs; a single identity remains readable.
+    runtime_identity_values = {}
     gpu = detect_gpu()
     ollama_version = client.version() if hasattr(client, "version") else None
 
@@ -1304,6 +1357,33 @@ def run(client, cfg: Config, *, level: str, out_dir: Path,
         before = list(models)
         models = [m for m in models if not rx.search(m)]
         skipped_models.extend({"model": m, "reason": "exclude_regex_match"} for m in before if m not in models)
+
+    from .runtime_identity import RuntimeIdentity, validate_resume_runtime_identities, write_runtime_identity_map_artifact
+    if runtime_identity is not None:
+        if isinstance(runtime_identity, RuntimeIdentity):
+            if len(models) != 1: raise ValueError("single RuntimeIdentity is only valid for one selected model")
+            runtime_identity_values = {models[0]: runtime_identity}
+        elif isinstance(runtime_identity, dict) and all(isinstance(v, RuntimeIdentity) for v in runtime_identity.values()):
+            runtime_identity_values = dict(runtime_identity)
+        else:
+            raise ValueError("runtime_identity must be RuntimeIdentity or a model-keyed RuntimeIdentity mapping")
+        missing = [model for model in models if model not in runtime_identity_values]
+        if missing: raise ValueError("current_runtime_identity_missing: " + ", ".join(missing))
+
+    # Gate an existing run before reading raw rows into done and before any write.
+    if resume and raw.exists():
+        validate_resume_runtime_identities(out_dir, runtime_identity_values, models)
+    elif runtime_identity_values:
+        # New evidence only: immutable model-keyed artifact. Never rewrite a resume artifact.
+        write_runtime_identity_map_artifact(out_dir / "runtime_identity.json", runtime_identity_values)
+
+    telemetry_ref = None
+    if capture_runtime_telemetry:
+        if runtime_telemetry_factory is None:
+            from .runtime_telemetry import collect_runtime_telemetry
+            runtime_telemetry_factory = collect_runtime_telemetry
+        telemetry_ref = _capture_runtime_telemetry(out_dir, client, runtime_telemetry_factory,
+                                                   runtime_profile=runtime_profile)
     if skip_offload:
         before = list(models)
         models = [m for m in models if size_gb(models_rows[m]) <= cfg.vram_budget_gb]
@@ -1435,7 +1515,8 @@ def run(client, cfg: Config, *, level: str, out_dir: Path,
             model_tasks = [t for t in all_model_tasks if (model, t.id, _task_hash(t)) not in done]
             if not model_tasks:
                 continue
-            client.flush_all()
+            if supports_capability(client, BackendCapability.FLUSH_ALL):
+                client.flush_all()
             # Warm up through a compatible provider path. Embedding-only models
             # must not be forced through chat, and insert-only models use suffix generation.
             if "text" in fams:
@@ -1447,8 +1528,12 @@ def run(client, cfg: Config, *, level: str, out_dir: Path,
             context_length_max = client.context_length(model)
             num_ctx_used = _ctx(cfg)
             display_ctx = num_ctx_used or context_length_max
-            offload = client.offload_fraction(model, exact=True)
-            if offload is None:
+            offload = (
+                client.offload_fraction(model, exact=True)
+                if supports_capability(client, BackendCapability.OFFLOAD_FRACTION)
+                else None
+            )
+            if offload is None and supports_capability(client, BackendCapability.OFFLOAD_FRACTION):
                 offload = client.offload_fraction(model, exact=False)
             model_started_at = time.perf_counter()
             status.start_model(model_index, model, cls, sz, len(all_model_tasks), display_ctx, offload)
@@ -1575,6 +1660,11 @@ def run(client, cfg: Config, *, level: str, out_dir: Path,
                     "vram_peak_mb": hw["vram_peak_mb"], "power_mean_w": hw["power_mean_w"],
                     "temp_peak_c": hw["temp_peak_c"],
                 }
+                if model in runtime_identity_values:
+                    from .runtime_identity import row_identity_reference
+                    row.update(row_identity_reference(runtime_identity_values[model]))
+                if telemetry_ref is not None:
+                    row["runtime_telemetry"] = dict(telemetry_ref)
                 if row_metadata_by_task and task.id in row_metadata_by_task:
                     # Repair/recovery provenance is additive and written only to the
                     # new child run. Source run evidence remains immutable.
@@ -1631,7 +1721,8 @@ def run(client, cfg: Config, *, level: str, out_dir: Path,
                         for p in fingerprint.PROBES]
                 fingerprints[model] = outs
             status.finish_model(model)
-            client.unload(model)
+            if supports_capability(client, BackendCapability.MODEL_UNLOAD):
+                client.unload(model)
 
     (out_dir / "fingerprints.json").write_text(json.dumps(fingerprints, indent=2))
     (out_dir / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2))

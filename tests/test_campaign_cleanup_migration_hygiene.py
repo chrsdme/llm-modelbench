@@ -288,7 +288,10 @@ def test_campaign_mode_commands_have_no_root_artifact_leakage(tmp_path, monkeypa
     manifest = campaign.transition(interrupted, manifest, "planned")
     manifest = campaign.transition(interrupted, manifest, "generating")
     campaign.transition(interrupted, manifest, "interrupted")
-    main(["campaign", "resume", "interrupted"])
+    # Legacy interrupted campaigns lack frozen runtime identity and must now
+    # refuse before transitioning their manifest.
+    with pytest.raises(SystemExit, match="runtime_identity_artifact_unavailable"):
+        main(["campaign", "resume", "interrupted"])
     forbidden = {"acceptance_artifacts", "overnight_logs", "rankings-separate", "report-package", "report_package"}
     for name in forbidden:
         assert not (tmp_path / name).exists(), name
