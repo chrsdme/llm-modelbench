@@ -2,8 +2,7 @@ from datetime import datetime, timezone
 import pytest
 
 from llm_modelbench.process_telemetry import (
-    GPUProcessCollectionResult, ProcessDiscoveryResult, RuntimeAttributionResult,
-    nvidia_process_command,
+    GPUProcessCollectionResult, ProcessDiscoveryResult, nvidia_process_command,
 )
 from llm_modelbench.runtime_telemetry import collect_runtime_telemetry, _snapshot_errors
 from llm_modelbench.telemetry import GPUCollectionResult, TelemetryCollectionError

@@ -8,7 +8,6 @@ from llm_modelbench.runtime_fit import (
     RuntimeFitModel, RuntimeFitProfile, RuntimeFitResult, calculate_kv_cache_bytes,
     evaluate_runtime_fit,
 )
-from llm_modelbench.telemetry import GPUCollectionResult
 
 
 TS = "2026-08-01T00:00:00Z"

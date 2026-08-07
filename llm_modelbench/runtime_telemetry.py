@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import re
-from typing import Any, Callable, Iterable, Optional, Tuple
+from typing import Callable, Iterable, Optional, Tuple
 from urllib.parse import urlsplit
 
 from .hardware import GPUDevice, detect_gpus

@@ -13,7 +13,7 @@ import subprocess
 import threading
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Iterable, List, Optional, Tuple
 
 from .hardware import GPUDevice
 

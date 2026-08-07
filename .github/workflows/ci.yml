@@ -64,14 +64,45 @@ jobs:
       - name: Installed-wheel smoke test
         shell: bash
         run: |
+          rm -rf /tmp/llmb-wheel-test /tmp/llmb-wheel-smoke /tmp/llmb-wheel-runs
+
           python -m venv /tmp/llmb-wheel-test
           /tmp/llmb-wheel-test/bin/python -m pip install --upgrade pip
-          /tmp/llmb-wheel-test/bin/python -m pip install --no-deps dist/*.whl
+
+          mkdir -p /tmp/llmb-wheel-smoke
+          cd /tmp/llmb-wheel-smoke
+
+          /tmp/llmb-wheel-test/bin/python -m pip install \
+            --no-deps \
+            --force-reinstall \
+            "$GITHUB_WORKSPACE"/dist/*.whl
+
+          /tmp/llmb-wheel-test/bin/python - <<'PYCODE'
+          import inspect
+          from importlib.metadata import version
+          from pathlib import Path
+
+          import llm_modelbench
+
+          package_file = Path(inspect.getfile(llm_modelbench)).resolve()
+          installed_version = version("llm-modelbench")
+
+          print("package version:", llm_modelbench.__version__)
+          print("metadata version:", installed_version)
+          print("loaded from:", package_file)
+
+          assert llm_modelbench.__version__ == installed_version
+          assert str(package_file).startswith(
+              "/tmp/llmb-wheel-test/"
+          ), package_file
+          PYCODE
+
+          test -x /tmp/llmb-wheel-test/bin/llm-modelbench
 
           /tmp/llmb-wheel-test/bin/llm-modelbench --version
           /tmp/llmb-wheel-test/bin/llm-modelbench selftest
 
-          /tmp/llmb-wheel-test/bin/python - <<'PY'
+          /tmp/llmb-wheel-test/bin/python - <<'PYCODE'
           from llm_modelbench import media
           from llm_modelbench.tasks import TASKS
 
@@ -87,7 +118,7 @@ jobs:
               assert media.load_image_file(resource)["data"]
 
           print(f"packaged resources: {len(resources)}")
-          PY
+          PYCODE
 
           /tmp/llmb-wheel-test/bin/llm-modelbench run \
             --mock \
@@ -101,7 +132,7 @@ jobs:
             --live-ui off \
             --no-ranking-update
 
-          /tmp/llmb-wheel-test/bin/python - <<'PY'
+          /tmp/llmb-wheel-test/bin/python - <<'PYCODE'
           import json
           from pathlib import Path
 
@@ -110,10 +141,11 @@ jobs:
               "wheel-resource-smoke/"
               "run_validity.json"
           )
+
           data = json.loads(validity_path.read_text())
 
           assert data["status"] == "valid"
           assert data["harness_error_rows"] == 0
 
           print("installed wheel OCR resource run: valid")
-          PY
+          PYCODE

@@ -17,8 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence, Tuple
 
-from .telemetry import (CommandResult, MAX_TELEMETRY_DETAIL_CHARS,
-                        MAX_TELEMETRY_ERRORS, TelemetryCollectionError,
+from .telemetry import (CommandResult, TelemetryCollectionError,
                         TelemetryFieldState, _bounded_detail,
                         _marker_state, _normalise_timestamp, _ordered_errors)
 
