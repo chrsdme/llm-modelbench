@@ -1013,7 +1013,7 @@ def cmd_repair(args, cfg):
     rankings_dir = _ranking_dir_for(args, run_id=f"repair_{plan.plan_id}")
     ranking_scope = "separate" if getattr(args, "separate_ranking", False) else "canonical"
     if args.kv_cascade:
-        from .ollama_service import OllamaServiceController
+        from .ollama_service import BrokerOllamaServiceController
         service_audit_path = Path(args.runs_dir or "runs") / f"repair_service_{plan.plan_id}.jsonl"
         controller_holder = {"controller": None}
 
@@ -1042,13 +1042,13 @@ def cmd_repair(args, cfg):
                     "Entering unattended quantized-KV fallback. Privileged commands use "
                     "'sudo -n' only; running the scoped NOPASSWD preflight now."
                 )
-                preflight = OllamaServiceController(
+                preflight = BrokerOllamaServiceController(
                     "ollama.service", port=port, auto_confirm=True,
                 )
                 preflight.verify_noninteractive_sudo_ready()
                 print("Preflight passed: passwordless sudo is ready for the fallback phases.\n")
             if args.ollama_service == "auto":
-                discovery_guard = OllamaServiceController(
+                discovery_guard = BrokerOllamaServiceController(
                     "ollama.service", port=port,
                     force_password_prompt=force_password,
                     auto_confirm=auto_confirm,
@@ -1062,7 +1062,7 @@ def cmd_repair(args, cfg):
                     keyword="DISCOVER",
                 )
                 discovery_guard.authorise_sudo()
-                controller = OllamaServiceController.for_active_service(
+                controller = BrokerOllamaServiceController.for_active_service(
                     port=port, force_password_prompt=force_password,
                     auto_confirm=auto_confirm, event_callback=record_service_event,
                     warn_fn=lambda message: record_service_event({
@@ -1070,7 +1070,7 @@ def cmd_repair(args, cfg):
                     }),
                 )
             else:
-                controller = OllamaServiceController(
+                controller = BrokerOllamaServiceController(
                     args.ollama_service, port=port,
                     force_password_prompt=force_password,
                     auto_confirm=auto_confirm, event_callback=record_service_event,
@@ -1776,7 +1776,7 @@ def build_parser():
     rp.add_argument("--restart-ollama", action="store_true",
                     help="allow the explicit KV cascade to install a temporary systemd drop-in and restart Ollama")
     rp.add_argument("--ollama-service", default="auto",
-                    help="systemd unit managed by --restart-ollama; default auto discovers the unit owning the configured Ollama port")
+                    help="deprecated display hint; the privileged broker always discovers the sole Ollama unit owning the configured port")
     rp.add_argument("--keep-final-kv", action="store_true",
                     help="do not restore the original Ollama service drop-in after the cascade")
     rp.add_argument("--reuse-sudo-credentials", action="store_true",
@@ -1784,7 +1784,7 @@ def build_parser():
     rp.add_argument("--auto-confirm", action="store_true",
                     help="fully unattended apply mode for --restart-ollama --kv-cascade: implies --yes, skips "
                          "typed DISCOVER/VERIFY/RESTART confirmations, and uses sudo -n only. Requires a scoped "
-                         "NOPASSWD sudoers rule for the exact commands in docs/auto_confirm_sudoers.md. Does "
+                         "NOPASSWD sudoers rule for the dedicated broker in docs/auto_confirm_sudoers.md. Does "
                          "not store or read a password. Off by default.")
     rp.add_argument("--force", action="store_true", help="allow a previously recorded repair action to be planned again")
     rp.add_argument("--live-ui", choices=["off", "compact", "full", "log"], default="compact",

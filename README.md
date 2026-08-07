@@ -24,6 +24,22 @@ and `1.2.0` denote minor releases, and `2.0.0` denotes a major release.
 
 Coding and file-operation scorers may execute model-generated code. The built-in guards, temporary directories, timeouts, environment scrubbing, and Linux resource limits reduce accidental damage but are not a complete security boundary. Run untrusted models inside a container, VM, or disposable host. See [docs/SAFETY.md](docs/SAFETY.md).
 
+## Privileges / root access
+
+Normal LLM ModelBench operation requires no root or sudo access: benchmarking,
+diagnostics, GPU/runtime discovery, telemetry, scoring, rankings, reports,
+Ollama API use, and external llama.cpp/`llama-server` use all run unprivileged.
+
+Root is used only when an operator explicitly enables automatic Ollama
+system-service KV-cache repair. That optional Ollama-only workflow temporarily
+tries `q8_0`/`q4_0`, restarts and verifies the discovered service, retries
+eligible work, and restores the original configuration through the narrowly
+scoped `llmb-ollama-kv-control` helper. llama.cpp does not use this path.
+Users who do not select automatic KV repair require no sudo access at all.
+See [repair](docs/REPAIR.md), [safety](docs/SAFETY.md),
+[optional sudoers setup](docs/auto_confirm_sudoers.md), and
+[security policy](SECURITY.md).
+
 ## Install and verify
 
 From the public repository:

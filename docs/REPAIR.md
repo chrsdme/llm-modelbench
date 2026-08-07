@@ -103,14 +103,42 @@ llmb repair \
   --restart-ollama
 ```
 
-The command performs this sequence:
+The command performs this sequence. Service discovery, drop-in construction,
+systemd mutation, and live KV verification are performed only by the installed
+root-owned broker; the Python client passes only a port, transaction token, and
+the q8/q4 KV enum. The broker retains root-private recovery state until final
+restore succeeds.
 
-1. require the operator to type `DISCOVER`, authenticate through normal `sudo`, identify the PID listening on the configured Ollama port, and match that PID to a systemd unit `MainPID`;
-2. reject a manually supplied `--ollama-service` when it does not own the live endpoint;
-3. validate any UUID-based `CUDA_VISIBLE_DEVICES` binding and block a restart when the UUID no longer exists;
+This optional convenience workflow is Ollama-specific: detect a likely
+KV-related problem, begin a transaction, try `q8_0`/`q4_0` as applicable,
+restart and verify Ollama, retry only eligible work, then restore the original
+service state. No root is needed when it is not selected; normal repair
+planning and diagnostics remain unprivileged, and external llama.cpp/
+`llama-server` does not use this pathway.
+
+If a restart failure leaves Ollama down, recovery validates the stored
+root-private transaction, matching lock, trusted systemd metadata, and managed
+drop-in hash without requiring a listener before it restores the original
+bytes. It then reloads, restarts, and requires the listener identity to return
+before final cleanup. Direct real root can use the documented broker
+`recover --transaction <token>` operation for an interrupted transaction owned
+by another sudo user; that override cannot set KV.
+
+Recovery is deliberately fail-closed, not a guarantee that every damaged host
+state can be repaired automatically. A failed restore/restart leaves
+root-private recovery state marked `rollback_failed` for administrator action.
+Direct real root can recover an interrupted transaction with:
+
+```bash
+/usr/local/libexec/llmb-ollama-kv-control recover --transaction <token>
+```
+
+1. require the operator to type `DISCOVER`, authenticate through normal `sudo`, and let the broker identify the PID listening on the configured Ollama port and its systemd owner;
+2. reject ambiguous, non-Ollama, or changed service ownership;
+3. retain the original managed drop-in bytes and hash in root-private transaction state;
 4. run non-needle repairs under the original Ollama configuration;
 5. print the exact privileged q8 phase and require the operator to type `RESTART`;
-6. install `/etc/systemd/system/<active-unit>.d/zzzz-llmb-repair-kv.conf` with `q8_0`;
+6. have the broker atomically construct its fixed managed drop-in with `q8_0`;
 7. reload systemd and verify the **merged effective environment before restart**;
 8. restart the active unit, verify it still owns the configured port, and verify the live process environment;
 9. run only guarded needle repairs;
@@ -135,7 +163,7 @@ state before propagating the error.
 Useful options:
 
 ```text
---ollama-service NAME       explicit systemd unit; default auto discovers the live port owner
+--ollama-service NAME       deprecated display hint; broker ignores it and discovers the live port owner
 --keep-final-kv             deliberately leave the final q8/q4 setting active
 --reuse-sudo-credentials    do not invalidate sudo's cached timestamp per phase
 ```
@@ -176,15 +204,10 @@ Measured VRAM slope is total-memory behaviour. It may include KV cache, activati
 
 ## Inspecting the live setting
 
-The repair planner performs best-effort inspection of `/proc/<ollama-pid>/environ` and the systemd unit. It stores only `OLLAMA_KV_CACHE_TYPE`, never the complete service environment.
-
-Manual checks on the host:
-
-```bash
-systemctl show ollama.service --property=Environment --value | tr ' ' '\n' | grep '^OLLAMA_KV_CACHE_TYPE='
-pid=$(systemctl show ollama.service --property=MainPID --value)
-sudo sh -c 'tr "\000" "\n" < "/proc/'"$pid"'/environ" | grep "^OLLAMA_KV_CACHE_TYPE="'
-```
+During a managed transaction, the broker reads only `OLLAMA_KV_CACHE_TYPE` from
+the validated live Ollama process and never returns or records the complete
+process or systemd environment. Non-mutating planning does not guess a systemd
+unit or perform service control.
 
 ## Evidence and outcomes
 

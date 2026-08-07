@@ -20,6 +20,7 @@ Current user and contributor documentation is kept concise and release-neutral.
 - [SAFETY.md](SAFETY.md), execution and service boundaries
 - [PRIVACY_FIXTURES.md](PRIVACY_FIXTURES.md), public fixture policy
 - [auto_confirm_sudoers.md](auto_confirm_sudoers.md), optional unattended repair template
+- [Security policy](../SECURITY.md), optional privileged broker rationale
 
 ## Develop and publish
 
