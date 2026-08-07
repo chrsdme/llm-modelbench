@@ -109,6 +109,13 @@ root-owned broker; the Python client passes only a port, transaction token, and
 the q8/q4 KV enum. The broker retains root-private recovery state until final
 restore succeeds.
 
+This optional convenience workflow is Ollama-specific: detect a likely
+KV-related problem, begin a transaction, try `q8_0`/`q4_0` as applicable,
+restart and verify Ollama, retry only eligible work, then restore the original
+service state. No root is needed when it is not selected; normal repair
+planning and diagnostics remain unprivileged, and external llama.cpp/
+`llama-server` does not use this pathway.
+
 If a restart failure leaves Ollama down, recovery validates the stored
 root-private transaction, matching lock, trusted systemd metadata, and managed
 drop-in hash without requiring a listener before it restores the original
@@ -116,6 +123,15 @@ bytes. It then reloads, restarts, and requires the listener identity to return
 before final cleanup. Direct real root can use the documented broker
 `recover --transaction <token>` operation for an interrupted transaction owned
 by another sudo user; that override cannot set KV.
+
+Recovery is deliberately fail-closed, not a guarantee that every damaged host
+state can be repaired automatically. A failed restore/restart leaves
+root-private recovery state marked `rollback_failed` for administrator action.
+Direct real root can recover an interrupted transaction with:
+
+```bash
+/usr/local/libexec/llmb-ollama-kv-control recover --transaction <token>
+```
 
 1. require the operator to type `DISCOVER`, authenticate through normal `sudo`, and let the broker identify the PID listening on the configured Ollama port and its systemd owner;
 2. reject ambiguous, non-Ollama, or changed service ownership;

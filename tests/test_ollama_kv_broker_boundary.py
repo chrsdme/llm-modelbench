@@ -62,6 +62,26 @@ def test_public_sudoers_policy_grants_only_broker():
         assert command not in text
 
 
+def test_public_docs_describe_optional_root_boundary():
+    readme = Path("README.md").read_text(encoding="utf-8").lower()
+    safety = Path("docs/SAFETY.md").read_text(encoding="utf-8").lower()
+    repair = Path("docs/REPAIR.md").read_text(encoding="utf-8").lower()
+    assert "normal llm modelbench operation requires no root or sudo access" in readme
+    assert "users who do not select automatic kv repair require no sudo access at all" in readme
+    assert "llama.cpp does not use this path" in readme
+    assert "zero sudo involvement" in safety
+    assert "ollama-specific" in repair and "llama-server" in repair
+
+
+def test_public_docs_deprecate_broad_privileged_policy():
+    security = Path("SECURITY.md").read_text(encoding="utf-8").lower()
+    sudoers = Path("docs/auto_confirm_sudoers.md").read_text(encoding="utf-8").lower()
+    assert "historical design" in security and "been removed" in security
+    assert "no generic llmb nopasswd policy is supported" in security
+    assert "not required to install or normally use" in sudoers
+    assert "old kv environment reader" in sudoers
+
+
 def test_auto_confirm_client_uses_only_sudo_n_broker():
     calls = []
     def run(argv, **kwargs):
