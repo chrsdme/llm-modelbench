@@ -109,12 +109,12 @@ root-owned broker; the Python client passes only a port, transaction token, and
 the q8/q4 KV enum. The broker retains root-private recovery state until final
 restore succeeds.
 
-1. require the operator to type `DISCOVER`, authenticate through normal `sudo`, identify the PID listening on the configured Ollama port, and match that PID to a systemd unit `MainPID`;
-2. reject a manually supplied `--ollama-service` when it does not own the live endpoint;
-3. validate any UUID-based `CUDA_VISIBLE_DEVICES` binding and block a restart when the UUID no longer exists;
+1. require the operator to type `DISCOVER`, authenticate through normal `sudo`, and let the broker identify the PID listening on the configured Ollama port and its systemd owner;
+2. reject ambiguous, non-Ollama, or changed service ownership;
+3. retain the original managed drop-in bytes and hash in root-private transaction state;
 4. run non-needle repairs under the original Ollama configuration;
 5. print the exact privileged q8 phase and require the operator to type `RESTART`;
-6. install `/etc/systemd/system/<active-unit>.d/zzzz-llmb-repair-kv.conf` with `q8_0`;
+6. have the broker atomically construct its fixed managed drop-in with `q8_0`;
 7. reload systemd and verify the **merged effective environment before restart**;
 8. restart the active unit, verify it still owns the configured port, and verify the live process environment;
 9. run only guarded needle repairs;
@@ -180,15 +180,10 @@ Measured VRAM slope is total-memory behaviour. It may include KV cache, activati
 
 ## Inspecting the live setting
 
-The repair planner performs best-effort inspection of `/proc/<ollama-pid>/environ` and the systemd unit. It stores only `OLLAMA_KV_CACHE_TYPE`, never the complete service environment.
-
-Manual checks on the host:
-
-```bash
-systemctl show ollama.service --property=Environment --value | tr ' ' '\n' | grep '^OLLAMA_KV_CACHE_TYPE='
-pid=$(systemctl show ollama.service --property=MainPID --value)
-sudo sh -c 'tr "\000" "\n" < "/proc/'"$pid"'/environ" | grep "^OLLAMA_KV_CACHE_TYPE="'
-```
+During a managed transaction, the broker reads only `OLLAMA_KV_CACHE_TYPE` from
+the validated live Ollama process and never returns or records the complete
+process or systemd environment. Non-mutating planning does not guess a systemd
+unit or perform service control.
 
 ## Evidence and outcomes
 

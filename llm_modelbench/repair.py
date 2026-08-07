@@ -279,16 +279,11 @@ def inspect_ollama_kv_environment() -> Dict[str, Any]:
                 result["notes"].append(f"could not inspect ollama pid {pid}: {exc!r}")
             result["running_processes"].append(item)
 
+    # Service ownership is deliberately resolved only inside the root-owned KV
+    # broker.  Non-mutating repair planning never guesses a unit or gains a
+    # service-control capability merely to enrich diagnostics.
     active_unit: Optional[str] = None
-    try:
-        from .ollama_service import discover_active_service
-        active = discover_active_service(run=subprocess.run, use_sudo=False)
-        active_unit = active.unit
-    except Exception as exc:
-        result["notes"].append(
-            f"active Ollama service unit could not be determined without privileged "
-            f"access; systemd inspection skipped ({exc})"
-        )
+    result["notes"].append("systemd KV inspection is available only during broker-controlled repair")
 
     if active_unit and shutil.which("systemctl"):
         try:

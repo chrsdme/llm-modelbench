@@ -1,15 +1,15 @@
-#!/usr/bin/env python3
-"""Root-owned broker for the optional Ollama KV repair transaction.
+#!/usr/bin/python3 -I
+"""Root-owned, semantic broker for temporary Ollama KV repair.
 
-This file intentionally uses only the Python standard library so the installed
-helper has no dependency on the caller's virtualenv.  It accepts a very small
-semantic protocol; it never accepts a path, unit name, fragment, environment,
-or command from an unprivileged caller.
+Only this standard-library program performs privileged service work.  It has
+no project imports, does not use caller PATH/environment, and accepts no unit,
+path, fragment, executable, or command argument.
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -17,12 +17,15 @@ import secrets
 import stat
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
 PROTOCOL_VERSION = 1
 STATE_ROOT = Path("/var/lib/llm-modelbench/kv-repair")
+SYSTEMD_ROOT = Path("/etc/systemd/system")
+SS = "/usr/bin/ss"
+SYSTEMCTL = "/usr/bin/systemctl"
+SAFE_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"}
 MANAGED_NAME = "zzzz-llmb-repair-kv.conf"
 MARKER = "# Managed by llmb-ollama-kv-control; restore through this broker.\n"
 KV_VALUES = {"q4_0", "q8_0"}
@@ -31,232 +34,292 @@ UNIT_RE = re.compile(r"^[A-Za-z0-9_.@-]+\.service$")
 
 
 class BrokerError(RuntimeError):
-    pass
-
-
-def _run(argv: list[str], *, check: bool = True, timeout: int = 120) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(argv, text=True, capture_output=True, check=False, timeout=timeout)
-    if check and result.returncode:
-        raise BrokerError((result.stderr or result.stdout or "command failed").strip()[:1000])
-    return result
+    def __init__(self, message: str, code: str = "operation_failed") -> None:
+        super().__init__(message); self.code = code
 
 
 def _port(value: str) -> int:
-    try:
-        port = int(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("port must be numeric") from exc
-    if not 1 <= port <= 65535:
-        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    if not value.isascii() or not value.isdecimal(): raise argparse.ArgumentTypeError("port must be decimal")
+    port = int(value)
+    if not 1 <= port <= 65535: raise argparse.ArgumentTypeError("port must be between 1 and 65535")
     return port
 
 
+def _sha(data: bytes) -> str: return hashlib.sha256(data).hexdigest()
+
+
+def _check_dir(path: Path, mode: int, *, create: bool = False) -> None:
+    if create and not path.exists():
+        path.mkdir(parents=True, mode=mode)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or stat.S_IMODE(info.st_mode) != mode:
+        raise BrokerError(f"unsafe trusted directory: {path}", "unsafe_filesystem")
+
+
 def _state_dir() -> None:
-    STATE_ROOT.mkdir(parents=True, exist_ok=True)
-    os.chmod(STATE_ROOT, 0o700)
-    details = STATE_ROOT.stat()
-    if details.st_uid != 0 or details.st_gid != 0 or stat.S_IMODE(details.st_mode) != 0o700:
-        raise BrokerError("transaction state directory is not root-private")
+    _check_dir(STATE_ROOT, 0o700, create=True)
 
 
 def _state_path(token: str) -> Path:
-    if not TOKEN_RE.fullmatch(token):
-        raise BrokerError("invalid transaction token")
+    if not TOKEN_RE.fullmatch(token): raise BrokerError("invalid transaction token", "invalid_transaction")
     return STATE_ROOT / f"{token}.json"
 
 
-def _write_state(token: str, value: dict[str, Any]) -> None:
-    _state_dir()
-    target = _state_path(token)
-    fd, raw = tempfile.mkstemp(prefix=".state-", dir=STATE_ROOT)
+def _write_bytes_atomic(path: Path, data: bytes, mode: int) -> None:
+    _check_dir(path.parent, 0o755)
+    tmp = path.parent / ("." + secrets.token_urlsafe(24))
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, flags, mode)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            os.fchmod(handle.fileno(), 0o600)
-            json.dump(value, handle, sort_keys=True)
-            handle.write("\n")
-            handle.flush(); os.fsync(handle.fileno())
-        os.replace(raw, target)
-        os.chmod(target, 0o600)
+        os.write(fd, data); os.fsync(fd)
     finally:
-        Path(raw).unlink(missing_ok=True)
+        os.close(fd)
+    try:
+        os.replace(tmp, path); os.chmod(path, mode)
+    finally:
+        try: tmp.unlink()
+        except FileNotFoundError: pass
+
+
+def _write_state(token: str, state: dict[str, Any]) -> None:
+    _state_dir(); target = _state_path(token)
+    # state root is 0700; reuse a root-owned 0755-compatible helper only after
+    # a dedicated secure atomic write implementation for the private directory.
+    tmp = STATE_ROOT / ("." + secrets.token_urlsafe(24))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        raw = (json.dumps(state, sort_keys=True) + "\n").encode(); os.write(fd, raw); os.fsync(fd)
+    finally: os.close(fd)
+    try: os.replace(tmp, target); os.chmod(target, 0o600)
+    finally:
+        try: tmp.unlink()
+        except FileNotFoundError: pass
 
 
 def _read_state(token: str) -> dict[str, Any]:
-    path = _state_path(token)
-    try:
-        details = path.stat()
-        if details.st_uid != 0 or details.st_gid != 0 or stat.S_IMODE(details.st_mode) != 0o600:
-            raise BrokerError("transaction state is not root-private")
-        return json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise BrokerError("unknown transaction") from exc
+    _state_dir(); path = _state_path(token)
+    try: info = path.lstat()
+    except FileNotFoundError as exc: raise BrokerError("unknown transaction", "unknown_transaction") from exc
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o600:
+        raise BrokerError("transaction state is not root-private", "unsafe_filesystem")
+    try: return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc: raise BrokerError("invalid transaction state", "invalid_state") from exc
+
+
+def _caller() -> dict[str, str]:
+    uid, user = os.environ.get("SUDO_UID"), os.environ.get("SUDO_USER")
+    if uid is None and user is None:
+        if os.geteuid() != 0: raise BrokerError("broker must run as root", "not_root")
+        return {"uid": "root", "user": "root", "direct_root": "true"}
+    if uid is None or user is None or not uid.isdecimal() or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", user):
+        raise BrokerError("invalid sudo identity", "invalid_owner")
+    return {"uid": uid, "user": user, "direct_root": "false"}
+
+
+def _run(argv: list[str], *, check: bool = True, timeout: int = 120) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(argv, text=True, capture_output=True, check=False, timeout=timeout, env=SAFE_ENV)
+    if check and result.returncode: raise BrokerError("trusted system operation failed", "system_operation_failed")
+    return result
 
 
 def _listener_pid(port: int) -> int:
-    output = _run(["ss", "-H", "-tlnp"], timeout=15).stdout
     matches: set[int] = set()
-    for line in output.splitlines():
+    for line in _run([SS, "-H", "-tlnp"], timeout=15).stdout.splitlines():
         fields = line.split()
-        if len(fields) < 5 or not (fields[3].endswith(f":{port}") or fields[3].endswith(f"]:{port}")):
-            continue
-        match = re.search(r"pid=(\d+)", line)
-        if match:
-            matches.add(int(match.group(1)))
-    if len(matches) != 1:
-        raise BrokerError("Ollama listener ownership is absent or ambiguous")
+        if len(fields) >= 5 and (fields[3].endswith(f":{port}") or fields[3].endswith(f"]:{port}")):
+            match = re.search(r"pid=(\d+)", line)
+            if match: matches.add(int(match.group(1)))
+    if len(matches) != 1: raise BrokerError("Ollama listener ownership is absent or ambiguous", "listener_ambiguous")
     return matches.pop()
 
 
 def _unit_for_listener(port: int) -> tuple[str, int]:
     pid = _listener_pid(port)
-    comm = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8", errors="replace").strip().lower()
-    cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace").lower()
-    if "ollama" not in comm and "ollama" not in cmdline:
-        raise BrokerError("listener process is not Ollama")
-    units = _run(["systemctl", "list-units", "--type=service", "--all", "--no-legend", "--plain"], timeout=15).stdout
-    candidates: list[str] = []
-    for line in units.splitlines():
+    try:
+        comm = Path(f"/proc/{pid}/comm").read_text(errors="replace").lower()
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().lower()
+    except OSError as exc: raise BrokerError("cannot inspect listener identity", "listener_identity") from exc
+    if b"ollama" not in cmdline and "ollama" not in comm: raise BrokerError("listener process is not Ollama", "not_ollama")
+    candidates = []
+    for line in _run([SYSTEMCTL, "list-units", "--type=service", "--all", "--no-legend", "--plain"], timeout=15).stdout.splitlines():
         unit = line.strip().lstrip("●").strip().split(maxsplit=1)[0] if line.strip() else ""
-        if not UNIT_RE.fullmatch(unit) or "ollama" not in unit.lower():
-            continue
-        main = _run(["systemctl", "show", unit, "--property=MainPID", "--value"], timeout=15).stdout.strip()
-        if main.isdigit() and int(main) == pid:
-            candidates.append(unit)
-    if len(candidates) != 1:
-        raise BrokerError("Ollama systemd ownership is absent or ambiguous")
+        if UNIT_RE.fullmatch(unit) and "ollama" in unit.lower():
+            main = _run([SYSTEMCTL, "show", unit, "--property=MainPID", "--value"], timeout=15).stdout.strip()
+            if main.isdecimal() and int(main) == pid: candidates.append(unit)
+    if len(candidates) != 1: raise BrokerError("Ollama systemd ownership is absent or ambiguous", "service_ambiguous")
     return candidates[0], pid
 
 
+def _revalidate(state: dict[str, Any]) -> tuple[str, int]:
+    unit, pid = _unit_for_listener(int(state["port"]))
+    if unit != state["unit"]: raise BrokerError("Ollama service ownership changed", "stale_service")
+    return unit, pid
+
+
 def _dropin(unit: str) -> Path:
-    if not UNIT_RE.fullmatch(unit):
-        raise BrokerError("invalid managed service")
-    return Path("/etc/systemd/system") / f"{unit}.d" / MANAGED_NAME
+    if not UNIT_RE.fullmatch(unit): raise BrokerError("invalid managed service", "invalid_state")
+    return SYSTEMD_ROOT / f"{unit}.d" / MANAGED_NAME
 
 
-def _safe_existing(path: Path) -> bytes | None:
-    try:
-        details = path.lstat()
-    except FileNotFoundError:
-        return None
-    if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
-        raise BrokerError("managed drop-in collision is not a regular file")
-    content = path.read_bytes()
-    if MARKER.encode() not in content:
-        raise BrokerError("refusing unmanaged managed-drop-in collision")
-    return content
+def _service_dir(unit: str, *, create: bool = False) -> Path:
+    _check_dir(SYSTEMD_ROOT, 0o755)
+    path = _dropin(unit).parent
+    if create and not path.exists(): path.mkdir(mode=0o755)
+    _check_dir(path, 0o755)
+    return path
 
 
-def _atomic_dropin(path: Path, content: bytes | None) -> None:
-    path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-    if path.parent.is_symlink() or not path.parent.is_dir():
-        raise BrokerError("managed drop-in directory is unsafe")
-    _safe_existing(path)
-    if content is None:
-        path.unlink(missing_ok=True)
-        return
-    fd, raw = tempfile.mkstemp(prefix=".llmb-kv-", dir=path.parent)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            os.fchmod(handle.fileno(), 0o644)
-            handle.write(content); handle.flush(); os.fsync(handle.fileno())
-        os.replace(raw, path)
-    finally:
-        Path(raw).unlink(missing_ok=True)
+def _existing(path: Path) -> bytes | None:
+    try: info = path.lstat()
+    except FileNotFoundError: return None
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o644:
+        raise BrokerError("managed drop-in collision is unsafe", "unsafe_filesystem")
+    data = path.read_bytes()
+    if not data.startswith(MARKER.encode()): raise BrokerError("refusing unmanaged managed-drop-in collision", "unmanaged_collision")
+    return data
 
 
 def _content(kv: str) -> bytes:
-    if kv not in KV_VALUES:
-        raise BrokerError("KV must be exactly q4_0 or q8_0")
+    if kv not in KV_VALUES: raise BrokerError("KV must be exactly q4_0 or q8_0", "invalid_kv")
     return (MARKER + "[Service]\n" + f'Environment="OLLAMA_KV_CACHE_TYPE={kv}"\n').encode()
 
 
-def _verify(state: dict[str, Any], expected: str) -> None:
-    unit, port = state["unit"], int(state["port"])
-    _run(["systemctl", "daemon-reload"], timeout=60)
-    env = _run(["systemctl", "show", unit, "--property=Environment", "--value"], timeout=15).stdout
-    if re.search(rf"(?:^|\s)OLLAMA_KV_CACHE_TYPE={re.escape(expected)}(?:\s|$)", env) is None:
-        raise BrokerError("merged systemd environment did not contain requested KV")
-    _run(["systemctl", "restart", unit], timeout=120)
-    if _run(["systemctl", "is-active", "--quiet", unit], check=False, timeout=15).returncode != 0:
-        raise BrokerError("Ollama service did not become active")
-    observed_unit, pid = _unit_for_listener(port)
-    if observed_unit != unit:
-        raise BrokerError("restarted service does not own the original Ollama listener")
-    value = None
-    for item in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
-        if item.startswith(b"OLLAMA_KV_CACHE_TYPE="):
-            value = item.split(b"=", 1)[1].decode("utf-8", "replace").lower()
-            break
-    if value != expected:
-        raise BrokerError("live Ollama process KV verification failed")
+def _assert_hash(state: dict[str, Any]) -> None:
+    now = _existing(_dropin(state["unit"]))
+    expected = state.get("last_hash")
+    if (None if now is None else _sha(now)) != expected: raise BrokerError("managed drop-in changed outside this transaction", "external_modification")
 
 
-def _restore(state: dict[str, Any]) -> None:
-    original = base64.b64decode(state["original"]) if state["original"] is not None else None
-    _atomic_dropin(_dropin(state["unit"]), original)
-    _run(["systemctl", "daemon-reload"], timeout=60)
-    _run(["systemctl", "restart", state["unit"]], timeout=120)
+def _apply_file(state: dict[str, Any], data: bytes | None) -> None:
+    path = _dropin(state["unit"]); _service_dir(state["unit"], create=data is not None); _assert_hash(state)
+    if data is None:
+        try: path.unlink()
+        except FileNotFoundError: pass
+    else:
+        _write_bytes_atomic(path, data, 0o644)
+    state["last_hash"] = None if data is None else _sha(data)
 
 
-def begin(port: int) -> dict[str, Any]:
-    _state_dir()
-    unit, _ = _unit_for_listener(port)
-    # State is the durable root-controlled lock: an interrupted client leaves
-    # recovery state in place, and a second transaction must restore/recover it
-    # rather than overwrite its snapshot.
-    for candidate in STATE_ROOT.glob("*.json"):
-        try:
-            if json.loads(candidate.read_text(encoding="utf-8")).get("unit") == unit:
-                raise BrokerError("another KV repair transaction is active")
-        except json.JSONDecodeError:
-            raise BrokerError("invalid existing KV repair state; recover it as root")
-    current = _safe_existing(_dropin(unit))
+def _observed(state: dict[str, Any], pid: int | None = None) -> tuple[str | None, str | None]:
+    unit = state["unit"]
+    env = _run([SYSTEMCTL, "show", unit, "--property=Environment", "--value"], timeout=15).stdout
+    match = re.search(r"(?:^|\s)OLLAMA_KV_CACHE_TYPE=([^\s\"']+)", env)
+    merged = match.group(1).lower() if match else None
+    if pid is None: _, pid = _revalidate(state)
+    live = None
+    for entry in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
+        if entry.startswith(b"OLLAMA_KV_CACHE_TYPE="):
+            live = entry.split(b"=", 1)[1].decode("utf-8", "replace").lower(); break
+    return merged, live
+
+
+def _restart_verify(state: dict[str, Any], expected: str) -> str:
+    _run([SYSTEMCTL, "daemon-reload"], timeout=60)
+    merged, _ = _observed(state)
+    if merged != expected: raise BrokerError("merged systemd environment did not contain requested KV", "merged_verification_failed")
+    _run([SYSTEMCTL, "restart", state["unit"]], timeout=120)
+    if _run([SYSTEMCTL, "is-active", "--quiet", state["unit"]], check=False, timeout=15).returncode != 0:
+        raise BrokerError("Ollama service did not become active", "service_inactive")
+    _, pid = _revalidate(state); _, live = _observed(state, pid)
+    if live != expected: raise BrokerError("live Ollama process KV verification failed", "live_verification_failed")
+    return live
+
+
+def _owner(state: dict[str, Any]) -> None:
+    if state.get("owner") != _caller(): raise BrokerError("transaction belongs to another sudo identity", "owner_mismatch")
+
+
+def _lock_path(unit: str) -> Path: return STATE_ROOT / ("service-" + _sha(unit.encode()) + ".lock")
+
+
+def _begin(port: int) -> dict[str, Any]:
+    _state_dir(); unit, pid = _unit_for_listener(port); lock = _lock_path(unit)
+    try: fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except FileExistsError as exc: raise BrokerError("another KV repair transaction requires recovery", "transaction_locked") from exc
     token = secrets.token_urlsafe(32)
-    state = {"protocol": PROTOCOL_VERSION, "token": token, "port": port, "unit": unit,
-             "original": base64.b64encode(current).decode() if current is not None else None,
-             "current_kv": None}
-    _write_state(token, state)
-    return {"protocol": PROTOCOL_VERSION, "transaction": token, "unit": unit}
+    try:
+        os.write(fd, token.encode()); os.fsync(fd)
+    finally: os.close(fd)
+    try:
+        original = _existing(_dropin(unit))
+        state = {"protocol": PROTOCOL_VERSION, "token": token, "port": port, "unit": unit, "listener_pid": pid,
+                 "owner": _caller(), "state": "active", "original": None if original is None else base64.b64encode(original).decode(),
+                 "original_hash": None if original is None else _sha(original), "last_hash": None if original is None else _sha(original), "current_kv": None}
+        _write_state(token, state)
+    except BaseException:
+        lock.unlink(missing_ok=True); raise
+    return _reply("begin", state, transaction=token)
+
+
+def _rollback(token: str, state: dict[str, Any]) -> None:
+    state["state"] = "restoring"; _write_state(token, state)
+    try:
+        original = None if state["original"] is None else base64.b64decode(state["original"])
+        _apply_file(state, original); _run([SYSTEMCTL, "daemon-reload"], timeout=60); _run([SYSTEMCTL, "restart", state["unit"]], timeout=120)
+        _revalidate(state); state["state"] = "restored"; _write_state(token, state)
+    except BaseException:
+        state["state"] = "rollback_failed"; _write_state(token, state); raise BrokerError("operation failed and rollback failed", "rollback_failed")
+
+
+def _set(token: str, kv: str) -> dict[str, Any]:
+    state = _read_state(token); _owner(state); _revalidate(state); _assert_hash(state)
+    state["state"] = "applying"; _write_state(token, state)
+    try:
+        _apply_file(state, _content(kv)); observed = _restart_verify(state, kv)
+    except BaseException:
+        state["state"] = "failed"; _write_state(token, state); _rollback(token, state); raise
+    state.update({"state": "applied", "current_kv": kv}); _write_state(token, state)
+    return _reply("set", state, transaction=token, verified=True, observed_kv=observed)
+
+
+def _restore(token: str) -> dict[str, Any]:
+    state = _read_state(token); _owner(state); _revalidate(state); _assert_hash(state); _rollback(token, state)
+    if state["state"] != "restored": raise BrokerError("restore did not complete", "rollback_failed")
+    _state_path(token).unlink(); _lock_path(state["unit"]).unlink(missing_ok=True)
+    return _reply("restore", state, transaction=token, restored=True)
+
+
+def _status(token: str) -> dict[str, Any]:
+    state = _read_state(token); _owner(state); _, pid = _revalidate(state); _assert_hash(state)
+    merged, live = _observed(state, pid)
+    return _reply("status", state, transaction=token, observed_kv=live, merged_kv=merged)
+
+
+def _reply(operation: str, state: dict[str, Any] | None = None, **extra: Any) -> dict[str, Any]:
+    result = {"protocol": PROTOCOL_VERSION, "ok": True, "operation": operation, "transaction": None, "state": None, "unit": None, "kv": None, "observed_kv": None, "error_code": None, "message": ""}
+    if state: result.update({"state": state.get("state"), "unit": state.get("unit"), "kv": state.get("current_kv")})
+    result.update(extra); return result
 
 
 def dispatch(args: argparse.Namespace) -> dict[str, Any]:
-    if args.command == "version": return {"protocol": PROTOCOL_VERSION}
+    if args.command == "version": return _reply("version")
     if args.command == "probe":
-        unit, _ = _unit_for_listener(args.port); return {"protocol": PROTOCOL_VERSION, "unit": unit}
-    if args.command == "begin": return begin(args.port)
-    state = _read_state(args.transaction)
-    if args.command == "status":
-        return {"protocol": PROTOCOL_VERSION, "unit": state["unit"], "kv": state.get("current_kv")}
-    if args.command == "set":
-        if args.kv not in KV_VALUES: raise BrokerError("KV must be exactly q4_0 or q8_0")
-        try:
-            _atomic_dropin(_dropin(state["unit"]), _content(args.kv)); _verify(state, args.kv)
-        except BaseException:
-            _restore(state); raise
-        state["current_kv"] = args.kv; _write_state(args.transaction, state)
-        return {"protocol": PROTOCOL_VERSION, "unit": state["unit"], "kv": args.kv, "verified": True}
-    if args.command == "restore":
-        _restore(state); _state_path(args.transaction).unlink(missing_ok=True)
-        return {"protocol": PROTOCOL_VERSION, "unit": state["unit"], "restored": True}
-    raise BrokerError("unknown operation")
+        unit, _ = _unit_for_listener(args.port); return _reply("probe", {"unit": unit})
+    if args.command == "begin": return _begin(args.port)
+    if args.command == "set": return _set(args.transaction, args.kv)
+    if args.command == "status": return _status(args.transaction)
+    if args.command == "restore": return _restore(args.transaction)
+    raise BrokerError("unknown operation", "invalid_operation")
 
 
 def parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(); sub = p.add_subparsers(dest="command", required=True)
+    p = argparse.ArgumentParser(description=__doc__); sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("version")
     for name in ("probe", "begin"):
-        c = sub.add_parser(name); c.add_argument("--port", required=True, type=_port)
+        q = sub.add_parser(name); q.add_argument("--port", required=True, type=_port)
+    q = sub.add_parser("set"); q.add_argument("--transaction", required=True); q.add_argument("--kv", required=True, choices=sorted(KV_VALUES))
     for name in ("status", "restore"):
-        c = sub.add_parser(name); c.add_argument("--transaction", required=True)
-    c = sub.add_parser("set"); c.add_argument("--transaction", required=True); c.add_argument("--kv", required=True)
+        q = sub.add_parser(name); q.add_argument("--transaction", required=True)
     return p
 
 
 def main() -> int:
-    try:
-        print(json.dumps(dispatch(parser().parse_args()), sort_keys=True)); return 0
-    except (BrokerError, OSError, subprocess.SubprocessError, ValueError) as exc:
-        print(json.dumps({"error": str(exc)[:1000]})); return 2
+    args = parser().parse_args()
+    try: payload = dispatch(args)
+    except (BrokerError, OSError, subprocess.SubprocessError) as exc:
+        payload = _reply(getattr(args, "command", "unknown")); payload.update({"ok": False, "error_code": getattr(exc, "code", "operation_failed"), "message": str(exc)})
+        print(json.dumps(payload, sort_keys=True)); return 1
+    print(json.dumps(payload, sort_keys=True)); return 0
 
 
 if __name__ == "__main__": raise SystemExit(main())

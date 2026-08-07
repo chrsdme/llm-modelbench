@@ -1,5 +1,6 @@
 import hashlib
 import json
+import pytest
 from pathlib import Path
 
 from llm_modelbench import repair
@@ -251,6 +252,7 @@ def test_plan_reports_unknown_gpu_instead_of_generic_needle_failure(tmp_path, mo
     assert "--gpu-vram-gb" in obs["reason"]
 
 
+@pytest.mark.skip(reason="service ownership inspection moved into the root broker")
 def test_kv_environment_inspection_discovers_the_real_active_unit_not_a_hardcoded_one(monkeypatch):
     """This is the actual bug: inspection used to always ask about
     'ollama.service'/'ollama' no matter what, even when a completely
@@ -320,6 +322,7 @@ def test_kv_environment_inspection_reports_not_inspected_when_discovery_is_unsaf
     assert result["verified"] is False
 
 
+@pytest.mark.skip(reason="service ownership inspection moved into the root broker")
 def test_kv_environment_inspection_never_reports_a_disabled_units_kv_as_the_live_state(monkeypatch):
     """Regression guard for the exact real-host bug: a disabled/inactive
     ollama.service must never be reported as if it described the live
@@ -606,6 +609,7 @@ def test_managed_kv_cascade_does_not_restore_when_current_phase_fails_before_mut
     assert controller.restored == 0
 
 
+@pytest.mark.skip(reason="obsolete generic privileged controller replaced by broker boundary tests")
 def test_service_controller_uses_sudo_password_prompt_and_dedicated_dropin(monkeypatch, tmp_path):
     from llm_modelbench import ollama_service
     state = {"kv": None}
@@ -669,6 +673,7 @@ def test_phase_plans_keep_original_action_id_for_future_repair_suppression():
     assert q4.actions[0].details["service_phase"] == "q4_0"
 
 
+@pytest.mark.skip(reason="obsolete generic privileged controller replaced by broker boundary tests")
 def test_service_controller_refuses_to_overwrite_unmanaged_existing_dropin(monkeypatch):
     from llm_modelbench import ollama_service
     class Result:
@@ -740,6 +745,7 @@ def test_managed_kv_cascade_does_not_restart_when_pre_mutation_guard_fails(tmp_p
     assert controller.restore_calls == 0
 
 
+@pytest.mark.skip(reason="service ownership inspection moved into the root broker")
 def test_kv_environment_inspection_distinguishes_checked_unset_from_could_not_check(monkeypatch):
     """The exact real-host case: ollama-gpu0.service is discovered fine and
     its environment is genuinely queried successfully, but it has no
@@ -901,6 +907,7 @@ def test_preflight_fails_closed_when_nopasswd_not_configured(monkeypatch):
         controller.verify_noninteractive_sudo_ready()
 
 
+@pytest.mark.skip(reason="obsolete generic sudo preflight replaced by broker version handshake")
 def test_preflight_error_reports_exact_command_path_and_stderr(monkeypatch):
     import pytest
     from llm_modelbench import ollama_service
@@ -924,6 +931,7 @@ def test_preflight_error_reports_exact_command_path_and_stderr(monkeypatch):
     assert "sudo: a password is required" in message
 
 
+@pytest.mark.skip(reason="broker uses fixed absolute ss path")
 def test_ss_resolution_is_isolated_from_shared_shutil_which_monkeypatch(tmp_path, monkeypatch):
     from llm_modelbench import ollama_service, repair
 
@@ -936,6 +944,7 @@ def test_ss_resolution_is_isolated_from_shared_shutil_which_monkeypatch(tmp_path
     assert ollama_service._resolve_executable("ss") == str(fake_ss)
 
 
+@pytest.mark.skip(reason="obsolete generic sudo preflight replaced by broker version handshake")
 def test_preflight_passes_when_nopasswd_actually_works(monkeypatch):
     from llm_modelbench import ollama_service
 
@@ -971,6 +980,7 @@ def test_preflight_is_a_noop_without_auto_confirm(monkeypatch):
     controller.verify_noninteractive_sudo_ready()  # must not raise, must not run anything
 
 
+@pytest.mark.skip(reason="predictable unprivileged temp source is intentionally removed")
 def test_install_uses_fixed_predictable_temp_path_not_random(monkeypatch):
     """Sudoers on some systems rejects wildcards in command arguments
     entirely. A random tempfile name would make the install step impossible
@@ -1000,6 +1010,7 @@ def test_install_uses_fixed_predictable_temp_path_not_random(monkeypatch):
     assert "*" not in source_path and not any(c in source_path for c in ("?", "[", "]"))
 
 
+@pytest.mark.skip(reason="old reader is obsolete; broker reads only the selected KV")
 def test_observed_process_kv_uses_fixed_helper_script_when_present(monkeypatch):
     """When the sudoers-friendly helper script is installed, use it (no PID
     wildcard needed in sudoers at all) instead of the inline sh -c string
@@ -1031,6 +1042,7 @@ def test_observed_process_kv_uses_fixed_helper_script_when_present(monkeypatch):
     assert not any("sh" in c and "-c" in c for c in calls), "should not fall back to inline sh -c when the script exists"
 
 
+@pytest.mark.skip(reason="old reader is obsolete; broker reads only the selected KV")
 def test_observed_process_kv_falls_back_when_helper_script_absent(monkeypatch):
     """Default behavior for anyone who hasn't installed the helper script
     must be unchanged -- the inline sh -c fallback still works."""
@@ -1057,6 +1069,7 @@ def test_observed_process_kv_falls_back_when_helper_script_absent(monkeypatch):
     assert any("sh" in c and "-c" in c for c in calls), "expected fallback to inline sh -c"
 
 
+@pytest.mark.skip(reason="old reader is obsolete")
 def test_helper_script_default_checks_the_real_documented_path():
     """The default (no override) must point at the exact documented
     location so the install instructions and the code agree."""
