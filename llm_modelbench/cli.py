@@ -229,24 +229,35 @@ def cmd_inventory(args, cfg):
         print("No models found (is Ollama running?). Try: llm-modelbench inventory --mock")
         return
     from .capabilities import interrogate_model
+    from .placement import model_placement_fit, topology_for_config
+    topology = topology_for_config(cfg)
     items = []
     for model_row in rows:
         name = model_row.get("name", "")
         profile = interrogate_model(client, name, functional=bool(getattr(args, "auto", False)))
         families = profile.get("supported_families") or []
+        fit = model_placement_fit(model_row, cfg)
         items.append({"name": name,
                       "class": classify_model(name, profile.get("declared_capabilities"), families),
                       "size_gb": size_gb(model_row), "families": families,
                       "declared_capabilities": profile.get("declared_capabilities") or [],
                       "capability_warnings": profile.get("warnings") or [],
-                      "will_offload": size_gb(model_row) > cfg.vram_budget_gb})
+                      "fit_classification": fit.classification,
+                      "selected_gpu_uuids": list(fit.selected_gpu_uuids),
+                      "will_offload": fit.classification == "confirmed_no_fit"})
     items.sort(key=lambda x: (x["class"], -x["size_gb"]))
     if args.json:
         print(json.dumps(items, indent=2)); return
-    print(f"VRAM budget: {cfg.vram_budget_gb}GB\n")
+    for device in topology.devices:
+        now = device.effective_now_bytes
+        print(f"GPU {device.uuid} safe/effective: {round(now / 1024**3, 3) if now is not None else 'unknown'} GiB")
+    print(f"max single-GPU: {round(topology.max_single_effective_bytes / 1024**3, 3) if topology.max_single_effective_bytes is not None else 'unknown'} GiB")
+    print(f"aggregate: {round(topology.aggregate_effective_bytes / 1024**3, 3) if topology.aggregate_effective_bytes is not None else 'unknown'} GiB")
+    if topology.aggregate_policy_cap_bytes is not None:
+        print(f"policy ceiling: {round(topology.aggregate_policy_cap_bytes / 1024**3, 3)} GiB")
+    print()
     for it in items:
-        flag = "OFFLOAD" if it["will_offload"] else "fits"
-        print(f"{it['class']:<11} {it['size_gb']:>6}GB  {flag:<8} {it['name']}")
+        print(f"{it['class']:<11} {it['size_gb']:>6}GB  {it['fit_classification']:<28} {it['name']}")
 
 
 def cmd_runtime_fit(args, cfg):

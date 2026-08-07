@@ -30,6 +30,7 @@ from .filters import (
 from .classify import classify_model, size_gb
 from .config import Config
 from .hardware import Telemetry, ProbeTelemetry, detect_gpu, nvidia_live, host_memory_snapshot
+from .placement import model_placement_fit
 from .backend import BackendCapability, InferenceClient, supports_capability
 from .tasks import Task, tasks_for, make_needle_prompt, TASKS
 from .inline_ui import InlineUI
@@ -371,10 +372,24 @@ def _needle_kv_estimate(
                 "dynamic offload changed between successful probes; metadata estimate retained for reference only"
             )
 
-    if out.get("estimated_total_gb") is None or budget_gb <= 0:
-        out["kv_exceeds_budget"] = None
+    # The long-context gate shares runner/planner topology logic.  The legacy
+    # scalar remains in the evidence for backward-compatible reports only.
+    from .placement import model_placement_fit, topology_for_config
+    row = {"size": model_size} if model_size is not None else {"size": None}
+    fit = model_placement_fit(row, cfg)
+    if metadata_bpt:
+        from .topology_budget import evaluate_workload_fit
+        fit = evaluate_workload_fit(topology_for_config(cfg), weight_bytes=model_size,
+                                    kv_cache_bytes=int(metadata_bpt * int(wanted_ctx)))
+    out["topology_fit_classification"] = fit.classification
+    out["topology_fit_selected_gpu_uuids"] = list(fit.selected_gpu_uuids)
+    if fit.classification == "unknown" and budget_gb > 0 and not topology_for_config(cfg).devices:
+        # Preserve the old single-GPU/manual-cap behavior where physical
+        # inventory is unavailable; never use this scalar fallback on a
+        # topology-bearing multi-GPU host.
+        out["kv_exceeds_budget"] = bool(out.get("estimated_total_gb") and float(out["estimated_total_gb"]) > budget_gb)
     else:
-        out["kv_exceeds_budget"] = bool(float(out["estimated_total_gb"]) > budget_gb)
+        out["kv_exceeds_budget"] = fit.classification == "confirmed_no_fit"
     return out
 
 def _needle_environment_skip(kv: Dict[str, Any], wanted_ctx: int, safe_floor: int = 32768) -> Optional[Dict[str, Any]]:
@@ -1386,8 +1401,10 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
                                                    runtime_profile=runtime_profile)
     if skip_offload:
         before = list(models)
-        models = [m for m in models if size_gb(models_rows[m]) <= cfg.vram_budget_gb]
-        skipped_models.extend({"model": m, "reason": "size_exceeds_vram_budget"} for m in before if m not in models)
+        fits = {m: model_placement_fit(models_rows[m], cfg) for m in before}
+        models = [m for m in models if fits[m].classification != "confirmed_no_fit"]
+        skipped_models.extend({"model": m, "reason": "topology_confirmed_no_fit", "fit_classification": fits[m].classification}
+                              for m in before if m not in models)
 
     models, context_skips = filter_models(
         models,

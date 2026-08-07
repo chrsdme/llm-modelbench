@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.0rc21.post1
+
+### Topology-aware VRAM correctness hotfix
+
+- Replace the legacy first-GPU auto-budget path with UUID-keyed per-device,
+  aggregate, policy-ceiling, and live-free topology budgeting.
+- Make runner, planner, inventory reporting, and long-context preflight share
+  conservative single-GPU-first placement labels; layer splitting is conditional
+  and CPU/RAM spill remains last resort.
+- Preserve `vram_budget_gb` as a backward-compatible operator cap, never as an
+  inferred multi-GPU hardware total, and add configuration for per-GPU and
+  aggregate policy ceilings.
+
 ## 1.0.0rc21
 
 ### RC21 runtime multi-GPU closeout

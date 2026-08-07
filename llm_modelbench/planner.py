@@ -18,6 +18,7 @@ from .runner import _samples_for_task
 from .tasks import TASKS, tasks_for
 from .progress import seconds_hms
 from .backend import InferenceClient
+from .placement import model_placement_fit
 
 
 def _rough_seconds(samples_total: int, models_total: int) -> int:
@@ -74,8 +75,10 @@ def build_plan(
         skipped.extend({"model": m, "reason": "exclude_regex_match"} for m in before if m not in models)
     if skip_offload:
         before = list(models)
-        models = [m for m in models if size_gb(models_rows[m]) <= cfg.vram_budget_gb]
-        skipped.extend({"model": m, "reason": "size_exceeds_vram_budget"} for m in before if m not in models)
+        fits = {m: model_placement_fit(models_rows[m], cfg) for m in before}
+        models = [m for m in models if fits[m].classification != "confirmed_no_fit"]
+        skipped.extend({"model": m, "reason": "topology_confirmed_no_fit", "fit_classification": fits[m].classification}
+                       for m in before if m not in models)
 
     models, context_skips = filter_models(
         models,

@@ -16,7 +16,8 @@ from typing import Any, Dict, Optional
 
 from urllib.parse import urlparse
 
-from .hardware import detect_gpu, suggested_vram_budget_gb
+from .hardware import detect_gpu, detect_gpus, suggested_vram_budget_gb  # noqa: F401 - legacy patch seams retained
+from .topology_budget import topology_from_inventory
 
 # Category weights feed the single composite quality score. They renormalise over whatever
 # categories actually ran, so partial suites still produce a fair number. Tune to taste.
@@ -71,12 +72,29 @@ def _validate_ollama_url(value: Any) -> str:
     return url.rstrip("/")
 
 
+def _validated_mib_mapping(value: Any) -> Dict[str, float]:
+    if not isinstance(value, Mapping):
+        raise SystemExit("gpu_policy_ceilings_mib must map physical GPU UUIDs to non-negative MiB values")
+    result: Dict[str, float] = {}
+    for uuid, raw in value.items():
+        try:
+            amount = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise SystemExit("gpu_policy_ceilings_mib values must be numeric") from exc
+        if not str(uuid).strip() or not math.isfinite(amount) or amount < 0:
+            raise SystemExit("gpu_policy_ceilings_mib values must be finite and non-negative")
+        result[str(uuid).strip()] = amount
+    return result
+
+
 @dataclass
 class Config:
     ollama_url: str = "http://127.0.0.1:11434"
     seed: int = 42
     temperature: float = 0.0
     vram_budget_gb: float = 0.0            # 0 = auto-detect
+    gpu_policy_ceilings_mib: Dict[str, float] = field(default_factory=dict)
+    aggregate_policy_ceiling_mib: Optional[float] = None
     judge_model: str = "qwen2.5:14b"
     embed_model: str = "nomic-embed-text"
     samples: int = 1                       # runs per test; median taken where applicable
@@ -123,6 +141,8 @@ class Config:
         for key, value in data.items():
             if key == "weights":
                 cfg.weights = _validated_weights(value)
+            elif key == "gpu_policy_ceilings_mib":
+                cfg.gpu_policy_ceilings_mib = _validated_mib_mapping(value)
             else:
                 setattr(cfg, key, value)
         env_map = {
@@ -147,9 +167,17 @@ class Config:
             raise SystemExit("think must be one of: auto, on, off")
         cfg.ollama_url = _validate_ollama_url(cfg.ollama_url)
         cfg.weights = _validated_weights(cfg.weights)
-        # auto VRAM budget
+        cfg.gpu_policy_ceilings_mib = _validated_mib_mapping(cfg.gpu_policy_ceilings_mib)
+        if cfg.aggregate_policy_ceiling_mib is not None and (not isinstance(cfg.aggregate_policy_ceiling_mib, (int, float)) or isinstance(cfg.aggregate_policy_ceiling_mib, bool) or not math.isfinite(float(cfg.aggregate_policy_ceiling_mib)) or cfg.aggregate_policy_ceiling_mib < 0):
+            raise SystemExit("aggregate_policy_ceiling_mib must be finite and non-negative")
+        # Compatibility scalar: an auto value is the best single physical GPU,
+        # never an invented aggregate.  Explicit vram_budget_gb remains a
+        # manual per-selected-GPU cap, not a claim about total host capacity.
         if not cfg.vram_budget_gb:
-            cfg.vram_budget_gb = suggested_vram_budget_gb(detect_gpu())
+            topology = topology_from_inventory(detect_gpus(), policy_ceilings_mib=cfg.gpu_policy_ceilings_mib,
+                                               aggregate_policy_cap_mib=cfg.aggregate_policy_ceiling_mib)
+            maximum = topology.max_single_effective_bytes
+            cfg.vram_budget_gb = round(maximum / (1024 ** 3), 3) if maximum is not None else 12.0
         return cfg
 
     def to_dict(self) -> dict:

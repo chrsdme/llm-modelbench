@@ -22,6 +22,10 @@ _HEALTH = {"healthy", "unhealthy", "unreachable", "unsupported", "unknown"}
 # than a few KiB, but discovery must not read an unbounded response.
 MAX_HEALTH_RESPONSE_BYTES = 4 * 1024 * 1024
 
+# Names only: this patch intentionally does not create services or profile-store
+# entries. Operators bind these to physical UUIDs and endpoints explicitly.
+TOPOLOGY_PROFILE_NAMES = ("ollama-gpu0", "ollama-gpu1", "ollama-dual", "llama_cpp-single-gpu", "llama_cpp-dual-gpu")
+
 
 class RuntimeProfileError(RuntimeError):
     pass
