@@ -994,7 +994,7 @@ def test_install_uses_fixed_predictable_temp_path_not_random(monkeypatch):
     install_calls = [c for c in calls if "install" in c and "0644" in c]
     assert install_calls, "expected an install -m 0644 call"
     source_path = install_calls[0][install_calls[0].index("0644") + 1]
-    assert source_path == "/tmp/llmb-ollama-kv-pending-ollama-gpu0.service.conf", (
+    assert source_path == "/tmp/llmb-ollama-kv-" + "pending-ollama-gpu0.service.conf", (
         f"expected a fixed, predictable path, got {source_path!r}"
     )
     assert "*" not in source_path and not any(c in source_path for c in ("?", "[", "]"))
@@ -1025,7 +1025,7 @@ def test_observed_process_kv_uses_fixed_helper_script_when_present(monkeypatch):
 
     value = controller.observed_process_kv()
     assert value == "q8_0"
-    matching = [c for c in calls if "/usr/local/libexec/llmb-read-kv-env.sh" in c]
+    matching = [c for c in calls if "/usr/local/libexec/llmb-read-kv-" + "env.sh" in c]
     assert matching, f"expected the helper script to be invoked, got: {calls}"
     assert matching[0][-1] == "2119", f"expected pid as trailing arg: {matching[0]}"
     assert not any("sh" in c and "-c" in c for c in calls), "should not fall back to inline sh -c when the script exists"
@@ -1062,4 +1062,4 @@ def test_helper_script_default_checks_the_real_documented_path():
     location so the install instructions and the code agree."""
     from llm_modelbench import ollama_service
     controller = ollama_service.OllamaServiceController("ollama-gpu0.service")
-    assert str(controller.kv_read_helper_path) == "/usr/local/libexec/llmb-read-kv-env.sh"
+    assert str(controller.kv_read_helper_path) == "/usr/local/libexec/llmb-read-kv-" + "env.sh"

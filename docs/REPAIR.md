@@ -103,7 +103,11 @@ llmb repair \
   --restart-ollama
 ```
 
-The command performs this sequence:
+The command performs this sequence. Service discovery, drop-in construction,
+systemd mutation, and live KV verification are performed only by the installed
+root-owned broker; the Python client passes only a port, transaction token, and
+the q8/q4 KV enum. The broker retains root-private recovery state until final
+restore succeeds.
 
 1. require the operator to type `DISCOVER`, authenticate through normal `sudo`, identify the PID listening on the configured Ollama port, and match that PID to a systemd unit `MainPID`;
 2. reject a manually supplied `--ollama-service` when it does not own the live endpoint;

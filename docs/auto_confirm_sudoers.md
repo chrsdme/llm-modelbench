@@ -1,80 +1,44 @@
 # Unattended repair sudo policy
 
-`--auto-confirm` is an explicit local unattended mode for a supervised KV-cache repair. It does not read or store a password. It invalidates cached sudo credentials and uses `sudo -n`, so a missing or mismatched rule fails instead of prompting.
+`--auto-confirm` is optional. It uses one root-owned broker rather than a
+collection of generic privileged commands. The broker accepts only its version,
+port, transaction token, and the `q8_0`/`q4_0` KV enum; it does not accept
+paths, units, systemd fragments, environment values, or shell commands.
 
-This feature is optional. Prefer normal interactive confirmation unless unattended recovery is genuinely required.
-
-## 1. Resolve local values
-
-Determine these values on the target host:
-
-```bash
-command -v sudo ss systemctl install test cat rm
-systemctl list-units --type=service | grep -i ollama
-id -un
-```
-
-Use placeholders below as follows:
-
-- `<username>`: the dedicated local account running LLM ModelBench
-- `<ss-path>`: the exact path returned by `command -v ss`
-- `<ollama-service>`: the verified systemd unit that owns the configured Ollama port
-
-Do not add wildcard service names or wildcard filesystem paths.
-
-## 2. Install the narrow environment reader
-
-From the repository root:
+## One-time installation
 
 ```bash
-sudo install -d -m 0755 /usr/local/libexec
-sudo install -o root -g root -m 0755 scripts/libexec/llmb-read-kv-env.sh \
-  /usr/local/libexec/llmb-read-kv-env.sh
+sudo install -d -o root -g root -m 0755 /usr/local/libexec
+sudo install -o root -g root -m 0755 scripts/libexec/llmb-ollama-kv-control \
+  /usr/local/libexec/llmb-ollama-kv-control
+sudo stat -c '%U:%G %a %n' /usr/local/libexec/llmb-ollama-kv-control
 ```
 
-The helper accepts only a numeric PID and prints only `OLLAMA_KV_CACHE_TYPE` from that process environment.
+The expected final mode is `root:root 755`. The broker creates root-private
+transaction recovery state beneath `/var/lib/llm-modelbench/kv-repair/`.
 
-## 3. Create a host-specific sudoers file
+## Sudoers rule
 
-Open the file through `visudo`:
-
-```bash
-sudo visudo -f /etc/sudoers.d/llmb-repair
-```
-
-Generate the exact rule set for the one verified unit. The shape is:
+Use `visudo` to grant the dedicated local benchmark account only the broker:
 
 ```sudoers
-<username> ALL=(root) NOPASSWD: <ss-path> -H -tlnp
-<username> ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload
-<username> ALL=(root) NOPASSWD: /usr/bin/systemctl restart <ollama-service>
-<username> ALL=(root) NOPASSWD: /usr/bin/install -d -m 0755 /etc/systemd/system/<ollama-service>.d
-<username> ALL=(root) NOPASSWD: /usr/bin/install -m 0644 /tmp/llmb-ollama-kv-pending-<ollama-service>.conf /etc/systemd/system/<ollama-service>.d/zzzz-llmb-repair-kv.conf
-<username> ALL=(root) NOPASSWD: /usr/bin/test -e /etc/systemd/system/<ollama-service>.d/zzzz-llmb-repair-kv.conf
-<username> ALL=(root) NOPASSWD: /usr/bin/cat /etc/systemd/system/<ollama-service>.d/zzzz-llmb-repair-kv.conf
-<username> ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/systemd/system/<ollama-service>.d/zzzz-llmb-repair-kv.conf
-<username> ALL=(root) NOPASSWD: /usr/local/libexec/llmb-read-kv-env.sh
+<username> ALL=(root) NOPASSWD: /usr/local/libexec/llmb-ollama-kv-control
 ```
 
-Replace every placeholder before saving. Never paste the placeholder form into sudoers unchanged.
+Do not grant NOPASSWD access to `install`, `rm`, `cat`, `test`, `ss`,
+`systemctl`, or a general shell. Sudoers authorizes the executable; the
+root-owned broker validates its semantic protocol and independently identifies
+the Ollama listener and owning systemd unit.
 
-## 4. Validate without cached credentials
+## Behaviour and removal
 
-```bash
-sudo visudo -cf /etc/sudoers.d/llmb-repair
-sudo -k
-sudo -n "$(command -v ss)" -H -tlnp >/dev/null
-```
+Interactive repair still uses normal sudo authentication and typed phase
+confirmation. Auto-confirm uses only `sudo -n`; a missing rule fails
+immediately and never falls back to an interactive password prompt. A
+transaction retains its original managed drop-in bytes until `restore`
+succeeds, enabling recovery after an interrupted client process.
 
-The final command must complete without a password prompt.
-
-## 5. Apply deliberately
-
-A previous unresolved repair is not repeated automatically. Use `--force` only after reviewing the plan:
-
-```bash
-./llmb repair --run-id RUN_ID --runs-dir runs --apply --force \
-  --kv-cascade --restart-ollama --ollama-service auto --auto-confirm
-```
-
-`--auto-confirm` implies the normal compute `--yes` gate. It does not imply `--force`.
+To remove unattended capability, remove the sudoers entry with `visudo`, then
+remove `/usr/local/libexec/llmb-ollama-kv-control` after restoring any active
+transaction. Normal benchmarking and supervised repair planning do not need
+this broker.

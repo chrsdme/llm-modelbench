@@ -1013,7 +1013,7 @@ def cmd_repair(args, cfg):
     rankings_dir = _ranking_dir_for(args, run_id=f"repair_{plan.plan_id}")
     ranking_scope = "separate" if getattr(args, "separate_ranking", False) else "canonical"
     if args.kv_cascade:
-        from .ollama_service import OllamaServiceController
+        from .ollama_service import BrokerOllamaServiceController
         service_audit_path = Path(args.runs_dir or "runs") / f"repair_service_{plan.plan_id}.jsonl"
         controller_holder = {"controller": None}
 
@@ -1042,13 +1042,13 @@ def cmd_repair(args, cfg):
                     "Entering unattended quantized-KV fallback. Privileged commands use "
                     "'sudo -n' only; running the scoped NOPASSWD preflight now."
                 )
-                preflight = OllamaServiceController(
+                preflight = BrokerOllamaServiceController(
                     "ollama.service", port=port, auto_confirm=True,
                 )
                 preflight.verify_noninteractive_sudo_ready()
                 print("Preflight passed: passwordless sudo is ready for the fallback phases.\n")
             if args.ollama_service == "auto":
-                discovery_guard = OllamaServiceController(
+                discovery_guard = BrokerOllamaServiceController(
                     "ollama.service", port=port,
                     force_password_prompt=force_password,
                     auto_confirm=auto_confirm,
@@ -1062,7 +1062,7 @@ def cmd_repair(args, cfg):
                     keyword="DISCOVER",
                 )
                 discovery_guard.authorise_sudo()
-                controller = OllamaServiceController.for_active_service(
+                controller = BrokerOllamaServiceController.for_active_service(
                     port=port, force_password_prompt=force_password,
                     auto_confirm=auto_confirm, event_callback=record_service_event,
                     warn_fn=lambda message: record_service_event({
@@ -1070,7 +1070,7 @@ def cmd_repair(args, cfg):
                     }),
                 )
             else:
-                controller = OllamaServiceController(
+                controller = BrokerOllamaServiceController(
                     args.ollama_service, port=port,
                     force_password_prompt=force_password,
                     auto_confirm=auto_confirm, event_callback=record_service_event,
