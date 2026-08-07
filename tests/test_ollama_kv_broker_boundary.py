@@ -1,5 +1,7 @@
 """Static, offline regression checks for the privileged broker's closed API."""
 import json
+import importlib.machinery
+import importlib.util
 import subprocess
 from pathlib import Path
 
@@ -9,6 +11,14 @@ from llm_modelbench.ollama_service import BrokerOllamaServiceController, Service
 
 
 def source(): return Path("scripts/libexec/llmb-ollama-kv-control").read_text(encoding="utf-8")
+
+
+def broker_module():
+    loader = importlib.machinery.SourceFileLoader("llmb_kv_broker_test", "scripts/libexec/llmb-ollama-kv-control")
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
 
 
 @pytest.mark.parametrize("needle", [
@@ -71,3 +81,51 @@ def test_old_reader_and_old_generic_pending_path_are_not_tracked():
     assert "scripts/libexec/llmb-read-kv-env.sh" not in tracked
     marker = "llmb-ollama-kv-" + "pending-"
     assert not any(marker in Path(path).read_text(errors="ignore") for path in tracked if Path(path).is_file())
+
+
+def test_recover_restores_before_requiring_listener(monkeypatch):
+    broker = broker_module()
+    token = "t" * 32
+    state = {"unit": "ollama.service", "owner": {"uid": "1000", "user": "a", "direct_root": "false"}, "state": "failed", "original": None, "last_hash": None}
+    calls = []
+    monkeypatch.setattr(broker, "_read_state", lambda value: state)
+    monkeypatch.setattr(broker, "_caller", lambda: {"uid": "root", "user": "root", "direct_root": "true"})
+    monkeypatch.setattr(broker, "_lock_matches", lambda *args: calls.append("lock"))
+    monkeypatch.setattr(broker, "_recovery_target", lambda value: calls.append("target"))
+    monkeypatch.setattr(broker, "_assert_hash", lambda value: calls.append("hash"))
+    monkeypatch.setattr(broker, "_apply_file", lambda value, data: calls.append("file"))
+    monkeypatch.setattr(broker, "_run", lambda *args, **kwargs: calls.append("systemctl") or subprocess.CompletedProcess(args[0], 0, "", ""))
+    monkeypatch.setattr(broker, "_revalidate", lambda value: calls.append("listener") or ("ollama.service", 1))
+    monkeypatch.setattr(broker, "_write_state", lambda *args: None)
+    monkeypatch.setattr(broker, "_finalize", lambda *args: calls.append("finalize"))
+    assert broker._recover(token)["restored"] is True
+    assert calls.index("file") < calls.index("listener") < calls.index("finalize")
+
+
+def test_direct_root_cannot_set_another_users_transaction(monkeypatch):
+    broker = broker_module()
+    state = {"unit": "ollama.service", "owner": {"uid": "1000", "user": "a", "direct_root": "false"}}
+    monkeypatch.setattr(broker, "_read_state", lambda token: state)
+    monkeypatch.setattr(broker, "_caller", lambda: {"uid": "root", "user": "root", "direct_root": "true"})
+    with pytest.raises(broker.BrokerError, match="another sudo identity"):
+        broker._set("t" * 32, "q4_0")
+
+
+@pytest.mark.parametrize("environment", ["OLLAMA_KV_CACHE_TYPE=q4_0", '"OLLAMA_KV_CACHE_TYPE=q8_0"'])
+def test_quoted_and_unquoted_systemd_environment_are_parsed(monkeypatch, environment):
+    broker = broker_module()
+    state = {"unit": "ollama.service", "port": 1}
+    monkeypatch.setattr(broker, "_run", lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, environment, ""))
+    monkeypatch.setattr(broker.Path, "read_bytes", lambda _self: b"OLLAMA_KV_CACHE_TYPE=q8_0\0")
+    merged, live = broker._observed(state, 1)
+    assert merged in {"q4_0", "q8_0"}
+    assert live == "q8_0"
+
+
+@pytest.mark.parametrize("argv", [["unknown"], ["begin", "--port", "0"], ["set", "--transaction", "bad", "--kv", "q6_0"], ["version", "extra"]])
+def test_malformed_protocol_is_bounded_json(argv, monkeypatch, capsys):
+    broker = broker_module()
+    monkeypatch.setattr("sys.argv", ["broker", *argv])
+    assert broker.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False and payload["protocol"] == 1 and payload["error_code"] == "invalid_request"

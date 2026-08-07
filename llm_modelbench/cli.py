@@ -1776,7 +1776,7 @@ def build_parser():
     rp.add_argument("--restart-ollama", action="store_true",
                     help="allow the explicit KV cascade to install a temporary systemd drop-in and restart Ollama")
     rp.add_argument("--ollama-service", default="auto",
-                    help="systemd unit managed by --restart-ollama; default auto discovers the unit owning the configured Ollama port")
+                    help="deprecated display hint; the privileged broker always discovers the sole Ollama unit owning the configured port")
     rp.add_argument("--keep-final-kv", action="store_true",
                     help="do not restore the original Ollama service drop-in after the cascade")
     rp.add_argument("--reuse-sudo-credentials", action="store_true",
@@ -1784,7 +1784,7 @@ def build_parser():
     rp.add_argument("--auto-confirm", action="store_true",
                     help="fully unattended apply mode for --restart-ollama --kv-cascade: implies --yes, skips "
                          "typed DISCOVER/VERIFY/RESTART confirmations, and uses sudo -n only. Requires a scoped "
-                         "NOPASSWD sudoers rule for the exact commands in docs/auto_confirm_sudoers.md. Does "
+                         "NOPASSWD sudoers rule for the dedicated broker in docs/auto_confirm_sudoers.md. Does "
                          "not store or read a password. Off by default.")
     rp.add_argument("--force", action="store_true", help="allow a previously recorded repair action to be planned again")
     rp.add_argument("--live-ui", choices=["off", "compact", "full", "log"], default="compact",

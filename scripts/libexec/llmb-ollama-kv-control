@@ -71,7 +71,7 @@ def _write_bytes_atomic(path: Path, data: bytes, mode: int) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(tmp, flags, mode)
     try:
-        os.write(fd, data); os.fsync(fd)
+        _write_all(fd, data); os.fsync(fd)
     finally:
         os.close(fd)
     try:
@@ -88,7 +88,7 @@ def _write_state(token: str, state: dict[str, Any]) -> None:
     tmp = STATE_ROOT / ("." + secrets.token_urlsafe(24))
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
-        raw = (json.dumps(state, sort_keys=True) + "\n").encode(); os.write(fd, raw); os.fsync(fd)
+        raw = (json.dumps(state, sort_keys=True) + "\n").encode(); _write_all(fd, raw); os.fsync(fd)
     finally: os.close(fd)
     try: os.replace(tmp, target); os.chmod(target, 0o600)
     finally:
@@ -104,6 +104,15 @@ def _read_state(token: str) -> dict[str, Any]:
         raise BrokerError("transaction state is not root-private", "unsafe_filesystem")
     try: return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc: raise BrokerError("invalid transaction state", "invalid_state") from exc
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Write all bytes; os.write is permitted to return a partial count."""
+    offset = 0
+    while offset < len(data):
+        count = os.write(fd, data[offset:])
+        if count <= 0: raise OSError("short write to trusted transaction file")
+        offset += count
 
 
 def _caller() -> dict[str, str]:
@@ -203,7 +212,7 @@ def _apply_file(state: dict[str, Any], data: bytes | None) -> None:
 def _observed(state: dict[str, Any], pid: int | None = None) -> tuple[str | None, str | None]:
     unit = state["unit"]
     env = _run([SYSTEMCTL, "show", unit, "--property=Environment", "--value"], timeout=15).stdout
-    match = re.search(r"(?:^|\s)OLLAMA_KV_CACHE_TYPE=([^\s\"']+)", env)
+    match = re.search(r"(?:^|[\s\"'])OLLAMA_KV_CACHE_TYPE=([^\s\"']+)", env)
     merged = match.group(1).lower() if match else None
     if pid is None: _, pid = _revalidate(state)
     live = None
@@ -232,13 +241,42 @@ def _owner(state: dict[str, Any]) -> None:
 def _lock_path(unit: str) -> Path: return STATE_ROOT / ("service-" + _sha(unit.encode()) + ".lock")
 
 
+def _lock_matches(token: str, state: dict[str, Any]) -> None:
+    lock = _lock_path(str(state.get("unit", "")))
+    try: info = lock.lstat()
+    except FileNotFoundError as exc: raise BrokerError("transaction service lock is missing", "invalid_lock") from exc
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o600:
+        raise BrokerError("transaction service lock is unsafe", "invalid_lock")
+    if lock.read_text(encoding="ascii") != token:
+        raise BrokerError("transaction service lock does not match token", "invalid_lock")
+
+
+def _recovery_target(state: dict[str, Any]) -> None:
+    """Validate stored service metadata without requiring a live listener."""
+    unit = str(state.get("unit", ""))
+    if not UNIT_RE.fullmatch(unit): raise BrokerError("invalid stored service unit", "invalid_state")
+    output = _run([SYSTEMCTL, "show", unit, "--property=Id", "--property=LoadState", "--property=Description", "--value"], timeout=15).stdout.lower()
+    if unit.lower() not in output or "loaded" not in output or "ollama" not in output:
+        raise BrokerError("stored service is no longer a loaded Ollama system service", "stale_service")
+
+
+def _recovery_owner(state: dict[str, Any], *, root_override: bool) -> None:
+    caller = _caller()
+    if root_override and caller.get("direct_root") == "true": return
+    if state.get("owner") != caller: raise BrokerError("transaction belongs to another sudo identity", "owner_mismatch")
+
+
+def _finalize(token: str, state: dict[str, Any]) -> None:
+    _state_path(token).unlink(); _lock_path(state["unit"]).unlink()
+
+
 def _begin(port: int) -> dict[str, Any]:
     _state_dir(); unit, pid = _unit_for_listener(port); lock = _lock_path(unit)
     try: fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     except FileExistsError as exc: raise BrokerError("another KV repair transaction requires recovery", "transaction_locked") from exc
     token = secrets.token_urlsafe(32)
     try:
-        os.write(fd, token.encode()); os.fsync(fd)
+        _write_all(fd, token.encode()); os.fsync(fd)
     finally: os.close(fd)
     try:
         original = _existing(_dropin(unit))
@@ -254,6 +292,7 @@ def _begin(port: int) -> dict[str, Any]:
 def _rollback(token: str, state: dict[str, Any]) -> None:
     state["state"] = "restoring"; _write_state(token, state)
     try:
+        _lock_matches(token, state); _recovery_target(state); _assert_hash(state)
         original = None if state["original"] is None else base64.b64decode(state["original"])
         _apply_file(state, original); _run([SYSTEMCTL, "daemon-reload"], timeout=60); _run([SYSTEMCTL, "restart", state["unit"]], timeout=120)
         _revalidate(state); state["state"] = "restored"; _write_state(token, state)
@@ -266,17 +305,26 @@ def _set(token: str, kv: str) -> dict[str, Any]:
     state["state"] = "applying"; _write_state(token, state)
     try:
         _apply_file(state, _content(kv)); observed = _restart_verify(state, kv)
-    except BaseException:
-        state["state"] = "failed"; _write_state(token, state); _rollback(token, state); raise
+    except BaseException as exc:
+        state["state"] = "failed"; _write_state(token, state)
+        _rollback(token, state); _finalize(token, state)
+        raise BrokerError("KV mutation failed; original service state was restored", "rolled_back") from exc
     state.update({"state": "applied", "current_kv": kv}); _write_state(token, state)
     return _reply("set", state, transaction=token, verified=True, observed_kv=observed)
 
 
 def _restore(token: str) -> dict[str, Any]:
-    state = _read_state(token); _owner(state); _revalidate(state); _assert_hash(state); _rollback(token, state)
+    state = _read_state(token); _recovery_owner(state, root_override=False); _lock_matches(token, state); _recovery_target(state); _assert_hash(state); _rollback(token, state)
     if state["state"] != "restored": raise BrokerError("restore did not complete", "rollback_failed")
-    _state_path(token).unlink(); _lock_path(state["unit"]).unlink(missing_ok=True)
+    _finalize(token, state)
     return _reply("restore", state, transaction=token, restored=True)
+
+
+def _recover(token: str) -> dict[str, Any]:
+    state = _read_state(token); _recovery_owner(state, root_override=True); _lock_matches(token, state); _recovery_target(state); _assert_hash(state); _rollback(token, state)
+    if state["state"] != "restored": raise BrokerError("recovery did not complete", "rollback_failed")
+    _finalize(token, state)
+    return _reply("recover", state, transaction=token, restored=True)
 
 
 def _status(token: str) -> dict[str, Any]:
@@ -299,25 +347,32 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "set": return _set(args.transaction, args.kv)
     if args.command == "status": return _status(args.transaction)
     if args.command == "restore": return _restore(args.transaction)
+    if args.command == "recover": return _recover(args.transaction)
     raise BrokerError("unknown operation", "invalid_operation")
 
 
+class _JsonParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None: raise BrokerError(message, "invalid_request")
+
+
 def parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description=__doc__); sub = p.add_subparsers(dest="command", required=True)
+    p = _JsonParser(description=__doc__); sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("version")
     for name in ("probe", "begin"):
         q = sub.add_parser(name); q.add_argument("--port", required=True, type=_port)
     q = sub.add_parser("set"); q.add_argument("--transaction", required=True); q.add_argument("--kv", required=True, choices=sorted(KV_VALUES))
     for name in ("status", "restore"):
         q = sub.add_parser(name); q.add_argument("--transaction", required=True)
+    q = sub.add_parser("recover"); q.add_argument("--transaction", required=True)
     return p
 
 
 def main() -> int:
-    args = parser().parse_args()
-    try: payload = dispatch(args)
+    args: argparse.Namespace | None = None
+    try:
+        args = parser().parse_args(); payload = dispatch(args)
     except (BrokerError, OSError, subprocess.SubprocessError) as exc:
-        payload = _reply(getattr(args, "command", "unknown")); payload.update({"ok": False, "error_code": getattr(exc, "code", "operation_failed"), "message": str(exc)})
+        payload = _reply(getattr(args, "command", "unknown")); payload.update({"ok": False, "error_code": getattr(exc, "code", "operation_failed"), "message": str(exc)[:500]})
         print(json.dumps(payload, sort_keys=True)); return 1
     print(json.dumps(payload, sort_keys=True)); return 0
 

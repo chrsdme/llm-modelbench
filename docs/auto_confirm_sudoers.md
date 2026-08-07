@@ -2,7 +2,7 @@
 
 `--auto-confirm` is optional. It uses one root-owned broker rather than a
 collection of generic privileged commands. The broker accepts only its version,
-port, transaction token, and the `q8_0`/`q4_0` KV enum; it does not accept
+bounded port, transaction token, and the `q8_0`/`q4_0` KV enum; it does not accept
 paths, units, systemd fragments, environment values, or shell commands.
 
 ## One-time installation
@@ -30,6 +30,11 @@ Do not grant NOPASSWD access to `install`, `rm`, `cat`, `test`, `ss`,
 root-owned broker validates its semantic protocol and independently identifies
 the Ollama listener and owning systemd unit.
 
+The selected port authorizes management only of the one system Ollama service
+that the broker independently discovers listening on that port. It does not
+authorize a caller-selected unit, path, fragment, executable, environment, or
+systemctl operation.
+
 ## Behaviour and removal
 
 Interactive repair still uses normal sudo authentication and typed phase
@@ -42,3 +47,17 @@ To remove unattended capability, remove the sudoers entry with `visudo`, then
 remove `/usr/local/libexec/llmb-ollama-kv-control` after restoring any active
 transaction. Normal benchmarking and supervised repair planning do not need
 this broker.
+
+If an interrupted transaction leaves Ollama down, an administrator logged in
+as direct real root (not through sudo) may recover only the recorded
+transaction:
+
+```bash
+/usr/local/libexec/llmb-ollama-kv-control recover --transaction <token>
+```
+
+Recovery validates root-private state and matching service lock, stored loaded
+Ollama systemd metadata, and the managed-drop-in hash before restoring bytes.
+It reloads and restarts the recorded service and requires the listener to
+return before removing state and its lock. Sudo users remain owner-bound;
+direct root cannot use this recovery override for `set`.

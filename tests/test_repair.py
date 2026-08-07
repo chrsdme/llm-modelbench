@@ -980,34 +980,10 @@ def test_preflight_is_a_noop_without_auto_confirm(monkeypatch):
     controller.verify_noninteractive_sudo_ready()  # must not raise, must not run anything
 
 
-@pytest.mark.skip(reason="predictable unprivileged temp source is intentionally removed")
-def test_install_uses_fixed_predictable_temp_path_not_random(monkeypatch):
-    """Sudoers on some systems rejects wildcards in command arguments
-    entirely. A random tempfile name would make the install step impossible
-    to authorize with an exact-match NOPASSWD rule. Must be fixed and
-    predictable per unit instead."""
-    from llm_modelbench import ollama_service
-
-    calls = []
-    def fake_run(argv, **kwargs):
-        calls.append(list(argv))
-        class R:
-            returncode = 0
-            stdout = ""
-            stderr = ""
-        return R()
-
-    monkeypatch.setattr(ollama_service.os, "geteuid", lambda: 1000)
-    controller = ollama_service.OllamaServiceController("ollama-gpu0.service", run=fake_run)
-    controller._install_bytes(b"test content")
-
-    install_calls = [c for c in calls if "install" in c and "0644" in c]
-    assert install_calls, "expected an install -m 0644 call"
-    source_path = install_calls[0][install_calls[0].index("0644") + 1]
-    assert source_path == "/tmp/llmb-ollama-kv-" + "pending-ollama-gpu0.service.conf", (
-        f"expected a fixed, predictable path, got {source_path!r}"
-    )
-    assert "*" not in source_path and not any(c in source_path for c in ("?", "[", "]"))
+def test_broker_source_has_no_legacy_user_controlled_transfer_pattern():
+    from pathlib import Path
+    marker = "llmb-ollama-kv-" + "pending-"
+    assert marker not in Path("scripts/libexec/llmb-ollama-kv-control").read_text(encoding="utf-8")
 
 
 @pytest.mark.skip(reason="old reader is obsolete; broker reads only the selected KV")
