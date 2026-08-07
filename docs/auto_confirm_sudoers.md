@@ -28,7 +28,7 @@ From the repository root:
 
 ```bash
 sudo install -d -m 0755 /usr/local/libexec
-sudo install -o root -g root -m 0755 llmb-read-kv-env.sh \
+sudo install -o root -g root -m 0755 scripts/libexec/llmb-read-kv-env.sh \
   /usr/local/libexec/llmb-read-kv-env.sh
 ```
 
