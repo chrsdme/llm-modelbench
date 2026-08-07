@@ -11,7 +11,11 @@
 
 ## Model and execution support
 
+- Explicit runtime profiles for Ollama and external llama.cpp/`llama-server`
+  endpoints, with persisted runtime identity and resume gates.
 - Local Ollama inventory, classification, family routing, and digest identities.
+- Dynamic NVIDIA multi-GPU inventory and bounded runtime/process telemetry where
+  available; physical-device identity is UUID-based rather than ordinal-based.
 - One-model-at-a-time runs with resume-safe JSONL artifacts.
 - Hardware/offload telemetry where available, without mixing it into quality.
 - Local wrappers: `llmb`, `llmb-run`, and `llmb-watch`.
@@ -37,5 +41,7 @@
 
 - No model deletion or automatic run scheduling.
 - Read-only tools do not benchmark or refresh model data.
+- llama.cpp service/KV repair is explicitly unsupported; ModelBench never
+  manages its lifecycle.
 - Fixture privacy restrictions and archival rules keep public documentation and
   benchmark assets reviewable.

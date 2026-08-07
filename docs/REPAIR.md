@@ -124,7 +124,13 @@ The password is never read, piped, logged, cached, or serialised by LLM ModelBen
 
 The cascade requires a real interactive terminal. It refuses to run through a non-TTY pipe, cron job, or unattended automation. It also refuses `--mock` together with service restarts. A pseudo-terminal recorder such as `script` is supported; a plain `| tee` pipeline is not a TTY.
 
-The managed drop-in is narrow and temporary. It uses a late-sorting filename, but systemd's merged `Environment` output remains authoritative: if another unit file or drop-in still wins, RC7 aborts before restarting anything and identifies competing drop-ins when possible. If the managed path already exists without the LLM ModelBench marker, the command refuses to overwrite it. On an exception after a service change, it attempts to restore the original state before propagating the error.
+The managed drop-in is narrow and temporary. It uses a late-sorting filename,
+but systemd's merged `Environment` output remains authoritative: if another
+unit file or drop-in still wins, the command aborts before restarting anything
+and identifies competing drop-ins when possible. If the managed path already
+exists without the LLM ModelBench marker, the command refuses to overwrite it.
+On an exception after a service change, it attempts to restore the original
+state before propagating the error.
 
 Useful options:
 
@@ -189,7 +195,7 @@ sudo sh -c 'tr "\000" "\n" < "/proc/'"$pid"'/environ" | grep "^OLLAMA_KV_CACHE_T
 - Judgements remain in `judge_results.jsonl` sidecars.
 - Final repair outcome is `COMPLETE`, `PARTIAL`, `FAILED` or `TIMEOUT`.
 
-## RC9 current-first KV policy
+## Current-first KV policy
 
 `--kv-cascade --restart-ollama` no longer means that q8 is tried first. Guarded
 needle actions run under the current/default service configuration before any

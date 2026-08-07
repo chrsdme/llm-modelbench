@@ -28,8 +28,8 @@ def test_html_report_is_self_contained_and_has_csp(tmp_path):
 
 
 def test_mixed_runtime_provenance_is_additive_and_never_injected_into_legacy(tmp_path):
-    uuid_a = "GPU-78077308-f4b2-3330-6d4e-19581d7b1511"
-    uuid_b = "GPU-5b99bce2-35ab-f6db-857b-72162069fa72"
+    uuid_a = "GPU-00000000-0000-0000-0000-0000000000a1"
+    uuid_b = "GPU-00000000-0000-0000-0000-0000000000b2"
     identity = RuntimeIdentity(
         backend="llama_cpp", adapter_identity="fixture", endpoint="http://127.0.0.1:8081",
         profile_name="fixture-profile", profile_provenance="test", profile_schema_version=1,

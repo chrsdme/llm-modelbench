@@ -20,4 +20,6 @@ Package and CLI: `llm-modelbench` / `llm_modelbench`
 
 Public clone instructions use HTTPS. Maintainers may configure authenticated SSH remotes separately.
 
-Release summaries belong in [CHANGELOG.md](../CHANGELOG.md). Historical audit documents belong in [history/](history/), not in the documentation root.
+Release summaries belong in [CHANGELOG.md](../CHANGELOG.md). Keep public
+documentation current and release-neutral; retain detailed internal audit
+material in the ignored local workspace.

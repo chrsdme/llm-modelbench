@@ -5,13 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "llm-modelbench"
 dynamic = ["version"]
-description = "A comprehensive, hardware-adaptive benchmark suite for local Ollama models."
+description = "A hardware-aware benchmark suite for explicitly selected local LLM runtimes."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "chrsdme" }]
-keywords = ["ollama", "llm", "benchmark", "local-ai", "evaluation"]
+keywords = ["ollama", "llama-cpp", "llama-server", "llm", "benchmark", "local-ai", "evaluation"]
 dependencies = []   # core runs on the standard library only
 
 [project.optional-dependencies]

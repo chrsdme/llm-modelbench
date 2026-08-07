@@ -42,7 +42,7 @@ Hybrid models keep every supported lane. Current families are `text`, `vision`, 
 
 A failed weak name hint is removed. A failed operator-declared or Ollama-declared capability remains routed and is recorded as a warning so the real task failure remains visible.
 
-## RC9 evidence policy
+## Evidence policy
 
 Actual `run` commands perform functional capability probes by default. Use
 `--no-auto-probe` only when deliberately accepting metadata-only routing.

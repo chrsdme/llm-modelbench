@@ -1,6 +1,6 @@
 # Documentation
 
-Current user and contributor documentation is kept separate from historical release material.
+Current user and contributor documentation is kept concise and release-neutral.
 
 ## Use the benchmark
 
@@ -9,6 +9,7 @@ Current user and contributor documentation is kept separate from historical rele
 - [TASKS.md](TASKS.md), task and fixture contracts
 - [SCORING.md](SCORING.md), deterministic and judged scoring semantics
 - [CAPABILITY_ROUTING.md](CAPABILITY_ROUTING.md), model selection and capability probes
+- [RUNTIMES.md](RUNTIMES.md), runtime profiles, backend boundaries, and telemetry
 - [CAMPAIGNS.md](CAMPAIGNS.md), isolated campaign lifecycle and adoption controls
 - [RANKINGS.md](RANKINGS.md), persistent rankings and model history
 - [JUDGE_DUMPS.md](JUDGE_DUMPS.md), post-hoc judging
@@ -25,4 +26,3 @@ Current user and contributor documentation is kept separate from historical rele
 - [CONTRIBUTING.md](CONTRIBUTING.md), contribution requirements
 - [PUBLISHING.md](PUBLISHING.md), release checklist
 - [FEATURES.md](FEATURES.md), feature inventory
-- [history/](history/), archived RC audits and application notes

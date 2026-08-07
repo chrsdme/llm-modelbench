@@ -8,7 +8,9 @@ Include the affected version, reproduction steps, expected behavior, observed be
 
 ## Supported versions
 
-Security fixes are applied to the latest release candidate or stable release. Historical release-candidate documents are retained for provenance but are not maintained branches.
+Security fixes are applied to the latest release candidate or stable release.
+Detailed internal development records are local-only and are not maintained
+release branches.
 
 ## Execution boundary
 

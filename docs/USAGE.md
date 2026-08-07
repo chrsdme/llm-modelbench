@@ -19,8 +19,18 @@ llm-modelbench doctor [--json]
 llm-modelbench plan [--mock] [--level smoke|short|full] [--models 'a;b'|--all|--select] [--auto]
 ```
 
-`inventory` and a non-mock `plan` read the local Ollama inventory. They do not
-execute benchmark prompts. `plan --mock` is fully offline.
+`runtime discover` finds local Ollama and llama.cpp candidates without changing
+their lifecycle. Select a profile before non-mock work; unattended ambiguity
+fails before model calls. `inventory` and a non-mock `plan` query the selected
+runtime without executing benchmark prompts. `plan --mock` is fully offline.
+
+```bash
+llm-modelbench runtime discover
+llm-modelbench runtime list
+llm-modelbench runtime select ollama
+```
+
+See [RUNTIMES.md](RUNTIMES.md) for profile and backend limits.
 
 ## Benchmark execution
 

@@ -1,8 +1,10 @@
 # LLM ModelBench
 
-LLM ModelBench is a local benchmark for installed Ollama models. It measures
-task correctness by lane, preserves raw evidence, and provides read-only tools
-for reviewing coverage, reliability, routing, and pruning decisions.
+LLM ModelBench is a local benchmark for models served by explicitly selected
+local runtimes. It supports Ollama and external llama.cpp/`llama-server`
+endpoints, measures task correctness by lane, preserves raw evidence, and
+provides read-only tools for reviewing coverage, reliability, routing, and
+pruning decisions.
 
 ## Naming
 
@@ -51,11 +53,15 @@ touches `runs/`, so past benchmark results are always preserved.
 
 ## Safe workflow
 
-Start by inspecting what would run. `inventory` and `plan` read the local
-Ollama inventory; `--mock` exercises the pipeline without Ollama.
+Start by inspecting what would run. `runtime discover` finds local candidates;
+`runtime select` persists the chosen runtime. In unattended use, ambiguity is
+a pre-model-work error. `inventory` and `plan` use the selected runtime;
+`--mock` exercises the pipeline without a runtime or GPU.
 
 ```bash
 ./llmb inventory
+./llmb runtime discover
+./llmb runtime select ollama
 ./llmb plan --mock
 ./llmb plan --models 'qwen2.5-coder:14b;qwen2.5-vl:7b' --auto --level short
 ./llmb-run --mock --level short --allow-host-code-execution --run-id demo --yes
@@ -235,6 +241,15 @@ to construct that plan.
 
 See [capability routing](docs/CAPABILITY_ROUTING.md).
 
+## Runtime support
+
+Ollama and llama.cpp are separate external runtimes. ModelBench does not start,
+stop, restart, or reconfigure `llama-server`. Runtime selection and identity are
+persisted with run and campaign evidence, so resume refuses a different
+runtime. Runtime discovery, profile storage, endpoint restrictions, multi-GPU
+inventory, telemetry boundaries, and the Ollama-only repair exception are
+documented in [runtime architecture](docs/RUNTIMES.md).
+
 ## Post-hoc judging and persistent rankings
 
 ```bash
@@ -307,7 +322,6 @@ See [docs/REPAIR.md](docs/REPAIR.md) for thinking-only recovery, capability gate
 - [docs/JUDGE_DUMPS.md](docs/JUDGE_DUMPS.md) — retroactive automated judging
 - [docs/RANKINGS.md](docs/RANKINGS.md) — formulas, status, ties, and model history
 - [docs/README.md](docs/README.md) — current documentation index
-- [docs/history/](docs/history/) — archived release audits and application notes
 - [docs/TASKS.md](docs/TASKS.md) — task and fixture rules
 - [docs/SCORING.md](docs/SCORING.md) — scorer contracts
 - [docs/FEATURES.md](docs/FEATURES.md) — feature summary

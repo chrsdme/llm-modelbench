@@ -13,7 +13,7 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 EXECUTABLES = [
     "bootstrap.sh", "install.sh", "update.sh", "uninstall.sh",
-    "llmb", "llmb-run", "llmb-watch", "llmb-read-kv-env.sh",
+    "llmb", "llmb-run", "llmb-watch", "scripts/libexec/llmb-read-kv-env.sh",
 ]
 FORBIDDEN_TRACKED = re.compile(
     r"(^|/)(__pycache__/|build/|dist/|[^/]+\.egg-info/)|\.(?:pyc|pyo)$"

@@ -19,3 +19,6 @@ model_cards/
 rankings-separate/
 snapshots/
 *.review.zip
+/local_only/
+/AGENTS.md
+/REPO_MAP_PRIVATE.md
