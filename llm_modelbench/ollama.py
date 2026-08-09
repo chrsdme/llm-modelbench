@@ -553,6 +553,9 @@ class MockClient(OllamaClient):
     def chat(self, model, prompt, *, images=None, system=None, num_predict=1024, num_ctx=None, think="auto", messages=None):
         if messages is not None and not prompt:
             prompt = "\n".join(str(m.get("content") or "") for m in messages)
+        if "modelbench judge qualification request" in str(prompt).lower():
+            return self._response(self._qualification_answer(prompt), num_predict=num_predict, num_ctx=num_ctx, think=think,
+                                  prompt_eval_count=max(1, int(len(prompt or "") / 6.85)))
         if "return only valid json" in str(prompt).lower() and "grading a model answer" in str(prompt).lower():
             return self._response(self._answer(prompt), num_predict=num_predict, num_ctx=num_ctx, think=think,
                                   prompt_eval_count=max(1, int(len(prompt or "") / 6.85)))
@@ -700,3 +703,35 @@ class MockClient(OllamaClient):
         if "wolf" in p and "cabbage" in p:
             return "7 crossings"
         return "This is a deterministic mock response for offline pipeline testing."
+
+    def _qualification_answer(self, prompt: str) -> str:
+        marker = "Return only JSON matching response_schema.\n"
+        try:
+            request = json.loads(str(prompt).split(marker, 1)[1])
+        except Exception:
+            return '{"score": 0, "confidence": 0, "verdict": "mock qualification parse failure", "rubric_adherence": false, "reference_used": false}'
+        control_id = str(request.get("control_id") or "")
+        if request.get("mode") == "pairwise":
+            winner = {
+                "pair_equal": "equal", "pair_equal_reversed": "equal",
+                "pair_a_better": "A", "pair_a_better_reversed": "B",
+                "pair_b_better": "B", "pair_b_better_reversed": "A",
+            }.get(control_id, "equal")
+            return json.dumps({"winner": winner, "confidence": 1, "verdict": "mock qualification pairwise"})
+        score = {
+            "obviously_correct": 95,
+            "obviously_wrong": 5,
+            "partial_credit": 60,
+            "irrelevant_answer": 5,
+            "unsupported_hallucination": 5,
+            "malformed_candidate_output": 5,
+            "rubric_adherence": 50,
+            "reference_answer_use": 5,
+        }.get(control_id, 95)
+        return json.dumps({
+            "score": score,
+            "confidence": 1,
+            "verdict": f"mock qualification {control_id}",
+            "rubric_adherence": True,
+            "reference_used": True,
+        })

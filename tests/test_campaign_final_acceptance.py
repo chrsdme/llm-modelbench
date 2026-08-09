@@ -57,6 +57,9 @@ def test_cli_forced_mock_campaign_runs_full_terminal_lifecycle(tmp_path, monkeyp
     assert judge_selection["cohort"] == [{"digest": "mock-qwen25coder14b", "name": "qwen2.5-coder:14b"}]
     assert judge_selection["posthoc_judge_model"] == "llama3.1:8b"
     assert judge_selection["generation_judge_model"] is None
+    assert judge_selection["qualification"]["protocol_version"] == "judge-qualification-v1"
+    assert judge_selection["qualification"]["aggregate_disposition"] == "qualified"
+    assert judge_selection["qualification"]["controls"]
     policy_selection = judge_selection["judge_policy_selection"]
     assert policy_selection["requested_primary"] is None
     assert policy_selection["configured_fallbacks"] == []

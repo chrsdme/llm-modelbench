@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from llm_modelbench import campaign
@@ -17,21 +19,37 @@ def test_structured_judge_qualification_rejects_first_http_failure_without_retry
         calls = 0
         def chat(self, *args, **kwargs):
             self.calls += 1
-            return {"ok": False, "error": "HTTP 400 unsupported endpoint"}
+            return {"ok": False, "error": "unsupported endpoint", "http_status": 400}
 
     client = Broken()
     result = campaign.qualify_judge(client, {"name": "judge", "capabilities": ["completion"]})
     assert result["qualified"] is False
     assert client.calls == 1  # immediate candidate stop; no source rows are touched
-    assert result["checks"]["errors"]
+    assert result["aggregate_disposition"] == "rejected_structural_incompatibility"
+    assert result["checks"]["structural_incompatibility"] is True
 
 
 def test_judge_qualification_uses_deterministic_fallback_chain():
     class Fallback:
         def chat(self, model, *args, **kwargs):
             if model == "first":
-                return {"ok": False, "error": "HTTP 400 unsupported endpoint"}
-            return {"ok": True, "text": '{"score": 90, "confidence": 1, "verdict": "correct"}'}
+                return {"ok": False, "error": "unsupported endpoint", "http_status": 400}
+            request = json.loads(args[0].split("Return only JSON matching response_schema.\n", 1)[1])
+            control_id = request["control_id"]
+            if request["mode"] == "pairwise":
+                winner = {
+                    "pair_equal": "equal", "pair_equal_reversed": "equal",
+                    "pair_a_better": "A", "pair_a_better_reversed": "B",
+                    "pair_b_better": "B", "pair_b_better_reversed": "A",
+                }[control_id]
+                return {"ok": True, "text": json.dumps({"winner": winner, "confidence": 1, "verdict": "ok"})}
+            score = {
+                "obviously_correct": 95, "obviously_wrong": 5, "partial_credit": 60,
+                "irrelevant_answer": 5, "unsupported_hallucination": 5,
+                "malformed_candidate_output": 5, "rubric_adherence": 50,
+                "reference_answer_use": 5,
+            }.get(control_id, 95)
+            return {"ok": True, "text": json.dumps({"score": score, "confidence": 1, "verdict": "ok", "rubric_adherence": True, "reference_used": True})}
 
     selection = campaign.build_judge_selection([
         {"name": "first", "digest": "1", "capabilities": ["completion"]},

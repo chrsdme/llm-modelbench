@@ -1881,13 +1881,7 @@ def build_judge_selection(
 
 
 def qualify_judge(client: Any, candidate: Dict[str, Any], *, repeats: int = 2) -> Dict[str, Any]:
-    """Cheap pre-batch qualification using the exact structured judge contract.
-
-    This deliberately does not pull a model.  Any endpoint/HTTP/contract error
-    rejects the candidate before the first source row is judged.
-    """
-    from . import judge as judge_mod
-    started = datetime.now(timezone.utc)
+    """Run the universal ModelBench judge qualification protocol."""
     name = str(candidate.get("name") or "")
     result: Dict[str, Any] = {"model": name, "digest": candidate.get("digest"),
                               "capabilities": candidate.get("capabilities") or [],
@@ -1896,29 +1890,11 @@ def qualify_judge(client: Any, candidate: Dict[str, Any], *, repeats: int = 2) -
     if not _judge_candidate_is_generative(candidate):
         result["selection_rationale"] = _judge_capability_rejection(candidate) or "rejected_non_generative_capability"
         return result
-    scores, errors = [], []
-    for _ in range(max(2, int(repeats))):
-        score, reason = judge_mod.judge_single(
-            client, name, "What is 2 + 2?", "4", "Score correctness; reference answer is 4.", think="off"
-        )
-        if score is None:
-            errors.append(reason)
-            # A structural endpoint/contract failure cannot be repaired by
-            # repeating the same request for the remaining rows.
-            if "http 400" in str(reason).lower() or "invalid json" in str(reason).lower():
-                break
-        else:
-            scores.append(score)
-    result["checks"] = {"endpoint_compatible": not errors, "structured_output": not errors,
-                        "score_range_valid": all(0 <= score <= 100 for score in scores),
-                        "reference_answer_use": bool(scores), "repeated_call_stable": len(set(scores)) <= 1,
-                        "malformed_output_recovery": "parser_diagnostic_available",
-                        "pairwise_order_reversal": "requires_pairwise_capability_probe",
-                        "self_preference_bias": "requires_cohort_probe", "scores": scores,
-                        "errors": errors, "latency_seconds": (datetime.now(timezone.utc) - started).total_seconds()}
-    result["qualified"] = bool(scores) and not errors and len(set(scores)) <= 1
-    result["selection_rationale"] = "qualified_structured_generation_probe" if result["qualified"] else "qualification_failed"
-    return result
+    from .judge_qualification import qualify_candidate
+
+    qualification = qualify_candidate(client, candidate, repeats=max(2, int(repeats)))
+    qualification["selection_rationale"] = qualification["aggregate_disposition"]
+    return qualification
 
 
 def select_campaign_judge(inventory: List[Dict[str, Any]], cohort: List[Dict[str, Any]], *,
