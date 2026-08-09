@@ -197,34 +197,15 @@ def _reversed_pair(control: QualificationControl) -> QualificationControl:
     )
 
 
-def _extract_json(text: str) -> Optional[dict]:
-    start = str(text or "").find("{")
-    if start < 0:
+def _parse_strict_json(text: str) -> Optional[dict]:
+    raw = str(text or "").strip()
+    if not raw or not raw.startswith("{") or not raw.endswith("}"):
         return None
-    depth = 0
-    in_str = False
-    esc = False
-    for i, ch in enumerate(str(text)[start:], start):
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    return json.loads(str(text)[start:i + 1])
-                except Exception:
-                    return None
-    return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _classify_backend_failure(response: Dict[str, Any]) -> str:
@@ -240,11 +221,17 @@ def _classify_backend_failure(response: Dict[str, Any]) -> str:
         status_i = int(status) if status is not None else 0
     except (TypeError, ValueError):
         status_i = 0
+    if status_i == 408:
+        return "timeout"
+    if status_i == 429:
+        return "transient_backend_failure"
+    if 500 <= status_i <= 599:
+        return "transient_backend_failure"
     if status_i in {400, 404, 405, 415, 422}:
         return "structural_incompatibility"
-    if status_i in {408, 429, 500, 502, 503, 504}:
-        return "timeout" if status_i == 408 else "backend_failure"
-    return "backend_failure"
+    if kind in {"backend_failure", "transport_failure", "connection_error", "transient_backend_failure", "rate_limited"}:
+        return "transient_backend_failure"
+    return "transient_backend_failure"
 
 
 def _render_prompt(request: QualificationRequest) -> str:
@@ -269,19 +256,44 @@ def _call_backend(client: Any, model: str, request: QualificationRequest, *, tim
         )
     except TimeoutError as exc:
         return {"ok": False, "error": str(exc), "error_kind": "timeout"}
-    except TypeError:
-        try:
-            return client.chat(
-                model,
-                _render_prompt(request),
-                system="You are being qualified as a benchmark judge. Return only the requested JSON.",
-                num_predict=512,
-                think="off",
-            )
-        except TimeoutError as exc:
-            return {"ok": False, "error": str(exc), "error_kind": "timeout"}
     except Exception as exc:
-        return {"ok": False, "error": repr(exc), "error_kind": "backend_failure"}
+        return {"ok": False, "error": repr(exc), "error_kind": "transient_backend_failure"}
+
+
+def _schema_violation(message: str, parsed: Dict[str, Any]) -> Dict[str, Any]:
+    return {"ok": False, "disposition": "schema_violation", "error": message, "parsed": parsed}
+
+
+def _required_number(data: Dict[str, Any], field: str, *, low: float, high: float) -> tuple[Optional[float], Optional[Dict[str, Any]]]:
+    if field not in data:
+        return None, _schema_violation(f"missing_{field}", data)
+    value = data.get(field)
+    if isinstance(value, bool):
+        return None, _schema_violation(f"{field}_must_be_numeric", data)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None, _schema_violation(f"{field}_must_be_numeric", data)
+    if not low <= number <= high:
+        disposition = "score_out_of_range" if field == "score" else "schema_violation"
+        return None, {"ok": False, "disposition": disposition, "error": f"{field}_out_of_range:{number}", "parsed": data}
+    return round(number, 2), None
+
+
+def _required_nonempty_string(data: Dict[str, Any], field: str) -> Optional[Dict[str, Any]]:
+    if field not in data:
+        return _schema_violation(f"missing_{field}", data)
+    if not isinstance(data.get(field), str) or not str(data.get(field) or "").strip():
+        return _schema_violation(f"{field}_must_be_nonempty_string", data)
+    return None
+
+
+def _required_bool(data: Dict[str, Any], field: str) -> Optional[Dict[str, Any]]:
+    if field not in data:
+        return _schema_violation(f"missing_{field}", data)
+    if not isinstance(data.get(field), bool):
+        return _schema_violation(f"{field}_must_be_boolean", data)
+    return None
 
 
 def _parse_response(request: QualificationRequest, response: Dict[str, Any]) -> Dict[str, Any]:
@@ -294,31 +306,42 @@ def _parse_response(request: QualificationRequest, response: Dict[str, Any]) -> 
             "parsed": None,
         }
     text = str(response.get("text") or "")
-    data = _extract_json(text)
+    data = _parse_strict_json(text)
     if not isinstance(data, dict):
         return {"ok": False, "disposition": "malformed_judge_output", "error": "invalid_json", "parsed": None}
     if request.mode == "score":
-        try:
-            score = float(data.get("score"))
-        except (TypeError, ValueError):
-            return {"ok": False, "disposition": "schema_violation", "error": "missing_numeric_score", "parsed": data}
-        if not 0 <= score <= 100:
-            return {"ok": False, "disposition": "score_out_of_range", "error": f"score_out_of_range:{score}", "parsed": data}
-        confidence = data.get("confidence")
-        if confidence is not None:
-            try:
-                confidence_f = float(confidence)
-            except (TypeError, ValueError):
-                return {"ok": False, "disposition": "schema_violation", "error": "non_numeric_confidence", "parsed": data}
-            if not 0 <= confidence_f <= 1:
-                return {"ok": False, "disposition": "schema_violation", "error": "confidence_out_of_range", "parsed": data}
-        data["score"] = round(score, 2)
+        score, violation = _required_number(data, "score", low=0, high=100)
+        if violation:
+            return violation
+        confidence, violation = _required_number(data, "confidence", low=0, high=1)
+        if violation:
+            return violation
+        for field in ("verdict",):
+            violation = _required_nonempty_string(data, field)
+            if violation:
+                return violation
+        for field in ("rubric_adherence", "reference_used"):
+            violation = _required_bool(data, field)
+            if violation:
+                return violation
+        data["score"] = score
+        data["confidence"] = confidence
     else:
+        violation = _required_nonempty_string(data, "winner")
+        if violation:
+            return violation
+        confidence, violation = _required_number(data, "confidence", low=0, high=1)
+        if violation:
+            return violation
+        violation = _required_nonempty_string(data, "verdict")
+        if violation:
+            return violation
         winner = str(data.get("winner") or "").strip().lower()
         normalised = {"a": "A", "b": "B", "equal": "equal"}.get(winner)
         if normalised is None:
             return {"ok": False, "disposition": "schema_violation", "error": "invalid_pairwise_winner", "parsed": data}
         data["winner"] = normalised
+        data["confidence"] = confidence
     return {"ok": True, "disposition": "parsed", "error": None, "parsed": data}
 
 
@@ -389,6 +412,7 @@ def qualify_candidate(
         "timeout": False,
         "structural_incompatibility": False,
         "unsupported_backend": False,
+        "transient_backend_failure": False,
     }
     parsed_by_id: Dict[str, Dict[str, Any]] = {}
 
@@ -415,6 +439,11 @@ def qualify_candidate(
                 checks["backend_request_compatible"] = False
                 failure_reasons.append("timeout")
                 return None
+            if disposition == "transient_backend_failure":
+                checks["transient_backend_failure"] = True
+                checks["backend_request_compatible"] = False
+                failure_reasons.append("transient_backend_failure")
+                return None
             if disposition == "malformed_judge_output":
                 checks["structured_output"] = False
                 failure_reasons.append("malformed_judge_output")
@@ -432,12 +461,12 @@ def qualify_candidate(
 
     for control in controls:
         parsed = run(control)
-        if parsed is None and (checks["structural_incompatibility"] or checks["unsupported_backend"] or checks["timeout"]):
+        if parsed is None and _operational_failure_seen(checks):
             return _result(candidate, started, control_results, checks, failure_reasons)
         if control.mode == "pairwise":
             reversed_control = _reversed_pair(control)
             parsed_reversed = run(reversed_control)
-            if parsed_reversed is None and (checks["structural_incompatibility"] or checks["unsupported_backend"] or checks["timeout"]):
+            if parsed_reversed is None and _operational_failure_seen(checks):
                 return _result(candidate, started, control_results, checks, failure_reasons)
 
     repeat_scores = []
@@ -454,7 +483,7 @@ def qualify_candidate(
             expected=repeat_control.expected,
         )
         parsed = run(repeated)
-        if parsed is None and (checks["structural_incompatibility"] or checks["unsupported_backend"] or checks["timeout"]):
+        if parsed is None and _operational_failure_seen(checks):
             return _result(candidate, started, control_results, checks, failure_reasons)
         if parsed and isinstance(parsed.get("score"), (int, float)):
             repeat_scores.append(float(parsed["score"]))
@@ -483,12 +512,21 @@ def qualify_candidate(
     checks["repeat_stability"] = bool(repeat_scores and max(repeat_scores) - min(repeat_scores) <= 5)
 
     for check, passed in checks.items():
-        if check in {"timeout", "structural_incompatibility", "unsupported_backend"}:
+        if check in {"timeout", "structural_incompatibility", "unsupported_backend", "transient_backend_failure"}:
             continue
         if not passed and check not in failure_reasons:
             failure_reasons.append(check)
 
     return _result(candidate, started, control_results, checks, failure_reasons)
+
+
+def _operational_failure_seen(checks: Dict[str, Any]) -> bool:
+    return bool(
+        checks.get("structural_incompatibility")
+        or checks.get("unsupported_backend")
+        or checks.get("timeout")
+        or checks.get("transient_backend_failure")
+    )
 
 
 def _result(
@@ -505,9 +543,13 @@ def _result(
         disposition = "rejected_unsupported_backend"
     elif checks.get("timeout"):
         disposition = "rejected_timeout"
+    elif checks.get("transient_backend_failure"):
+        disposition = "rejected_transient_backend_failure"
     elif failure_reasons:
         if "malformed_judge_output" in failure_reasons:
             disposition = "rejected_malformed_output"
+        elif "schema_violation" in failure_reasons:
+            disposition = "rejected_schema_violation"
         elif "score_out_of_range" in failure_reasons:
             disposition = "rejected_score_out_of_range"
         elif "repeat_stability" in failure_reasons:

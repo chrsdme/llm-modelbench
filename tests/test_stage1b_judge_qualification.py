@@ -2,11 +2,13 @@ import json
 
 from llm_modelbench import campaign
 from llm_modelbench.judge_qualification import PROTOCOL_VERSION, qualify_candidate
+from llm_modelbench.ollama import OllamaClient
 
 
 class FakeJudgeBackend:
-    def __init__(self, behavior="qualified"):
+    def __init__(self, behavior="qualified", replacement=None):
         self.behavior = behavior
+        self.replacement = replacement
         self.calls = []
         self.repeat_scores = [95, 70, 90]
 
@@ -16,10 +18,24 @@ class FakeJudgeBackend:
         control_id = request["control_id"]
         if self.behavior == "timeout":
             return {"ok": False, "error": "deadline exceeded", "error_kind": "timeout"}
+        if self.behavior == "rate_limited":
+            return {"ok": False, "error": "rate limited", "http_status": 429}
+        if self.behavior == "server_error":
+            return {"ok": False, "error": "server unavailable", "http_status": 503}
         if self.behavior == "structural_http":
             return {"ok": False, "error": "unsupported request schema", "http_status": 415}
         if self.behavior == "unsupported":
             return {"ok": False, "error": "chat unavailable", "error_kind": "unsupported_backend"}
+        if self.behavior == "replace_score" and request["mode"] == "score":
+            return {"ok": True, "text": json.dumps(self.replacement)}
+        if self.behavior == "replace_pairwise" and control_id == "pair_equal":
+            return {"ok": True, "text": json.dumps(self.replacement)}
+        if self.behavior == "whitespace_json" and control_id == "obviously_correct":
+            return {"ok": True, "text": " \n\t" + json.dumps(self._score_response(control_id)) + "\n "}
+        if self.behavior == "prose_before_json" and control_id == "obviously_correct":
+            return {"ok": True, "text": "Here is the result: " + json.dumps(self._score_response(control_id))}
+        if self.behavior == "prose_after_json" and control_id == "obviously_correct":
+            return {"ok": True, "text": json.dumps(self._score_response(control_id)) + "\nThis is my explanation."}
         if self.behavior == "malformed_output" and control_id == "obviously_correct":
             return {"ok": True, "text": "not json"}
         if self.behavior == "out_of_range" and control_id == "obviously_correct":
@@ -128,6 +144,33 @@ def test_fully_qualified_fake_judge_exercises_complete_protocol():
     first_request = backend.calls[0]["request"]
     assert first_request["protocol_version"] == PROTOCOL_VERSION
     assert first_request["response_schema"]["score"] == "number 0-100"
+    assert backend.calls[0]["kwargs"]["timeout"] == 30.0
+
+
+def test_ollama_chat_propagates_per_request_timeout_to_stream_transport():
+    class Response:
+        def __enter__(self):
+            return iter([
+                b'{"message":{"content":"ok"},"done":true,"eval_count":1,'
+                b'"eval_duration":1000000000,"prompt_eval_count":1,'
+                b'"prompt_eval_duration":1000000000,"total_duration":2000000000}\n'
+            ])
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    client = OllamaClient(timeout=300)
+    observed = {}
+
+    def fake_post_stream(path, payload, timeout=None):
+        observed["path"] = path
+        observed["timeout"] = timeout
+        return Response()
+
+    client._post_stream = fake_post_stream
+    result = client.chat("judge", "prompt", think="auto", timeout=1.25)
+    assert result["ok"] is True
+    assert observed == {"path": "/api/chat", "timeout": 1.25}
 
 
 def test_malformed_structured_judge_output_rejects_candidate():
@@ -175,6 +218,24 @@ def test_timeout_is_typed_and_rejects_candidate_immediately():
     assert len(backend.calls) == 1
 
 
+def test_rate_limit_backend_failure_is_typed_and_rejects_immediately():
+    backend = FakeJudgeBackend("rate_limited")
+    result = qualify_candidate(backend, _candidate())
+    assert result["qualified"] is False
+    assert result["aggregate_disposition"] == "rejected_transient_backend_failure"
+    assert result["checks"]["transient_backend_failure"] is True
+    assert len(backend.calls) == 1
+
+
+def test_5xx_backend_failure_is_typed_and_rejects_immediately():
+    backend = FakeJudgeBackend("server_error")
+    result = qualify_candidate(backend, _candidate())
+    assert result["qualified"] is False
+    assert result["aggregate_disposition"] == "rejected_transient_backend_failure"
+    assert result["checks"]["transient_backend_failure"] is True
+    assert len(backend.calls) == 1
+
+
 def test_typed_http_request_incompatibility_rejects_candidate_immediately():
     backend = FakeJudgeBackend("structural_http")
     result = qualify_candidate(backend, _candidate())
@@ -189,6 +250,69 @@ def test_unsupported_backend_rejects_candidate():
     assert result["qualified"] is False
     assert result["aggregate_disposition"] == "rejected_unsupported_backend"
     assert result["checks"]["unsupported_backend"] is True
+
+
+def test_raw_json_and_surrounding_whitespace_are_valid_structured_outputs():
+    assert qualify_candidate(FakeJudgeBackend(), _candidate())["qualified"] is True
+    whitespace = qualify_candidate(FakeJudgeBackend("whitespace_json"), _candidate())
+    assert whitespace["qualified"] is True
+
+
+def test_prose_before_or_after_json_is_malformed_structured_output():
+    before = qualify_candidate(FakeJudgeBackend("prose_before_json"), _candidate())
+    after = qualify_candidate(FakeJudgeBackend("prose_after_json"), _candidate())
+    assert before["aggregate_disposition"] == "rejected_malformed_output"
+    assert after["aggregate_disposition"] == "rejected_malformed_output"
+
+
+def _valid_score_response():
+    return {"score": 90, "confidence": 1, "verdict": "ok", "rubric_adherence": True, "reference_used": True}
+
+
+def _valid_pairwise_response():
+    return {"winner": "equal", "confidence": 1, "verdict": "ok"}
+
+
+def test_score_schema_requires_every_declared_field_and_type():
+    cases = []
+    for field in ("score", "confidence", "verdict", "rubric_adherence", "reference_used"):
+        payload = _valid_score_response()
+        payload.pop(field)
+        cases.append((f"missing_{field}", payload))
+    cases.extend([
+        ("score_must_be_numeric", {**_valid_score_response(), "score": "high"}),
+        ("score_must_be_numeric", {**_valid_score_response(), "score": True}),
+        ("confidence_must_be_numeric", {**_valid_score_response(), "confidence": "certain"}),
+        ("verdict_must_be_nonempty_string", {**_valid_score_response(), "verdict": ""}),
+        ("rubric_adherence_must_be_boolean", {**_valid_score_response(), "rubric_adherence": "true"}),
+        ("reference_used_must_be_boolean", {**_valid_score_response(), "reference_used": 1}),
+    ])
+    for expected_error, replacement in cases:
+        result = qualify_candidate(FakeJudgeBackend("replace_score", replacement), _candidate())
+        first = result["controls"][0]["parse"]
+        assert result["aggregate_disposition"] == "rejected_schema_violation"
+        assert first["disposition"] == "schema_violation"
+        assert first["error"] == expected_error
+
+
+def test_pairwise_schema_requires_every_declared_field_and_type():
+    cases = []
+    for field in ("winner", "confidence", "verdict"):
+        payload = _valid_pairwise_response()
+        payload.pop(field)
+        cases.append((f"missing_{field}", payload))
+    cases.extend([
+        ("invalid_pairwise_winner", {**_valid_pairwise_response(), "winner": "C"}),
+        ("winner_must_be_nonempty_string", {**_valid_pairwise_response(), "winner": 7}),
+        ("confidence_must_be_numeric", {**_valid_pairwise_response(), "confidence": "certain"}),
+        ("verdict_must_be_nonempty_string", {**_valid_pairwise_response(), "verdict": ""}),
+    ])
+    for expected_error, replacement in cases:
+        result = qualify_candidate(FakeJudgeBackend("replace_pairwise", replacement), _candidate())
+        pair = next(item for item in result["controls"] if item["control_id"] == "pair_equal")
+        assert result["aggregate_disposition"] == "rejected_schema_violation"
+        assert pair["parse"]["disposition"] == "schema_violation"
+        assert pair["parse"]["error"] == expected_error
 
 
 def test_fallback_ready_rejection_uses_protocol_result_not_descriptive_strings():

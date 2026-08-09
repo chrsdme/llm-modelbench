@@ -13,6 +13,7 @@ import copy
 import json
 import os
 import statistics
+import socket
 import time
 import urllib.request
 import urllib.error
@@ -22,6 +23,8 @@ from typing import Any, Dict, List, Optional
 def _exception_payload(exc: Exception) -> Dict[str, Any]:
     """Preserve HTTP status and response body instead of reducing failures to repr()."""
     payload: Dict[str, Any] = {"error": repr(exc)}
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        payload["error_kind"] = "timeout"
     if isinstance(exc, urllib.error.HTTPError):
         payload["http_status"] = getattr(exc, "code", None)
         payload["http_reason"] = str(getattr(exc, "reason", "") or "")
@@ -50,10 +53,10 @@ class OllamaClient:
         self._show_cache: Dict[str, Dict[str, Any]] = {}
 
     # ---- low level
-    def _post_stream(self, path: str, payload: dict):
+    def _post_stream(self, path: str, payload: dict, timeout: Optional[float] = None):
         req = urllib.request.Request(self.base + path, data=json.dumps(payload).encode(),
                                      headers={"Content-Type": "application/json"})
-        return urllib.request.urlopen(req, timeout=self.timeout)  # nosec B310
+        return urllib.request.urlopen(req, timeout=timeout if timeout is not None else self.timeout)  # nosec B310
 
     def _post(self, path: str, payload: dict, timeout: Optional[int] = None) -> dict:
         req = urllib.request.Request(self.base + path, data=json.dumps(payload).encode(),
@@ -124,7 +127,8 @@ class OllamaClient:
     def chat(self, model: str, prompt: str, *, images: Optional[List[str]] = None,
              system: Optional[str] = None, num_predict: int = 1024,
              num_ctx: Optional[int] = None, think: str = "auto",
-             messages: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+             messages: Optional[List[Dict[str, Any]]] = None,
+             timeout: Optional[float] = None) -> Dict[str, Any]:
         if messages is not None:
             messages = [dict(m) for m in messages]
             if system:
@@ -161,7 +165,7 @@ class OllamaClient:
         visible_times: List[float] = []
         stats: Dict[str, Any] = {}
         try:
-            with self._post_stream("/api/chat", payload) as resp:
+            with self._post_stream("/api/chat", payload, timeout=timeout) as resp:
                 for line in resp:
                     if not line:
                         continue
@@ -191,7 +195,7 @@ class OllamaClient:
                 visible_times = []
                 stats = {}
                 try:
-                    with self._post_stream("/api/chat", payload) as resp:
+                    with self._post_stream("/api/chat", payload, timeout=timeout) as resp:
                         for line in resp:
                             if not line:
                                 continue
@@ -550,7 +554,7 @@ class MockClient(OllamaClient):
         payload.update(extra)
         return payload
 
-    def chat(self, model, prompt, *, images=None, system=None, num_predict=1024, num_ctx=None, think="auto", messages=None):
+    def chat(self, model, prompt, *, images=None, system=None, num_predict=1024, num_ctx=None, think="auto", messages=None, timeout=None):
         if messages is not None and not prompt:
             prompt = "\n".join(str(m.get("content") or "") for m in messages)
         if "modelbench judge qualification request" in str(prompt).lower():
