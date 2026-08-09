@@ -1173,7 +1173,7 @@ TERMINAL_DISPOSITIONS = {
     "capability_measured_failure", "environment_limited", "operator_excluded",
     "terminal_model_failure", "terminal_thinking_only", "terminal_empty",
     "terminal_transient", "recovery_exhausted", "harness_failure", "awaiting_external_judge",
-    "awaiting_independent_judge",
+    "awaiting_independent_judge", "judge_exhausted_unavailable",
 }
 
 
@@ -1466,7 +1466,12 @@ def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_a
     child_by_source = _child_rows_by_repair_hash(paths)
     action_by_source = _recovery_actions_by_source(paths)
     judge_rows = _read_jsonl(paths.judge_results)
-    judge_by_source = {str(row.get("source_row_hash") or ""): row for row in judge_rows if row.get("status") == "judged"}
+    judge_sidecar_by_source = {
+        str(row.get("source_row_hash") or ""): row
+        for row in judge_rows
+        if row.get("status") in {"judged", "awaiting_independent_judge", "judge_exhausted_unavailable"}
+    }
+    judge_by_source = {source: row for source, row in judge_sidecar_by_source.items() if row.get("status") == "judged"}
     superseded = supersession_map(paths)
     effective: List[Dict[str, Any]] = []
     for index, row in enumerate(rows):
@@ -1490,6 +1495,7 @@ def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_a
             if child:
                 recovery_attempt_number = child.get("repair_attempt_number")
         judge_source_hash = str(row.get("judge_source_row_hash") or "")
+        judge_sidecar = judge_sidecar_by_source.get(judge_source_hash)
         judge_row = judge_by_source.get(judge_source_hash)
         if row.get("posthoc_judged") or judge_row:
             source = row
@@ -1506,7 +1512,7 @@ def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_a
             "recovery_child_id": recovery_child_id,
             "recovery_attempt_number": recovery_attempt_number,
             "judge_source_row_hash": judge_source_hash or None,
-            "judge_row_hash": _json_compact_hash(judge_row) if judge_row else None,
+            "judge_row_hash": _json_compact_hash(judge_sidecar) if judge_sidecar else None,
             "result_origin": origin,
             "effective_score": source.get("score"),
             "effective_reason": source.get("reason"),
@@ -1520,7 +1526,12 @@ def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_a
                 "recovery_action_id": (action or {}).get("action_id"),
                 "recovery_status": (action or {}).get("status"),
                 "judge_model": row.get("judge_model") or (judge_row or {}).get("judge_model"),
-                "judge_mode": row.get("judge_mode") or (judge_row or {}).get("judge_mode"),
+                "judge_model_digest": row.get("judge_model_digest") or (judge_sidecar or {}).get("judge_model_digest"),
+                "judge_mode": row.get("judge_mode") or (judge_sidecar or {}).get("judge_mode"),
+                "judge_identity": (judge_sidecar or {}).get("judge_identity"),
+                "identity_relation": (judge_sidecar or {}).get("identity_relation"),
+                "judge_failure_disposition": (judge_sidecar or {}).get("failure_disposition"),
+                "judge_pool_signature": (judge_sidecar or {}).get("judge_pool_signature"),
             },
         }
         replacement = superseded.get(primary_hash)
@@ -1550,9 +1561,11 @@ def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_a
         blockers.append("awaiting_external_judge")
     if "awaiting_independent_judge" in dispositions:
         blockers.append("awaiting_independent_judge")
+    if "judge_exhausted_unavailable" in dispositions:
+        blockers.append("judge_exhausted_unavailable")
     state = "ready_for_adoption" if not blockers else (
         "not_ready_harness_failure" if "harness_failure" in blockers else
-        "not_ready_external_judge" if "awaiting_external_judge" in blockers or "awaiting_independent_judge" in blockers else
+        "not_ready_external_judge" if "awaiting_external_judge" in blockers or "awaiting_independent_judge" in blockers or "judge_exhausted_unavailable" in blockers else
         "not_ready_manual_items"
     )
     summary = {
@@ -1578,6 +1591,8 @@ def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_a
         "subjective_eligible": sum(bool(row.get("judge_source_row_hash") or row.get("judge_model")) for row in effective),
         "judged": dispositions.count("judged"),
         "awaiting_external_judge": dispositions.count("awaiting_external_judge"),
+        "awaiting_independent_judge": dispositions.count("awaiting_independent_judge"),
+        "judge_exhausted_unavailable": dispositions.count("judge_exhausted_unavailable"),
         "harness_failure": dispositions.count("harness_failure"),
         "manual_conflicting_items": sum(d in {"conflicting_evidence/manual_review"} for d in dispositions),
         "blockers": sorted(set(blockers)),
