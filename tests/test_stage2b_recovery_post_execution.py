@@ -574,3 +574,133 @@ def test_stage2b_repeated_write_readiness_is_deterministic_with_post_reconciliat
     second_rows = paths.effective_rows.read_text()
     assert first == second
     assert first_rows == second_rows
+
+
+def _write_exact_post_with_child_final(paths, primary, *, child, persisted_child=None):
+    action = _action([primary])
+    plan = {"actions": [action], "reconciliation": {"exact": True}}
+    post = campaign.reconcile_recovery_post_execution([primary], plan, {"actions": []}, [persisted_child or child])
+    assert post["exact"] is True
+    paths.recovery_plan.write_text(json.dumps(plan, sort_keys=True))
+    paths.recovery_result.write_text(json.dumps({
+        "actions": [{"action_id": "a1", "tasks": [primary["task"]], "status": "recovered", "score": 100}],
+        "post_execution_reconciliation": post,
+    }, sort_keys=True))
+    return post
+
+
+def test_stage2b_exact_post_missing_child_raw_does_not_fallback_to_action(tmp_path):
+    paths, _ = campaign.create_campaign("stage2b_missing_final_child", models=["m"], campaigns_root=tmp_path / "campaigns")
+    primary = _primary(error_kind="empty_output")
+    paths.primary_raw_results.write_text(json.dumps(primary) + "\n")
+    _write_exact_post_with_child_final(paths, primary, child=_child(primary, score=0, child_id="child-X"))
+
+    campaign.write_readiness(paths, [primary])
+    row = json.loads(paths.effective_rows.read_text().splitlines()[0])
+    assert row["result_origin"] == "primary"
+    assert row["effective_score"] is None
+    assert row["terminal_disposition"] == "empty_output_pending_retry"
+    assert row["provenance"]["recovery_action_id"] is None
+
+
+def test_stage2b_exact_post_changed_child_score_is_non_effective(tmp_path):
+    paths, _ = campaign.create_campaign("stage2b_changed_child_score", models=["m"], campaigns_root=tmp_path / "campaigns")
+    primary = _primary(error_kind="empty_output")
+    paths.primary_raw_results.write_text(json.dumps(primary) + "\n")
+    persisted = _child(primary, score=0, reason="visible wrong", child_id="child-X")
+    _write_exact_post_with_child_final(paths, primary, child=persisted)
+    child_dir = paths.recovery_children_dir / "child-X"
+    child_dir.mkdir(parents=True)
+    child_dir.joinpath("raw_results.jsonl").write_text(json.dumps(_child(primary, score=100, child_id="child-X")) + "\n")
+
+    campaign.write_readiness(paths, [primary])
+    row = json.loads(paths.effective_rows.read_text().splitlines()[0])
+    assert row["result_origin"] == "primary"
+    assert row["effective_score"] != 100
+    assert row["terminal_disposition"] == "empty_output_pending_retry"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("task", "git_commit"),
+    ("repair_action_id", "wrong-action"),
+    ("repair_attempt_number", 2),
+])
+def test_stage2b_exact_post_child_identity_mismatch_is_non_effective(tmp_path, field, value):
+    paths, _ = campaign.create_campaign(f"stage2b_child_identity_{field}", models=["m"], campaigns_root=tmp_path / "campaigns")
+    primary = _primary(error_kind="empty_output")
+    paths.primary_raw_results.write_text(json.dumps(primary) + "\n")
+    persisted = _child(primary, score=0, child_id="child-X")
+    _write_exact_post_with_child_final(paths, primary, child=persisted)
+    modified = dict(persisted)
+    modified[field] = value
+    child_dir = paths.recovery_children_dir / "child-X"
+    child_dir.mkdir(parents=True)
+    child_dir.joinpath("raw_results.jsonl").write_text(json.dumps(modified) + "\n")
+
+    campaign.write_readiness(paths, [primary])
+    row = json.loads(paths.effective_rows.read_text().splitlines()[0])
+    assert row["result_origin"] == "primary"
+    assert row["terminal_disposition"] == "empty_output_pending_retry"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("model_digest_resolved", "changed-digest"),
+    ("repair_policy_version", "changed-policy"),
+])
+def test_stage2b_exact_post_child_digest_or_policy_mismatch_is_non_effective(tmp_path, field, value):
+    paths, _ = campaign.create_campaign(f"stage2b_child_semantic_{field}", models=["m"], campaigns_root=tmp_path / "campaigns")
+    primary = _primary(error_kind="empty_output")
+    paths.primary_raw_results.write_text(json.dumps(primary) + "\n")
+    persisted = _child(primary, score=0, child_id="child-X")
+    _write_exact_post_with_child_final(paths, primary, child=persisted)
+    modified = dict(persisted)
+    modified[field] = value
+    child_dir = paths.recovery_children_dir / "child-X"
+    child_dir.mkdir(parents=True)
+    child_dir.joinpath("raw_results.jsonl").write_text(json.dumps(modified) + "\n")
+
+    campaign.write_readiness(paths, [primary])
+    row = json.loads(paths.effective_rows.read_text().splitlines()[0])
+    assert row["result_origin"] == "primary"
+    assert row["terminal_disposition"] == "empty_output_pending_retry"
+
+
+def test_stage2b_exact_post_valid_child_uses_persisted_final_semantics(tmp_path):
+    paths, _ = campaign.create_campaign("stage2b_valid_child_final_semantics", models=["m"], campaigns_root=tmp_path / "campaigns")
+    primary = _primary(error_kind="empty_output")
+    raw_text = json.dumps(primary) + "\n"
+    paths.primary_raw_results.write_text(raw_text)
+    child = _child(primary, score=0, reason="persisted visible wrong", child_id="child-X")
+    post = _write_exact_post_with_child_final(paths, primary, child=child)
+    child_dir = paths.recovery_children_dir / "child-X"
+    child_dir.mkdir(parents=True)
+    child_dir.joinpath("raw_results.jsonl").write_text(json.dumps(child) + "\n")
+    final = post["final_per_row_outcomes"][0]
+
+    campaign.write_readiness(paths, [primary])
+    row = json.loads(paths.effective_rows.read_text().splitlines()[0])
+    assert row["effective_score"] == final["score"] == 0
+    assert row["effective_reason"] == final["reason_text"]
+    assert row["terminal_disposition"] == final["disposition"] == "scored"
+    assert row["recovery_attempt_number"] == final["attempt_number"]
+    assert row["provenance"]["recovery_action_id"] == final["action_id"]
+    assert row["recovery_child_id"] == final["child_run_id"]
+    assert row["provenance"]["recovery_evidence_source"] == "child_raw"
+    assert paths.primary_raw_results.read_text() == raw_text
+
+
+def test_stage2b_legacy_no_post_reconciliation_keeps_action_compatibility(tmp_path):
+    paths, _ = campaign.create_campaign("stage2b_legacy_no_post", models=["m"], campaigns_root=tmp_path / "campaigns")
+    primary = _primary(error_kind="empty_output")
+    source = _hash(primary)
+    paths.primary_raw_results.write_text(json.dumps(primary) + "\n")
+    paths.recovery_plan.write_text(json.dumps({"actions": [{"action_id": "a1", "tasks": ["json_extract"],
+                                                            "source_row_hashes": {"json_extract": source}}]}))
+    paths.recovery_result.write_text(json.dumps({"actions": [{"action_id": "a1", "tasks": ["json_extract"],
+                                                              "status": "terminal_empty_output"}]}))
+
+    campaign.write_readiness(paths, [primary])
+    row = json.loads(paths.effective_rows.read_text().splitlines()[0])
+    assert row["result_origin"] == "recovery_terminal"
+    assert row["terminal_disposition"] == "terminal_empty"
+    assert row["provenance"]["recovery_action_id"] == "a1"

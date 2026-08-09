@@ -204,3 +204,49 @@
   - invalid post-reconciliation remains non-effective;
   - no Stage 3A or later work leaked in;
   - no prohibited real-host/model work occurred.
+
+## Final fail-closed integration corrective pass
+- Corrective baseline: `f06512bb1133a1a6926d26efe16a0d78868f9bc6`.
+- Actual HEAD before editing: `f06512bb1133a1a6926d26efe16a0d78868f9bc6`.
+- Stage 3A is not approved and was not started.
+- Required files re-read before this corrective work: `AGENTS.md`, `CODEX_START.md`, `PR_RC21POST1_ACCEPTANCE_CONTROLS.md`, `codex_prompts/stage2B.md`, `codex_logs/Session 3/stage2B.md`.
+- Residual defect addressed:
+  - `write_readiness` used persisted `final_per_row_outcomes` to locate child evidence, but still loaded recovery actions separately and could fall back to action status when an exact native final child reference was missing or invalid.
+- Implementation:
+  - exact `post_execution_reconciliation` now disables independent action fallback for effective/readiness materialization;
+  - invalid exact post-reconciliation still disables all recovery materialization;
+  - child_raw final outcomes are resolved only by the persisted source hash, task, action ID, child run ID and attempt number;
+  - referenced child rows are validated against persisted final model/digest/status/policy where positive values are present and against exact persisted score/error semantics;
+  - effective recovery rows are materialized from the persisted final outcome rather than from mutable child row semantics;
+  - action_result-only finals still materialize directly from persisted final outcomes without fabricated child directories;
+  - legacy no-post action compatibility remains unchanged.
+- Tests added/extended:
+  - exact post final pointing to a missing child_raw child does not fall back to a matching recovery action;
+  - exact post final with missing child is not marked recovered or terminal from action status;
+  - persisted final score zero cannot be changed to effective score 100 by modifying the referenced child;
+  - task, action and attempt mismatches in the referenced child are non-effective;
+  - digest and policy mismatches in the referenced child are non-effective;
+  - valid child-backed final materializes score, reason, disposition, attempt, action, child and evidence source from `final_per_row_outcomes`;
+  - valid child-backed score zero remains exactly zero;
+  - action_result-only finals remain supported;
+  - invalid post-reconciliation remains non-effective;
+  - legacy no-post action fallback remains supported;
+  - repeated readiness materialization remains deterministic;
+  - primary evidence remains byte-identical.
+- Final validation:
+  - `.venv/bin/python -m pytest tests/test_stage2b_recovery_post_execution.py -q` - passed, 64 tests.
+  - `.venv/bin/python -m pytest tests/test_stage2a_recovery_reconciliation.py tests/test_campaign_recovery_matrix.py tests/test_repair.py tests/test_rc9_context_repair.py tests/test_rc10_repair_truth.py -q` - passed, 119 tests, 11 skipped.
+  - `.venv/bin/python -m pytest tests/test_rc21_post1_acceptance_repairs.py tests/test_campaign.py tests/test_campaign_final_acceptance.py tests/test_campaign_runtime_identity_resume.py tests/test_campaign_package_integrity.py tests/test_cli_subcommands.py tests/test_config_validation.py tests/test_stage1a_judge_policy.py tests/test_stage1b_judge_qualification.py tests/test_stage1c_model_roles.py tests/test_stage1d_judge_integration.py tests/test_judge_dumps.py -q` - passed, 184 tests.
+  - Final combined validation:
+    `.venv/bin/python -m pytest tests/test_stage2b_recovery_post_execution.py tests/test_stage2a_recovery_reconciliation.py tests/test_campaign_recovery_matrix.py tests/test_repair.py tests/test_rc9_context_repair.py tests/test_rc10_repair_truth.py tests/test_rc21_post1_acceptance_repairs.py tests/test_campaign.py tests/test_campaign_final_acceptance.py tests/test_campaign_runtime_identity_resume.py tests/test_campaign_package_integrity.py tests/test_cli_subcommands.py tests/test_config_validation.py tests/test_stage1a_judge_policy.py tests/test_stage1b_judge_qualification.py tests/test_stage1c_model_roles.py tests/test_stage1d_judge_integration.py tests/test_judge_dumps.py -q` - passed, 367 tests, 11 skipped.
+  - `.venv/bin/python -m ruff check llm_modelbench/campaign.py tests/test_stage2b_recovery_post_execution.py tests/test_stage2a_recovery_reconciliation.py` - passed.
+  - `.venv/bin/python -m compileall -q llm_modelbench tests/test_stage2b_recovery_post_execution.py tests/test_stage2a_recovery_reconciliation.py` - passed.
+  - `git diff --check` - passed.
+- Manual inspection:
+  - exact post-reconciliation disables independent action fallback;
+  - missing authoritative child fails closed;
+  - changed authoritative child cannot alter effective score;
+  - action_result-only finals still work;
+  - legacy no-post behavior remains compatible;
+  - no Stage 3A or later work leaked in;
+  - no prohibited real-host/model work occurred.

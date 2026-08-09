@@ -1920,6 +1920,47 @@ def supersession_map(paths: CampaignPaths) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def _final_outcome_row(final: Dict[str, Any], *, child_run_id: Optional[str] = None) -> Dict[str, Any]:
+    return {
+        "model": final.get("model"),
+        "model_digest_resolved": final.get("model_digest"),
+        "task": final.get("task"),
+        "score": final.get("score"),
+        "reason": final.get("reason_text"),
+        "error_kind": final.get("error_kind"),
+        "status": final.get("status"),
+        "repair_source_row_hash": final.get("source_row_hash"),
+        "repair_action_id": final.get("action_id"),
+        "repair_attempt_number": final.get("attempt_number"),
+        "repair_policy_version": final.get("policy_version"),
+        "_recovery_child_id": child_run_id,
+        "evidence_source": final.get("evidence_source"),
+        "_stage2b_final_outcome": dict(final),
+    }
+
+
+def _child_matches_final_outcome(row: Dict[str, Any], final: Dict[str, Any], child_id: str) -> bool:
+    if str(row.get("repair_source_row_hash") or "") != str(final.get("source_row_hash") or ""):
+        return False
+    if str(row.get("task") or "") != str(final.get("task") or ""):
+        return False
+    if str(row.get("repair_action_id") or "") != str(final.get("action_id") or ""):
+        return False
+    if str(row.get("repair_attempt_number") or "") != str(final.get("attempt_number") or ""):
+        return False
+    if child_id != str(final.get("child_run_id") or ""):
+        return False
+    optional_checks = (
+        (final.get("model"), row.get("model")),
+        (final.get("model_digest"), row.get("model_digest_resolved") or row.get("model_digest")),
+        (final.get("status"), row.get("status") or row.get("output_classification")),
+        (final.get("policy_version"), row.get("repair_policy_version") or row.get("policy_version")),
+    )
+    if any(expected not in (None, "") and actual not in (None, "") and actual != expected for expected, actual in optional_checks):
+        return False
+    return final.get("score") == row.get("score") and final.get("error_kind") == row.get("error_kind")
+
+
 def _child_rows_by_repair_hash(paths: CampaignPaths) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
     recovery = _json_object(paths.recovery_result)
@@ -1941,33 +1982,12 @@ def _child_rows_by_repair_hash(paths: CampaignPaths) -> Dict[str, Dict[str, Any]
             key = f"{source}:{task}"
             if final.get("evidence_source") == "child_raw":
                 child_id = str(final.get("child_run_id") or "")
-                attempt = int(final.get("attempt_number") or 0)
                 for row in raw_by_child.get(child_id, []):
-                    if (
-                        str(row.get("repair_source_row_hash") or "") == source
-                        and str(row.get("task") or "") == task
-                        and str(row.get("repair_action_id") or "") == str(final.get("action_id") or "")
-                        and int(row.get("repair_attempt_number") or 0) == attempt
-                    ):
-                        out[key] = row | {"_stage2b_final_outcome": dict(final)}
+                    if _child_matches_final_outcome(row, final, child_id):
+                        out[key] = _final_outcome_row(final, child_run_id=child_id)
                         break
                 continue
-            out[key] = {
-                "model": final.get("model"),
-                "model_digest_resolved": final.get("model_digest"),
-                "task": task,
-                "score": final.get("score"),
-                "reason": final.get("reason_text"),
-                "error_kind": final.get("error_kind"),
-                "status": final.get("status"),
-                "repair_source_row_hash": source,
-                "repair_action_id": final.get("action_id"),
-                "repair_attempt_number": final.get("attempt_number"),
-                "repair_policy_version": final.get("policy_version"),
-                "_recovery_child_id": final.get("child_run_id") or None,
-                "evidence_source": final.get("evidence_source"),
-                "_stage2b_final_outcome": dict(final),
-            }
+            out[key] = _final_outcome_row(final, child_run_id=final.get("child_run_id") or None)
         return out
     valid_sources = {
         str(item.get("source_row_hash") or "")
@@ -2038,7 +2058,9 @@ def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_a
     manifest = load_manifest(paths)
     raw_primary_rows = _read_jsonl(paths.primary_raw_results)
     child_by_source = _child_rows_by_repair_hash(paths)
-    action_by_source = _recovery_actions_by_source(paths)
+    recovery = _json_object(paths.recovery_result)
+    has_post_reconciliation = bool(recovery.get("post_execution_reconciliation"))
+    action_by_source = {} if has_post_reconciliation else _recovery_actions_by_source(paths)
     judge_rows = _read_jsonl(paths.judge_results)
     judge_sidecar_by_source = {
         str(row.get("source_row_hash") or ""): row
@@ -2097,7 +2119,7 @@ def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_a
             "provenance": {
                 "campaign_id": paths.campaign_id,
                 "primary_run_id": "primary",
-                "recovery_action_id": (action or {}).get("action_id"),
+                "recovery_action_id": (child or {}).get("repair_action_id") or (action or {}).get("action_id"),
                 "recovery_status": (action or {}).get("status"),
                 "recovery_evidence_source": ((child or {}).get("_stage2b_final_outcome") or {}).get("evidence_source"),
                 "judge_model": row.get("judge_model") or (judge_row or {}).get("judge_model"),
