@@ -99,3 +99,57 @@
 
 ## Safety confirmation
 - No real Ollama, llama.cpp, Selene, judge, benchmark, campaign recovery against production evidence, GPU, model pull/delete, service/KV mutation, adoption, canonical ranking mutation or push occurred.
+
+## Corrective pass after independent review
+- Corrective baseline: `065262c5d54fbae4b33ab4ee8786fed8367bd5f7`.
+- Stage 3A is not approved and was not started.
+- Required files re-read before corrective work: `AGENTS.md`, `CODEX_START.md`, `PR_RC21POST1_ACCEPTANCE_CONTROLS.md`, `codex_prompts/stage2B.md`, `codex_logs/Session 3/stage2B.md`.
+- Residual defects addressed:
+  - post-execution provenance recorded action, child, attempt and policy fields but did not validate all of them;
+  - sequential bounded attempts for one source were treated as duplicate final outcomes;
+  - execution resolved evidence with global `child_rows OR action_result_rows`, which could suppress unrelated action-result evidence.
+- Implementation:
+  - validates child/action `action_id` against the Stage 2A owning action;
+  - rejects native child evidence with missing action ID, missing child run ID, invalid attempt number, or missing/mismatched policy version;
+  - validates policy version against the repair plan policy version when present;
+  - preserves deterministic `attempt_history`;
+  - derives exactly one `final_per_row_outcomes` entry per planned source from the highest valid bounded attempt;
+  - permits legitimate multi-attempt bounded histories without duplicate failure;
+  - rejects duplicate/conflicting evidence for the same source/action/attempt;
+  - distinguishes `evidence_source = child_raw` from `evidence_source = action_result`;
+  - suppresses aggregate action-result attempt metadata when valid child raw evidence exists for that exact source/task/attempt, but still allows explicit row-outcome action metadata to reveal contradictions;
+  - resolves child raw and action-result evidence per source instead of globally.
+- Tests added/extended:
+  - wrong action ID fails;
+  - missing native child action ID fails;
+  - invalid native attempt numbers fail;
+  - contradictory native policy version fails;
+  - complete child action/attempt/policy provenance succeeds;
+  - legitimate two-attempt chain does not fail as duplicate;
+  - three-attempt chain ending in visible score 0 has final `scored` outcome;
+  - repeated bounded transient attempts end in terminal transient;
+  - same action/same attempt incompatible rows fail;
+  - incompatible child and explicit action-result row outcomes fail;
+  - deterministic attempt history and one final outcome per source;
+  - mixed child/action-result evidence resolves H1 and H2 independently;
+  - child evidence for one source does not suppress action-result evidence for another source.
+- Corrective validation:
+  - `.venv/bin/python -m pytest tests/test_stage2b_recovery_post_execution.py -q` - passed, 44 tests.
+  - `.venv/bin/python -m pytest tests/test_stage2a_recovery_reconciliation.py tests/test_campaign_recovery_matrix.py tests/test_repair.py tests/test_rc9_context_repair.py tests/test_rc10_repair_truth.py -q` - passed, 119 tests, 11 skipped.
+  - `.venv/bin/python -m pytest tests/test_rc21_post1_acceptance_repairs.py tests/test_campaign.py tests/test_campaign_final_acceptance.py tests/test_campaign_runtime_identity_resume.py tests/test_campaign_package_integrity.py tests/test_cli_subcommands.py tests/test_config_validation.py tests/test_stage1a_judge_policy.py tests/test_stage1b_judge_qualification.py tests/test_stage1c_model_roles.py tests/test_stage1d_judge_integration.py tests/test_judge_dumps.py -q` - passed after policy-version correction.
+  - Final combined corrective validation:
+    `.venv/bin/python -m pytest tests/test_stage2b_recovery_post_execution.py tests/test_stage2a_recovery_reconciliation.py tests/test_campaign_recovery_matrix.py tests/test_repair.py tests/test_rc9_context_repair.py tests/test_rc10_repair_truth.py tests/test_rc21_post1_acceptance_repairs.py tests/test_campaign.py tests/test_campaign_final_acceptance.py tests/test_campaign_runtime_identity_resume.py tests/test_campaign_package_integrity.py tests/test_cli_subcommands.py tests/test_config_validation.py tests/test_stage1a_judge_policy.py tests/test_stage1b_judge_qualification.py tests/test_stage1c_model_roles.py tests/test_stage1d_judge_integration.py tests/test_judge_dumps.py -q` - passed, 347 tests, 11 skipped.
+  - `.venv/bin/python -m ruff check llm_modelbench/campaign.py tests/test_stage2b_recovery_post_execution.py tests/test_stage2a_recovery_reconciliation.py` - passed.
+  - `.venv/bin/python -m compileall -q llm_modelbench tests/test_stage2b_recovery_post_execution.py tests/test_stage2a_recovery_reconciliation.py` - passed.
+  - `git diff --check` - passed.
+- Corrective manual inspection:
+  - action identity cannot contradict the plan;
+  - native child/attempt/policy provenance is checked truthfully;
+  - bounded attempt history is retained and no longer mistaken for duplicate final evidence;
+  - duplicate or conflicting same-attempt/final evidence still fails;
+  - exactly one final outcome is produced per planned source on exact success;
+  - mixed child/action-result evidence resolves per source;
+  - child evidence for one source cannot suppress action-result evidence for another;
+  - visible final score 0 remains `scored`;
+  - no Stage 3A or later work leaked in;
+  - no prohibited real-host/model work occurred.

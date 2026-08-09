@@ -28,7 +28,7 @@ def _action(rows, *, action_id="a1", status="recovered"):
 
 
 def _child(source, *, task=None, score=100, error_kind=None, reason="ok", model="m", digest="d", action_id="a1",
-           child_id="child", attempt=1):
+           child_id="child", attempt=1, policy_version=campaign.RECOVERY_POLICY_VERSION):
     row = {
         "model": model,
         "model_digest_resolved": digest,
@@ -38,9 +38,10 @@ def _child(source, *, task=None, score=100, error_kind=None, reason="ok", model=
         "repair_source_row_hash": _hash(source),
         "repair_action_id": action_id,
         "repair_attempt_number": attempt,
-        "repair_policy_version": campaign.RECOVERY_POLICY_VERSION,
         "_recovery_child_id": child_id,
     }
+    if policy_version is not None:
+        row["repair_policy_version"] = policy_version
     if error_kind is not None:
         row["error_kind"] = error_kind
         row["score"] = None
@@ -128,6 +129,47 @@ def test_stage2b_contradictory_child_digest_fails():
     assert evidence["invalid_child_attributions"][0]["reason"] == "model_digest_source_mismatch"
 
 
+def test_stage2b_wrong_action_id_for_correct_source_task_digest_fails():
+    source = _primary("json_extract", error_kind="empty_output")
+    evidence = _stage2b([source], [_action([source], action_id="a1")], [_child(source, action_id="a2")])
+    assert evidence["exact"] is False
+    assert evidence["invalid_child_attributions"][0]["reason"] == "action_id_mismatch"
+
+
+def test_stage2b_native_child_missing_action_id_fails():
+    source = _primary("json_extract", error_kind="empty_output")
+    child = _child(source, action_id=None)
+    evidence = _stage2b([source], [_action([source])], [child])
+    assert evidence["exact"] is False
+    assert evidence["invalid_child_attributions"][0]["reason"] == "missing_action_id"
+
+
+@pytest.mark.parametrize("attempt", [None, 0, -1, "not-a-number"])
+def test_stage2b_invalid_native_attempt_number_fails(attempt):
+    source = _primary("json_extract", error_kind="empty_output")
+    evidence = _stage2b([source], [_action([source])], [_child(source, attempt=attempt)])
+    assert evidence["exact"] is False
+    assert evidence["invalid_child_attributions"][0]["reason"] == "invalid_attempt_number"
+
+
+def test_stage2b_contradictory_native_policy_version_fails():
+    source = _primary("json_extract", error_kind="empty_output")
+    evidence = _stage2b([source], [_action([source])], [_child(source, policy_version="old-policy")])
+    assert evidence["exact"] is False
+    assert evidence["invalid_child_attributions"][0]["reason"] == "policy_version_mismatch"
+
+
+def test_stage2b_valid_full_child_provenance_succeeds():
+    source = _primary("json_extract", error_kind="empty_output")
+    evidence = _stage2b([source], [_action([source])], [_child(source, child_id="child-a", attempt=1)])
+    assert evidence["exact"] is True
+    outcome = evidence["final_per_row_outcomes"][0]
+    assert outcome["action_id"] == "a1"
+    assert outcome["child_run_id"] == "child-a"
+    assert outcome["attempt_number"] == 1
+    assert outcome["policy_version"] == campaign.RECOVERY_POLICY_VERSION
+
+
 def test_stage2b_duplicate_child_attribution_fails():
     source = _primary(error_kind="empty_output")
     evidence = _stage2b([source], [_action([source])], [
@@ -135,7 +177,60 @@ def test_stage2b_duplicate_child_attribution_fails():
         _child(source, child_id="c2"),
     ])
     assert evidence["exact"] is False
-    assert evidence["duplicate_recovery_source_row_hashes"] == [_hash(source)]
+    assert evidence["invalid_child_attributions"][0]["reason"] == "duplicate_attempt_number"
+
+
+def test_stage2b_legitimate_two_attempt_chain_is_not_duplicate():
+    source = _primary(error_kind="thinking_only")
+    evidence = _stage2b([source], [_action([source])], [
+        _child(source, score=None, error_kind="thinking_only", child_id="c1", attempt=1),
+        _child(source, score=100, child_id="c2", attempt=2),
+    ])
+    assert evidence["exact"] is True
+    assert [item["attempt_number"] for item in evidence["attempt_history"]] == [1, 2]
+    assert evidence["final_per_row_outcomes"][0]["disposition"] == "scored"
+
+
+def test_stage2b_three_attempt_chain_ending_visible_zero_final_scored():
+    source = _primary(error_kind="thinking_only")
+    evidence = _stage2b([source], [_action([source])], [
+        _child(source, score=None, error_kind="thinking_only", child_id="c1", attempt=1),
+        _child(source, score=None, error_kind="empty_output", child_id="c2", attempt=2),
+        _child(source, score=0, reason="visible wrong", child_id="c3", attempt=3),
+    ])
+    assert evidence["exact"] is True
+    assert evidence["final_per_row_outcomes"][0]["disposition"] == "scored"
+    assert evidence["final_per_row_outcomes"][0]["score"] == 0
+
+
+def test_stage2b_bounded_repeated_transient_attempts_final_terminal_transient():
+    source = _primary(error_kind="timeout")
+    evidence = _stage2b([source], [_action([source])], [
+        _child(source, score=None, error_kind="timeout", child_id="c1", attempt=1),
+        _child(source, score=None, error_kind="timeout", child_id="c2", attempt=2),
+    ])
+    assert evidence["exact"] is True
+    assert evidence["final_per_row_outcomes"][0]["disposition"] == "terminal_transient"
+
+
+def test_stage2b_same_action_same_attempt_incompatible_rows_fail():
+    source = _primary(error_kind="empty_output")
+    evidence = _stage2b([source], [_action([source])], [
+        _child(source, score=100, reason="ok", child_id="c1", attempt=1),
+        _child(source, score=0, reason="wrong", child_id="c2", attempt=1),
+    ])
+    assert evidence["exact"] is False
+    assert evidence["invalid_child_attributions"][0]["reason"] == "duplicate_attempt_number"
+
+
+def test_stage2b_incompatible_child_and_action_result_for_same_source_fails():
+    source = _primary(error_kind="empty_output")
+    plan = {"actions": [_action([source])], "reconciliation": {"exact": True}}
+    result = {"actions": [{"action_id": "a1", "tasks": ["json_extract"], "status": "terminal_empty_output",
+                           "error_kind": "empty_output", "score": None}]}
+    evidence = campaign.reconcile_recovery_post_execution([source], plan, result, [_child(source, score=100)])
+    assert evidence["exact"] is False
+    assert any(item["reason"] == "conflicting_attempt_evidence" for item in evidence["invalid_child_attributions"])
 
 
 def test_stage2b_grouped_action_all_rows_resolved_succeeds():
@@ -187,6 +282,44 @@ def test_stage2b_primary_evidence_immutable_and_reconciliation_idempotent(tmp_pa
     second = _stage2b(rows, [action], [child])
     assert first == second
     assert path.read_bytes() == before
+
+
+def test_stage2b_attempt_history_and_final_outcomes_are_deterministic():
+    source = _primary(error_kind="thinking_only")
+    children = [
+        _child(source, score=0, child_id="c3", attempt=3),
+        _child(source, score=None, error_kind="thinking_only", child_id="c1", attempt=1),
+        _child(source, score=None, error_kind="empty_output", child_id="c2", attempt=2),
+    ]
+    first = _stage2b([source], [_action([source])], children)
+    second = _stage2b([source], [_action([source])], list(reversed(children)))
+    assert first["attempt_history"] == second["attempt_history"]
+    assert len(first["final_per_row_outcomes"]) == 1
+    assert first["final_per_row_outcomes"][0]["attempt_number"] == 3
+
+
+def test_stage2b_mixed_child_and_action_result_evidence_resolves_per_source():
+    h1 = _primary("json_extract", error_kind="empty_output")
+    h2 = _primary("git_commit", error_kind="thinking_only")
+    plan = {"actions": [_action([h1, h2])], "reconciliation": {"exact": True}}
+    result = {"actions": [{"action_id": "a1", "tasks": ["git_commit"], "status": "recovered",
+                           "score": 0, "reason": "visible wrong"}]}
+    evidence = campaign.reconcile_recovery_post_execution([h1, h2], plan, result, [_child(h1, score=100)])
+    assert evidence["exact"] is True
+    outcomes = {item["source_row_hash"]: item for item in evidence["final_per_row_outcomes"]}
+    assert outcomes[_hash(h1)]["evidence_source"] == "child_raw"
+    assert outcomes[_hash(h2)]["evidence_source"] == "action_result"
+
+
+def test_stage2b_child_for_one_source_does_not_suppress_action_result_for_another():
+    h1 = _primary("json_extract", error_kind="empty_output")
+    h2 = _primary("git_commit", error_kind="thinking_only")
+    plan = {"actions": [_action([h1, h2])], "reconciliation": {"exact": True}}
+    result = {"actions": [{"action_id": "a1", "tasks": ["git_commit"], "status": "timeout",
+                           "error_kind": "timeout", "score": None}]}
+    evidence = campaign.reconcile_recovery_post_execution([h1, h2], plan, result, [_child(h1, score=100)])
+    assert evidence["exact"] is True
+    assert {item["source_row_hash"] for item in evidence["final_per_row_outcomes"]} == {_hash(h1), _hash(h2)}
 
 
 def test_stage2b_execute_persists_post_reconciliation(tmp_path):
