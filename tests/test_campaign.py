@@ -622,6 +622,7 @@ def test_execute_recovery_phase_persists_attempt_and_preserves_primary(tmp_path)
     before = paths.primary_raw_results.read_bytes()
     class Plan:
         def to_dict(self): return {"actions": [{"action_id": "a1", "kind": "retry_generation",
+                                                "tasks": ["exact"],
                                                 "source_row_hashes": {"exact": source}}]}
     def build(*args, **kwargs): return Plan()
     def apply(*args, **kwargs):

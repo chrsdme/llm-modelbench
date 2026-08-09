@@ -26,7 +26,15 @@ def _plan_for(*rows, duplicate=False, include_unexpected=None):
     if include_unexpected:
         source_map[str(include_unexpected["task"])] = _hash(include_unexpected)
     return {"actions": [{"action_id": "a1", "kind": "retry_generation", "model": "m",
-                         "model_digest": "d", "source_row_hashes": source_map}]}
+                         "model_digest": "d", "tasks": sorted(source_map),
+                         "source_row_hashes": source_map}]}
+
+
+def _single_action(task, source, **overrides):
+    action = {"action_id": "a1", "kind": "retry_generation", "model": "m",
+              "model_digest": "d", "tasks": [task], "source_row_hashes": {task: source}}
+    action.update(overrides)
+    return {"actions": [action]}
 
 
 @pytest.mark.parametrize("task_id", OMITTED_TASKS)
@@ -131,6 +139,121 @@ def test_stage2a_unattributed_native_action_fails():
         campaign.assert_recovery_reconciled([row], {"actions": [{"action_id": "a1", "kind": "retry_generation"}]})
 
 
+def test_stage2a_correct_hash_wrong_task_mapping_fails():
+    row = _row("json_extract", error_kind="empty_output")
+    plan = _single_action("git_commit", _hash(row), tasks=["git_commit"])
+    evidence = campaign.recovery_reconciliation_evidence([row], plan)
+    assert evidence["invalid_planned_attributions"][0]["reason"] == "task_source_mismatch"
+    assert evidence["exact"] is False
+    with pytest.raises(campaign.CampaignError, match="recovery_plan_incomplete"):
+        campaign.assert_recovery_reconciled([row], plan)
+
+
+def test_stage2a_source_mapping_key_must_be_declared_by_action_tasks():
+    row = _row("json_extract", error_kind="empty_output")
+    plan = {"actions": [{"action_id": "a1", "kind": "retry_generation", "model": "m",
+                         "model_digest": "d", "tasks": ["git_commit"],
+                         "source_row_hashes": {"json_extract": _hash(row)}}]}
+    evidence = campaign.recovery_reconciliation_evidence([row], plan)
+    assert {item["reason"] for item in evidence["invalid_planned_attributions"]} == {
+        "action_task_mapping_mismatch", "missing_task_source_mapping",
+    }
+    with pytest.raises(campaign.CampaignError, match="recovery_plan_incomplete"):
+        campaign.assert_recovery_reconciled([row], plan)
+
+
+def test_stage2a_action_task_requires_source_mapping():
+    row = _row("json_extract", error_kind="empty_output")
+    plan = {"actions": [{"action_id": "a1", "kind": "retry_generation", "model": "m",
+                         "model_digest": "d", "tasks": ["json_extract", "git_commit"],
+                         "source_row_hashes": {"json_extract": _hash(row)}}]}
+    evidence = campaign.recovery_reconciliation_evidence([row], plan)
+    assert evidence["invalid_planned_attributions"][0]["reason"] == "missing_task_source_mapping"
+    with pytest.raises(campaign.CampaignError, match="recovery_plan_incomplete"):
+        campaign.assert_recovery_reconciled([row], plan)
+
+
+def test_stage2a_contradictory_model_digest_fails():
+    row = _row("json_extract", model="model-A", model_digest_resolved="digest-A", error_kind="empty_output")
+    plan = {"actions": [{"action_id": "a1", "kind": "retry_generation", "model": "model-B",
+                         "model_digest": "digest-B", "tasks": ["json_extract"],
+                         "source_row_hashes": {"json_extract": _hash(row)}}]}
+    evidence = campaign.recovery_reconciliation_evidence([row], plan)
+    assert evidence["invalid_planned_attributions"][0]["reason"] == "model_digest_source_mismatch"
+    with pytest.raises(campaign.CampaignError, match="recovery_plan_incomplete"):
+        campaign.assert_recovery_reconciled([row], plan)
+
+
+def test_stage2a_matching_task_model_digest_succeeds():
+    row = _row("json_extract", model="model-A", model_digest_resolved="digest-A", error_kind="empty_output")
+    plan = {"actions": [{"action_id": "a1", "kind": "retry_generation", "model": "model-A",
+                         "model_digest": "digest-A", "tasks": ["json_extract"],
+                         "source_row_hashes": {"json_extract": _hash(row)}}]}
+    assert campaign.assert_recovery_reconciled([row], plan)["exact"] is True
+
+
+def test_stage2a_grouped_multi_task_native_action_succeeds():
+    rows = [
+        _row("json_extract", model="model-A", model_digest_resolved="digest-A", error_kind="empty_output"),
+        _row("git_commit", model="model-A", model_digest_resolved="digest-A", error_kind="thinking_only"),
+    ]
+    plan = {"actions": [{"action_id": "a1", "kind": "capability_gate", "model": "model-A",
+                         "model_digest": "digest-A", "tasks": ["json_extract", "git_commit"],
+                         "source_row_hashes": {row["task"]: _hash(row) for row in rows}}]}
+    assert campaign.assert_recovery_reconciled(rows, plan)["exact"] is True
+
+
+def test_stage2a_grouped_multi_task_wrong_pair_fails_whole_reconciliation():
+    rows = [
+        _row("json_extract", model="model-A", model_digest_resolved="digest-A", error_kind="empty_output"),
+        _row("git_commit", model="model-A", model_digest_resolved="digest-A", error_kind="thinking_only"),
+    ]
+    plan = {"actions": [{"action_id": "a1", "kind": "capability_gate", "model": "model-A",
+                         "model_digest": "digest-A", "tasks": ["json_extract", "git_commit"],
+                         "source_row_hashes": {
+                             "json_extract": _hash(rows[1]),
+                             "git_commit": _hash(rows[0]),
+                         }}]}
+    evidence = campaign.recovery_reconciliation_evidence(rows, plan)
+    assert {item["reason"] for item in evidence["invalid_planned_attributions"]} == {"task_source_mismatch"}
+    with pytest.raises(campaign.CampaignError, match="recovery_plan_incomplete"):
+        campaign.assert_recovery_reconciled(rows, plan)
+
+
+@pytest.mark.parametrize("text", [
+    "expected 5 keys but received 4",
+    "parser rejected 5 malformed fields",
+    "validation failed after 5 attempts",
+    "model returned 50 tokens instead of the required structure",
+])
+def test_stage2a_legacy_digit_five_prose_is_not_transient_retry(text):
+    assert campaign.classify_recovery_row(_row(reason=text))["retry"] is False
+
+
+@pytest.mark.parametrize("text", [
+    "request timeout",
+    "timed out waiting for backend",
+    "HTTP 500 Internal Server Error",
+    "HTTP/1.1 503 Service Unavailable",
+    "HTTP/1.1 502 Bad Gateway",
+])
+def test_stage2a_narrow_legacy_transport_text_is_transient_generation_retry(text):
+    state = campaign.classify_recovery_row(_row(reason=text))
+    assert state["retry"] is True
+    assert state["disposition"] == "transient_retry_pending"
+
+
+def test_stage2a_legacy_http_500_text_in_judge_lane_is_not_generation_recovery():
+    state = campaign.classify_recovery_row(_row(reason="HTTP 500 Internal Server Error", evidence_lane="judge"))
+    assert state["retry"] is False
+
+
+@pytest.mark.parametrize("kind", ["timeout", "transient_backend_failure"])
+def test_stage2a_typed_transient_generation_behavior_remains(kind):
+    assert campaign.classify_recovery_row(_row(error_kind=kind))["retry"] is True
+    assert campaign.classify_recovery_row(_row(error_kind=kind, evidence_lane="judge"))["retry"] is False
+
+
 class _Plan:
     def __init__(self, actions):
         self._actions = actions
@@ -164,6 +287,25 @@ def test_stage2a_failed_reconciliation_prevents_execution_callback(tmp_path, act
         )
     assert calls == []
     persisted = json.loads(paths.recovery_plan.read_text())
+    assert persisted["reconciliation"]["exact"] is False
+    assert paths.primary_raw_results.read_bytes() == before
+
+
+def test_stage2a_failed_semantic_attribution_prevents_execution_and_is_persisted(tmp_path):
+    primary = _row("json_extract", error_kind="empty_output")
+    paths, before = _execute_fixture(tmp_path, primary)
+    actions = [{"action_id": "a1", "kind": "retry_generation", "model": "m", "model_digest": "d",
+                "tasks": ["git_commit"], "source_row_hashes": {"git_commit": _hash(primary)}}]
+    calls = []
+    with pytest.raises(campaign.CampaignError, match="recovery_plan_incomplete"):
+        campaign.execute_recovery_phase(
+            paths, object(), object(),
+            build_plan_fn=lambda *a, **k: _Plan(actions),
+            apply_plan_fn=lambda *a, **k: calls.append("called") or {"actions": []},
+        )
+    assert calls == []
+    persisted = json.loads(paths.recovery_plan.read_text())
+    assert persisted["reconciliation"]["invalid_planned_attributions"][0]["reason"] == "task_source_mismatch"
     assert persisted["reconciliation"]["exact"] is False
     assert paths.primary_raw_results.read_bytes() == before
 

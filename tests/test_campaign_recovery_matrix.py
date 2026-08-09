@@ -10,6 +10,7 @@ class Plan:
 
     def to_dict(self):
         return {"actions": [{"action_id": "a1", "kind": "retry_generation",
+                             "tasks": ["exact"],
                              "source_row_hashes": {"exact": self.source}}]}
 
 

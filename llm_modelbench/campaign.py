@@ -1181,6 +1181,12 @@ JUDGE_RECOVERY_TERMINAL_STATES = {
     "judge_output_failure",
 }
 TRANSIENT_GENERATION_ERROR_KINDS = {"timeout", "transient_backend_failure"}
+LEGACY_TRANSIENT_TEXT_RE = re.compile(
+    r"\b(?:request\s+)?time(?:d)?\s*out\b|\btimeout\b|"
+    r"\bhttp(?:/\d(?:\.\d)?)?\s+(?:500|502|503|504)\b|"
+    r"\b(?:server|backend)\s+5xx\s+response\b",
+    re.I,
+)
 
 
 def visible_answer(row: Dict[str, Any]) -> bool:
@@ -1236,7 +1242,7 @@ def classify_recovery_row(row: Dict[str, Any]) -> Dict[str, Any]:
         return {"disposition": "empty_output_pending_retry", "retry": True, "reason": kind}
     if kind in TRANSIENT_GENERATION_ERROR_KINDS:
         return {"disposition": "transient_retry_pending", "retry": True, "reason": kind}
-    if "timeout" in text or " 5" in text or "http" in text and "5" in text:
+    if LEGACY_TRANSIENT_TEXT_RE.search(text):
         return {"disposition": "transient_retry_pending", "retry": True, "reason": "transient transport failure"}
     if kind == "harness_error":
         return {"disposition": "harness_failure", "retry": False, "reason": kind}
@@ -1267,6 +1273,30 @@ def _sorted_identities(values: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]
             str(item.get("action_id") or ""),
         ),
     )
+
+
+def _action_declared_tasks(action: Dict[str, Any]) -> List[str]:
+    declared = [str(task) for task in (action.get("tasks") or []) if str(task)]
+    single = str(action.get("task") or "")
+    if single and single not in declared:
+        declared.append(single)
+    return sorted(set(declared))
+
+
+def _invalid_attribution(action: Dict[str, Any], index: int, task: str, source_hash: str,
+                         reason: str, source_row: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return {
+        "action_index": index,
+        "action_id": action.get("action_id"),
+        "source_row_hash": source_hash,
+        "declared_task": task,
+        "actual_source_task": (source_row or {}).get("task"),
+        "declared_model": action.get("model"),
+        "actual_source_model": (source_row or {}).get("model"),
+        "declared_digest": action.get("model_digest") or action.get("model_digest_resolved"),
+        "actual_source_digest": (source_row or {}).get("model_digest_resolved") or (source_row or {}).get("model_digest"),
+        "reason": reason,
+    }
 
 
 def reconcile_recovery_rows(rows: List[Dict[str, Any]], *, excluded: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
@@ -1332,28 +1362,74 @@ def recovery_reconciliation_evidence(rows: List[Dict[str, Any]], plan: Dict[str,
     actions = list(plan.get("actions") or [])
     eligible_set = set(reconciliation["eligible_source_row_hashes"])
     excluded_set = {str(item["source_row_hash"]) for item in reconciliation["explicit_exclusions"]}
+    rows_by_source: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        rows_by_source.setdefault(_primary_row_hash(row), []).append(row)
     planned: List[str] = []
     planned_identities: List[Dict[str, Any]] = []
     unattributed: List[Dict[str, Any]] = []
+    invalid_attributions: List[Dict[str, Any]] = []
     for index, action in enumerate(actions):
         source_map = action.get("source_row_hashes") or {}
         if not source_map:
             unattributed.append({"action_index": index, "action_id": action.get("action_id"), "reason": "missing_source_row_hashes"})
             continue
+        declared_tasks = _action_declared_tasks(action)
+        mapped_tasks = {str(task) for task in source_map}
+        if native:
+            for task in sorted(mapped_tasks - set(declared_tasks)):
+                invalid_attributions.append(_invalid_attribution(
+                    action, index, task, str(source_map.get(task) or ""), "action_task_mapping_mismatch",
+                ))
+            for task in sorted(set(declared_tasks) - mapped_tasks):
+                invalid_attributions.append(_invalid_attribution(
+                    action, index, task, "", "missing_task_source_mapping",
+                ))
         for task, source in sorted(source_map.items()):
+            task_text = str(task)
             source_text = str(source or "")
             if not source_text:
                 unattributed.append({
                     "action_index": index,
                     "action_id": action.get("action_id"),
-                    "task": str(task),
+                    "task": task_text,
                     "reason": "empty_source_row_hash",
                 })
                 continue
             planned.append(source_text)
+            source_rows = rows_by_source.get(source_text, [])
+            source_row = source_rows[0] if len(source_rows) == 1 else None
+            if native:
+                if not source_rows:
+                    invalid_attributions.append(_invalid_attribution(
+                        action, index, task_text, source_text, "source_hash_not_found",
+                    ))
+                elif len(source_rows) > 1:
+                    invalid_attributions.append(_invalid_attribution(
+                        action, index, task_text, source_text, "ambiguous_source_hash",
+                    ))
+                else:
+                    actual_task = str(source_row.get("task") or "")
+                    if task_text != actual_task:
+                        invalid_attributions.append(_invalid_attribution(
+                            action, index, task_text, source_text, "task_source_mismatch", source_row,
+                        ))
+                    declared_digest = str(action.get("model_digest") or action.get("model_digest_resolved") or "")
+                    actual_digest = str(source_row.get("model_digest_resolved") or source_row.get("model_digest") or "")
+                    if declared_digest and actual_digest and declared_digest != actual_digest:
+                        invalid_attributions.append(_invalid_attribution(
+                            action, index, task_text, source_text, "model_digest_source_mismatch", source_row,
+                        ))
+                    elif not (declared_digest and actual_digest):
+                        declared_model = str(action.get("model") or "")
+                        actual_model = str(source_row.get("model") or "")
+                        if declared_model and actual_model and declared_model != actual_model:
+                            invalid_attributions.append(_invalid_attribution(
+                                action, index, task_text, source_text, "model_source_mismatch", source_row,
+                            ))
             planned_identities.append({
                 "source_row_hash": source_text,
-                "task": str(task),
+                "task": task_text,
                 "model": str(action.get("model") or ""),
                 "model_digest": str(action.get("model_digest") or ""),
                 "action_id": str(action.get("action_id") or ""),
@@ -1372,6 +1448,7 @@ def recovery_reconciliation_evidence(rows: List[Dict[str, Any]], plan: Dict[str,
         and not unexpected_planned
         and not unexpected_exclusions
         and not duplicate_planned
+        and not invalid_attributions
         and not reconciliation["invalid_exclusions"]
         and not missing
         and (not native or not unattributed)
@@ -1386,6 +1463,7 @@ def recovery_reconciliation_evidence(rows: List[Dict[str, Any]], plan: Dict[str,
         "overlapping_planned_and_excluded_source_row_hashes": overlap,
         "duplicate_planned_source_row_hashes": duplicate_planned,
         "unattributed_plan_actions": unattributed,
+        "invalid_planned_attributions": _sorted_identities(invalid_attributions),
         "native_plan": bool(native),
         "exact": exact,
         "balanced": exact,

@@ -83,3 +83,50 @@
 ## Safety confirmation
 - No real Ollama, llama.cpp, Selene, judge, benchmark, campaign recovery, GPU, model pull/delete, service/KV mutation, adoption, canonical ranking mutation or push occurred.
 - Stage 2B was not started.
+
+## Corrective pass after independent review
+- Corrective baseline: `38f1b8acd301597214b7bf5bc4a25becda115d50`.
+- Stage 2B remains not approved and was not started.
+- Required files re-read before corrective work: `AGENTS.md`, `CODEX_START.md`, `PR_RC21POST1_ACCEPTANCE_CONTROLS.md`, `codex_prompts/stage2A.md`, `codex_logs/Session 3/stage2A.md`.
+- Residual defects addressed:
+  - native source-hash set reconciliation did not validate task/model semantics for each source attribution;
+  - legacy transient text fallback was too broad because arbitrary prose containing a digit `5` could become transient recovery eligibility.
+- Implementation:
+  - added narrow `LEGACY_TRANSIENT_TEXT_RE` for legacy generation transport failures, preserving typed `timeout` / `transient_backend_failure`;
+  - removed the broad `" 5"` / loose HTTP text classifier;
+  - added native action declared-task extraction and invalid attribution evidence;
+  - validated every native `source_row_hashes[task] = hash` against the exact primary row resolved by hash;
+  - rejected source hash not found, ambiguous hash, task/source mismatch, action task mapping mismatch, missing task source mapping, model mismatch where digest is absent, and digest mismatch where both digests are present;
+  - kept grouped multi-task action support by validating each task/hash pair independently;
+  - kept failed reconciliation persistence before the execution boundary.
+- Tests added/extended:
+  - wrong task mapping fails;
+  - source mapping key absent from `action.tasks` fails;
+  - declared action task missing a source mapping fails;
+  - contradictory model digest fails;
+  - matching task/model/digest succeeds;
+  - grouped multi-task attribution succeeds;
+  - grouped attribution with one wrong pair fails;
+  - arbitrary digit-5 prose is not transient;
+  - narrow legacy timeout/HTTP 5xx text remains generation-transient;
+  - same HTTP 500 text in the judge lane is not generation recovery;
+  - typed transient generation and judge-lane behavior remain unchanged;
+  - semantic attribution failure prevents `apply_plan_fn`, persists invalid attribution evidence, and preserves primary raw bytes.
+- Corrective validation:
+  - `.venv/bin/python -m pytest tests/test_stage2a_recovery_reconciliation.py -q` - passed, 54 tests.
+  - `.venv/bin/python -m pytest tests/test_repair.py tests/test_rc9_context_repair.py tests/test_rc10_repair_truth.py -q` - passed, 46 tests, 11 skipped.
+  - `.venv/bin/python -m pytest tests/test_campaign_recovery_matrix.py tests/test_rc21_post1_acceptance_repairs.py tests/test_campaign.py tests/test_campaign_final_acceptance.py tests/test_campaign_runtime_identity_resume.py tests/test_campaign_package_integrity.py tests/test_cli_subcommands.py tests/test_config_validation.py tests/test_stage1a_judge_policy.py tests/test_stage1b_judge_qualification.py tests/test_stage1c_model_roles.py tests/test_stage1d_judge_integration.py tests/test_judge_dumps.py -q` - passed, 203 tests.
+  - Combined corrective validation over Stage 2A, repair, campaign, CLI/config and Judge files - passed, 303 tests, 11 skipped.
+  - `.venv/bin/python -m ruff check llm_modelbench/campaign.py tests/test_stage2a_recovery_reconciliation.py tests/test_campaign.py tests/test_campaign_recovery_matrix.py` - passed.
+  - `.venv/bin/python -m compileall -q llm_modelbench tests/test_stage2a_recovery_reconciliation.py` - passed.
+  - `git diff --check` - passed.
+- Corrective manual inspection:
+  - source hashes cannot be attached to the wrong task;
+  - action task declarations and `source_row_hashes` keys must agree for native plans;
+  - grouped actions are checked per task/hash pair;
+  - contradictory positive digest evidence fails;
+  - matching digest remains authoritative and permits aliases where both digests match;
+  - invalid semantic attribution blocks `apply_plan_fn` and persists `invalid_planned_attributions`;
+  - legacy transient recognition no longer matches arbitrary digit `5` prose;
+  - judge-lane text cannot become generation recovery;
+  - no Stage 2B post-execution semantics were implemented.
