@@ -50,29 +50,36 @@ def _policy(**kwargs):
     return campaign.JudgePolicy(**defaults)
 
 
-def _qualified(name: str, digest: str):
+def _qualified(name: str, digest: str, *, runtime_backend: str = "mock-runtime"):
     return {
         "name": name,
         "digest": digest,
         "roles": ["judge"],
+        "runtime_identity": {"backend": runtime_backend, "model": name},
         "qualified": True,
         "qualification": {
             "protocol_version": "judge-qualification-v1",
             "aggregate_disposition": "qualified",
+            "runtime_identity": {"backend": runtime_backend, "model": name},
             "controls": [{"control_id": "synthetic", "passed": True}],
         },
     }
 
 
 class RecordingJudgeClient:
-    def __init__(self, structural_models=()):
-        self.structural_models = set(structural_models)
+    def __init__(self, failures=None, structural_models=()):
+        self.failures = dict(failures or {})
+        for model in structural_models:
+            self.failures[model] = {"ok": False, "error": "unsupported request schema", "http_status": 415}
         self.calls = []
 
     def chat(self, model, prompt, **kwargs):
         self.calls.append(model)
-        if model in self.structural_models:
-            return {"ok": False, "error": "HTTP 415 unsupported request schema"}
+        failure = self.failures.get(model)
+        if failure == "timeout_exception":
+            raise TimeoutError("deadline exceeded")
+        if failure:
+            return dict(failure)
         return {"ok": True, "text": '{"score": 88, "confidence": 1, "verdict": "synthetic"}'}
 
 
@@ -190,6 +197,8 @@ def test_stage1d_structural_judging_failure_records_once_and_uses_next_independe
     assert entry["judgement_attempts"][0]["judge_model"] == "bad-judge"
     assert entry["judgement_attempts"][-1]["status"] == "judged"
     assert entry["qualified_judge_pool"][0]["name"] == "bad-judge"
+    assert entry["judgement_attempts"][0]["sample"]["backend"]["http_status"] == 415
+    assert entry["judgement_attempts"][0]["compatibility_fingerprint"]
 
 
 def test_stage1d_exhausted_independent_judges_overlay_and_readiness_block(tmp_path):
@@ -241,6 +250,203 @@ def test_stage1d_unchanged_exhausted_judge_rerun_is_noop(tmp_path):
     assert second["skipped"][0]["reason"] == "already_judge_exhausted_unavailable"
     assert client.calls == ["bad-judge"]
     assert len((run / "judge_results.jsonl").read_text().splitlines()) == 1
+
+
+def test_stage1d_expanded_pool_reuses_known_bad_structural_fingerprint_without_calling_j1(tmp_path):
+    run = _write_subjective_run(tmp_path, [{"model": "source", "digest": "digest-source"}])
+    client = RecordingJudgeClient(structural_models={"bad-judge"})
+    bad_only = [_qualified("bad-judge", "digest-bad")]
+    expanded = [*bad_only, _qualified("good-judge", "digest-good")]
+
+    first = judge_dumps.judge_run(client, run, judge_model="bad-judge", qualified_judges=bad_only)
+    second = judge_dumps.judge_run(client, run, judge_model="bad-judge", qualified_judges=expanded)
+
+    assert first["entries"][0]["status"] == "judge_exhausted_unavailable"
+    assert client.calls == ["bad-judge", "good-judge"]
+    assert second["judged"] == 1
+    assert second["entries"][0]["judge_model"] == "good-judge"
+    assert second["entries"][0]["judgement_attempts"][0]["status"] == "reused_structural_incompatibility"
+
+
+def test_stage1d_changed_execution_fingerprint_reconsiders_prior_structural_judge(tmp_path):
+    run = _write_subjective_run(tmp_path, [{"model": "source", "digest": "digest-source"}])
+    client = RecordingJudgeClient(structural_models={"bad-judge"})
+    bad_only = [_qualified("bad-judge", "digest-bad")]
+    expanded = [*bad_only, _qualified("good-judge", "digest-good")]
+
+    judge_dumps.judge_run(client, run, judge_model="bad-judge", qualified_judges=bad_only, think="auto")
+    second = judge_dumps.judge_run(client, run, judge_model="bad-judge", qualified_judges=expanded, think="off")
+
+    assert client.calls == ["bad-judge", "bad-judge", "good-judge"]
+    assert second["judged"] == 1
+    assert second["entries"][0]["judgement_attempts"][0]["status"] == "rejected_structural_incompatibility"
+
+
+def test_stage1d_typed_backend_failures_preserve_dispositions_and_overlay_readiness(tmp_path):
+    cases = [
+        ("bad400", {"ok": False, "error": "bad request", "http_status": 400}, "structural_incompatibility", "judge_exhausted_unavailable"),
+        ("bad404", {"ok": False, "error": "not found", "http_status": 404}, "structural_incompatibility", "judge_exhausted_unavailable"),
+        ("bad405", {"ok": False, "error": "method", "http_status": 405}, "structural_incompatibility", "judge_exhausted_unavailable"),
+        ("bad415", {"ok": False, "error": "media", "http_status": 415}, "structural_incompatibility", "judge_exhausted_unavailable"),
+        ("bad422", {"ok": False, "error": "entity", "http_status": 422}, "structural_incompatibility", "judge_exhausted_unavailable"),
+        ("timeout408", {"ok": False, "error": "deadline", "http_status": 408}, "timeout", "judge_error"),
+        ("rate429", {"ok": False, "error": "rate", "http_status": 429}, "transient_backend_failure", "judge_error"),
+        ("server500", {"ok": False, "error": "server", "http_status": 500}, "transient_backend_failure", "judge_error"),
+        ("typed-timeout", "timeout_exception", "timeout", "judge_error"),
+        ("malformed", {"ok": True, "text": "not json"}, "judge_output_failure", "judge_error"),
+    ]
+    for model, failure, disposition, status in cases:
+        root = tmp_path / model
+        run = _write_subjective_run(root, [{"model": "source", "digest": "digest-source"}])
+        client = RecordingJudgeClient(failures={model: failure})
+        result = judge_dumps.judge_run(client, run, judge_model=model, qualified_judges=[_qualified(model, f"digest-{model}")])
+        entry = result["entries"][0]
+
+        assert entry["status"] == status
+        assert entry["failure_disposition"] == disposition
+        assert entry["score"] is None
+        if status == "judge_error":
+            overlaid = judge_dumps.apply_judgements(run, [json.loads((run / "raw_results.jsonl").read_text().splitlines()[0])])
+            assert overlaid[0]["posthoc_judged"] is False
+            assert overlaid[0]["disposition"] == disposition
+            assert overlaid[0]["score"] is None
+            second = judge_dumps.judge_run(client, run, judge_model=model, qualified_judges=[_qualified(model, f"digest-{model}")])
+            assert second["eligible"] == 0
+            assert second["skipped"][0]["reason"] == "already_judge_error_for_resolved_judge"
+
+
+def test_stage1d_non_structural_failure_effective_row_and_readiness_are_truthful(tmp_path):
+    paths, manifest = campaign.create_campaign("judge_timeout", models=["source"], campaigns_root=tmp_path / "campaigns")
+    run = _write_subjective_run(tmp_path, [{"model": "source", "digest": "digest-source"}])
+    paths.primary_raw_results.write_text((run / "raw_results.jsonl").read_text())
+    paths.primary_run_validity.write_text('{"status":"valid"}')
+    for source in (run / "subjective").rglob("*"):
+        if source.is_file():
+            target = paths.primary_dir / source.relative_to(run)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(source.read_text())
+    manifest = campaign.transition(paths, manifest, "planned")
+    manifest = campaign.transition(paths, manifest, "generating")
+    campaign.transition(paths, manifest, "judging")
+
+    result = judge_dumps.judge_run(
+        RecordingJudgeClient(failures={"timeout-judge": {"ok": False, "error": "deadline", "http_status": 408}}),
+        paths.primary_dir,
+        judge_model="timeout-judge",
+        qualified_judges=[_qualified("timeout-judge", "digest-timeout")],
+    )
+    paths.judge_results.write_text((paths.primary_dir / "judge_results.jsonl").read_text())
+    raw_rows = [json.loads(paths.primary_raw_results.read_text().splitlines()[0])]
+    rows = judge_dumps.apply_judgements(paths.primary_dir, raw_rows)
+    summary = campaign.write_readiness(paths, rows, judge_available=True)
+    effective = json.loads(paths.effective_rows.read_text().splitlines()[0])
+
+    assert result["entries"][0]["status"] == "judge_error"
+    assert rows[0]["disposition"] == "timeout"
+    assert effective["terminal_disposition"] == "timeout"
+    assert effective["effective_score"] is None
+    assert effective["provenance"]["judge_model"] == "timeout-judge"
+    assert effective["provenance"]["judge_failure_disposition"] == "timeout"
+    assert summary["readiness"] == "not_ready_external_judge"
+    assert "judge_failure" in summary["blockers"]
+
+
+def test_stage1d_mocked_campaign_artifacts_link_selection_fallback_judge_and_readiness(monkeypatch, tmp_path):
+    paths, manifest = campaign.create_campaign("fallback_campaign", models=["source"], campaigns_root=tmp_path / "campaigns")
+    run = _write_subjective_run(tmp_path, [{"model": "source", "digest": "digest-source"}])
+    paths.primary_raw_results.write_text((run / "raw_results.jsonl").read_text())
+    paths.primary_run_validity.write_text('{"status":"valid"}')
+    for source in (run / "subjective").rglob("*"):
+        if source.is_file():
+            target = paths.primary_dir / source.relative_to(run)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(source.read_text())
+    manifest = campaign.transition(paths, manifest, "planned")
+    manifest = campaign.transition(paths, manifest, "generating")
+    campaign.transition(paths, manifest, "judging")
+
+    inventory = [
+        {"name": "j1", "digest": "digest-j1", "roles": ["judge"], "capabilities": ["completion"]},
+        {"name": "j2", "digest": "digest-j2", "roles": ["judge"], "capabilities": ["completion"]},
+        {"name": "embedder", "digest": "digest-embedder", "roles": ["judge"], "capabilities": ["embedding"]},
+    ]
+    selection_result = campaign.build_judge_selection(
+        inventory,
+        [{"name": "source", "digest": "digest-source"}],
+        _policy(requested_primary="j1", configured_fallbacks=("j2", "embedder"), excluded_families=()),
+    )
+
+    def fake_qualify(client, candidate):
+        return {
+            "model": candidate["name"],
+            "digest": candidate["digest"],
+            "qualified": True,
+            "aggregate_disposition": "qualified",
+            "protocol_version": "judge-qualification-v1",
+            "runtime_identity": {"backend": "mock", "model": candidate["name"]},
+            "controls": [{"control_id": "synthetic", "passed": True}],
+        }
+
+    monkeypatch.setattr(campaign, "qualify_judge", fake_qualify)
+    raw_row = json.loads(paths.primary_raw_results.read_text().splitlines()[0])
+    qualified, qualifications = campaign.select_qualified_campaign_judges(object(), selection_result)
+    coverage = {
+        "coverage_complete": True,
+        "qualified_count": len(qualified),
+        "judge_pool_signature": campaign.judge_pool_signature(qualified),
+    }
+    selection = {
+        "eligible": 1,
+        "cohort": [{"name": "source", "digest": "digest-source"}],
+        "judge": qualified[0],
+        "qualified_judges": qualified,
+        "qualification_chain": qualifications,
+        "qualification_coverage": coverage,
+        "posthoc_judge_model": qualified[0]["name"],
+        "judge_policy_selection": selection_result.to_dict(),
+    }
+    campaign._atomic_write_text(paths.judge_dir / "judge_selection.json", json.dumps(selection, indent=2, sort_keys=True))
+
+    judged = judge_dumps.judge_run(
+        RecordingJudgeClient(structural_models={"j1"}),
+        paths.primary_dir,
+        judge_model="j1",
+        qualified_judges=qualified,
+        judge_mode="single",
+        num_ctx=4096,
+        think="off",
+    )
+    paths.judge_results.write_text((paths.primary_dir / "judge_results.jsonl").read_text())
+    campaign._atomic_write_text(paths.judge_summary, json.dumps({**judged, "selection": selection}, indent=2, sort_keys=True))
+    rows = judge_dumps.apply_judgements(paths.primary_dir, [raw_row])
+    summary = campaign.write_readiness(paths, rows, judge_available=True)
+
+    persisted_selection = json.loads((paths.judge_dir / "judge_selection.json").read_text())
+    sidecar = json.loads(paths.judge_results.read_text().splitlines()[0])
+    effective = json.loads(paths.effective_rows.read_text().splitlines()[0])
+    readiness = json.loads(paths.readiness_json.read_text())
+
+    assert persisted_selection["judge_policy_selection"]["requested_primary"] == "j1"
+    assert [item["name"] for item in persisted_selection["judge_policy_selection"]["final_eligible_order"]] == ["j1", "j2"]
+    assert any(item["model"] == "embedder" and item["reason"] == "non_generative_embedding_only" for item in persisted_selection["judge_policy_selection"]["rejection_reasons"])
+    assert persisted_selection["qualification_chain"][0]["protocol_version"] == "judge-qualification-v1"
+    assert [item["name"] for item in persisted_selection["qualified_judges"]] == ["j1", "j2"]
+    assert sidecar["source_model"] == "source"
+    assert sidecar["source_model_digest"] == "digest-source"
+    assert sidecar["judge_model"] == "j2"
+    assert sidecar["judge_model_digest"] == "digest-j2"
+    assert sidecar["identity_relation"] == "independent"
+    assert sidecar["judgement_attempts"][0]["judge_model"] == "j1"
+    assert sidecar["judgement_attempts"][0]["status"] == "rejected_structural_incompatibility"
+    assert sidecar["task_hash"] == raw_row["task_hash"]
+    assert sidecar["source_row_hash"]
+    assert sidecar["samples"][0]["output_sha256"]
+    assert sidecar["judge_mode_configuration"] == {"judge_mode": "single", "num_ctx": 4096, "think": "off"}
+    assert effective["result_origin"] == "judged"
+    assert effective["provenance"]["judge_model"] == "j2"
+    assert effective["provenance"]["judge_model_digest"] == "digest-j2"
+    assert summary["readiness"] == "ready_for_adoption"
+    assert readiness["readiness"] == "ready_for_adoption"
 
 
 def test_stage1d_incomplete_identity_and_manual_judge_dump_fail_closed(tmp_path):

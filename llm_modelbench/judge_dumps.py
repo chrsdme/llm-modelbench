@@ -126,11 +126,16 @@ def _matching_pending_entry(entry: Dict[str, Any], pool_signature: str, judge_mo
     )
 
 
-def _matching_exhausted_entry(entry: Dict[str, Any], pool_signature: str, judge_mode: str) -> bool:
-    return (
-        entry.get("status") == "judge_exhausted_unavailable"
-        and entry.get("judge_mode") == judge_mode
-        and entry.get("judge_pool_signature") == pool_signature
+def _matching_judge_error_entry(entry: Dict[str, Any], resolution: Dict[str, Any], judge_mode_configuration: Dict[str, Any]) -> bool:
+    if entry.get("status") != "judge_error":
+        return False
+    judge = resolution.get("judge") or {}
+    expected = _compatibility_fingerprint(judge, judge_mode_configuration)
+    attempts = entry.get("judgement_attempts") if isinstance(entry.get("judgement_attempts"), list) else []
+    return any(
+        attempt.get("status") == "judge_error"
+        and attempt.get("compatibility_fingerprint") == expected
+        for attempt in attempts
     )
 
 
@@ -160,36 +165,63 @@ def _source_identity(row: Dict[str, Any]) -> Dict[str, Any]:
     return campaign.stable_model_identity(row)
 
 
-def _judge_failure_disposition(score: Any, reason: str) -> Optional[str]:
-    if isinstance(score, (int, float)):
-        return None
-    text = str(reason or "").lower()
-    structural_markers = (
-        "structural_incompatibility",
-        "request_incompatibility",
-        "invalid_request",
-        "unsupported request",
-        "unsupported_request",
-        "request schema",
-        "http 400",
-        "http 404",
-        "http 405",
-        "http 415",
-        "http 422",
-    )
-    if any(marker in text for marker in structural_markers):
-        return "structural_incompatibility"
-    if "timeout" in text:
-        return "timeout"
-    if "rate limit" in text or "rate_limited" in text or "http 429" in text:
-        return "transient_backend_failure"
-    if "http 5" in text or "server" in text or "transport" in text or text.startswith("judge exception:"):
-        return "backend_failure"
-    return "judge_output_failure"
-
-
 def _judge_identity_key(judge: Dict[str, Any]) -> str:
     return str(campaign.stable_model_identity(judge).get("identity_key") or "")
+
+
+def _qualification_protocol_version(judge: Dict[str, Any]) -> Optional[str]:
+    qualification = judge.get("qualification") if isinstance(judge.get("qualification"), dict) else {}
+    return qualification.get("protocol_version")
+
+
+def _compatibility_fingerprint(judge: Dict[str, Any], judge_mode_configuration: Dict[str, Any]) -> str:
+    qualification = judge.get("qualification") if isinstance(judge.get("qualification"), dict) else {}
+    payload = {
+        "judge_identity": campaign.stable_model_identity(judge),
+        "runtime_identity": judge.get("runtime_identity") or qualification.get("runtime_identity") or {},
+        "qualification_protocol_version": qualification.get("protocol_version"),
+        "qualification_disposition": qualification.get("aggregate_disposition"),
+        "judge_mode_configuration": judge_mode_configuration,
+        "request_contract_version": judge_mod.JUDGE_REQUEST_CONTRACT_VERSION,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
+
+
+def _execution_fingerprint(qualified_judges: List[Dict[str, Any]], judge_mode_configuration: Dict[str, Any]) -> str:
+    payload = {
+        "judge_compatibility_fingerprints": [
+            _compatibility_fingerprint(judge, judge_mode_configuration)
+            for judge in qualified_judges
+        ],
+        "judge_mode_configuration": judge_mode_configuration,
+        "request_contract_version": judge_mod.JUDGE_REQUEST_CONTRACT_VERSION,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
+
+
+def _matching_exhausted_execution_entry(entry: Dict[str, Any], execution_fingerprint: str) -> bool:
+    return (
+        entry.get("status") == "judge_exhausted_unavailable"
+        and entry.get("judge_execution_fingerprint") == execution_fingerprint
+    )
+
+
+def _prior_structural_failure(
+    previous: List[Dict[str, Any]],
+    compatibility_fingerprint: str,
+) -> Optional[Dict[str, Any]]:
+    for entry in reversed(previous):
+        attempts = entry.get("judgement_attempts") if isinstance(entry.get("judgement_attempts"), list) else []
+        for attempt in reversed(attempts):
+            if (
+                attempt.get("status") == "rejected_structural_incompatibility"
+                and attempt.get("compatibility_fingerprint") == compatibility_fingerprint
+            ):
+                reused = dict(attempt)
+                reused["status"] = "reused_structural_incompatibility"
+                reused["reused_from_source_row_hash"] = entry.get("source_row_hash")
+                return reused
+    return None
 
 
 def scan_run(
@@ -198,12 +230,16 @@ def scan_run(
     judge_model: str,
     qualified_judges: Optional[List[Dict[str, Any]]] = None,
     judge_mode: str,
+    num_ctx: Optional[int] = None,
+    think: str = "auto",
     force: bool = False,
 ) -> Dict[str, Any]:
     raw_rows = _jsonl(run_dir / "raw_results.jsonl")
     existing = _jsonl(run_dir / "judge_results.jsonl")
     qualified_judges = qualified_judges if qualified_judges is not None else _manual_judge_pool(judge_model)
     pool_signature = campaign.judge_pool_signature(qualified_judges)
+    judge_mode_configuration = _judge_config(judge_mode, num_ctx, think)
+    execution_fingerprint = _execution_fingerprint(qualified_judges, judge_mode_configuration)
     existing_by_source: Dict[str, List[Dict[str, Any]]] = {}
     for entry in existing:
         source = str(entry.get("source_row_hash") or "")
@@ -217,13 +253,16 @@ def scan_run(
             continue
         row_hash = source_row_hash(row)
         resolution = campaign.resolve_independent_judge_for_row(row, qualified_judges)
+        previous = existing_by_source.get(row_hash, [])
         if not force:
-            previous = existing_by_source.get(row_hash, [])
             if resolution.get("status") == "selected_independent_judge":
                 if any(_matching_judged_entry(entry, resolution, judge_mode) for entry in previous):
                     skipped.append({"row_index": row_index, "model": row.get("model"), "task": row.get("task"), "reason": "already_judged_by_resolved_independent_judge"})
                     continue
-                if any(_matching_exhausted_entry(entry, pool_signature, judge_mode) for entry in previous):
+                if any(_matching_judge_error_entry(entry, resolution, judge_mode_configuration) for entry in previous):
+                    skipped.append({"row_index": row_index, "model": row.get("model"), "task": row.get("task"), "reason": "already_judge_error_for_resolved_judge"})
+                    continue
+                if any(_matching_exhausted_execution_entry(entry, execution_fingerprint) for entry in previous):
                     skipped.append({"row_index": row_index, "model": row.get("model"), "task": row.get("task"), "reason": "already_judge_exhausted_unavailable"})
                     continue
             elif any(_matching_pending_entry(entry, pool_signature, judge_mode) for entry in previous):
@@ -239,7 +278,7 @@ def scan_run(
         if not outputs:
             skipped.append({"row_index": row_index, "model": row.get("model"), "task": row.get("task"), "reason": "missing_or_empty_dump"})
             continue
-        eligible.append({"row_index": row_index, "row": row, "row_hash": row_hash, "task": task, "outputs": outputs, "judge_resolution": resolution})
+        eligible.append({"row_index": row_index, "row": row, "row_hash": row_hash, "task": task, "outputs": outputs, "judge_resolution": resolution, "prior_sidecars": previous})
     return {
         "run_dir": str(run_dir),
         "raw_rows": len(raw_rows),
@@ -247,6 +286,7 @@ def scan_run(
         "skipped": skipped,
         "already_recorded": len(existing),
         "judge_pool_signature": pool_signature,
+        "judge_execution_fingerprint": execution_fingerprint,
     }
 
 
@@ -265,7 +305,15 @@ def judge_run(
     if judge_mode not in {"single", "panel"}:
         raise ValueError("judge mode must be single or panel")
     qualified_judges = qualified_judges if qualified_judges is not None else _manual_judge_pool(judge_model)
-    scan = scan_run(run_dir, judge_model=judge_model, qualified_judges=qualified_judges, judge_mode=judge_mode, force=force)
+    scan = scan_run(
+        run_dir,
+        judge_model=judge_model,
+        qualified_judges=qualified_judges,
+        judge_mode=judge_mode,
+        num_ctx=num_ctx,
+        think=think,
+        force=force,
+    )
     eligible = scan.pop("eligible")
     pool_signature = str(scan.get("judge_pool_signature") or "")
     result = {
@@ -295,6 +343,7 @@ def judge_run(
     run_dir.mkdir(parents=True, exist_ok=True)
     pool_evidence = _pool_evidence(qualified_judges)
     judge_mode_configuration = _judge_config(judge_mode, num_ctx, think)
+    execution_fingerprint = _execution_fingerprint(qualified_judges, judge_mode_configuration)
     with sidecar.open("a") as handle:
         for item in eligible:
             row = item["row"]
@@ -336,8 +385,10 @@ def judge_run(
                     "judgement_attempts": structural_failures,
                     "failure_disposition": "structural_incompatibility" if exhausted else "awaiting_independent_judge",
                     "judge_pool_signature": pool_signature,
+                    "judge_execution_fingerprint": execution_fingerprint,
                     "qualified_judge_pool": pool_evidence,
                     "judge_mode_configuration": judge_mode_configuration,
+                    "request_contract_version": judge_mod.JUDGE_REQUEST_CONTRACT_VERSION,
                     "judge_policy_version": campaign.JUDGE_POLICY_VERSION,
                     "model_role_policy_version": campaign.MODEL_ROLE_POLICY_VERSION,
                 }
@@ -354,37 +405,69 @@ def judge_run(
                 continue
 
             while selected_judge_model:
-                result["attempted"] += 1
                 selected_judge = resolution.get("judge") or {}
+                compatibility_fingerprint = _compatibility_fingerprint(selected_judge, judge_mode_configuration)
+                reused_failure = _prior_structural_failure(item.get("prior_sidecars") or [], compatibility_fingerprint)
+                if reused_failure is not None:
+                    structural_failures.append(reused_failure)
+                    failed_keys = {
+                        str((failure.get("judge_identity") or {}).get("identity_key") or "")
+                        for failure in structural_failures
+                    }
+                    remaining_judges = [
+                        judge for judge in qualified_judges
+                        if _judge_identity_key(judge) not in failed_keys
+                    ]
+                    resolution = campaign.resolve_independent_judge_for_row(row, remaining_judges)
+                    selected_judge_model = str(resolution.get("judge_model") or "")
+                    selected_judge_digest = resolution.get("judge_digest")
+                    if selected_judge_model:
+                        continue
+                    break
+                result["attempted"] += 1
                 sample_results = []
                 valid_scores: List[float] = []
+                failure_dispositions: List[str] = []
                 started = time.perf_counter()
                 structural_failure: Optional[Dict[str, Any]] = None
                 for path, output in item["outputs"]:
                     try:
                         if judge_mode == "panel":
-                            score, reason = judge_mod.judge_panel(
+                            judge_result = judge_mod.judge_panel_result(
                                 client, selected_judge_model, task.prompt, output, task.rubric,
                                 num_ctx=num_ctx, think=think,
                             )
                         else:
-                            score, reason = judge_mod.judge_single(
+                            judge_result = judge_mod.judge_single_result(
                                 client, selected_judge_model, task.prompt, output, task.rubric,
                                 num_ctx=num_ctx, think=think,
                             )
+                        score = judge_result.get("score")
+                        reason = str(judge_result.get("reason") or "")
                     except Exception as exc:
                         score, reason = None, f"judge exception: {exc!r}"
-                    failure_disposition = _judge_failure_disposition(score, reason)
+                        judge_result = {
+                            "score": None,
+                            "reason": reason,
+                            "failure_disposition": "backend_failure",
+                            "backend": {"ok": False, "error": repr(exc), "failure_disposition": "backend_failure"},
+                            "request_contract_version": judge_mod.JUDGE_REQUEST_CONTRACT_VERSION,
+                        }
+                    failure_disposition = judge_result.get("failure_disposition")
                     sample = {
                         "subjective_path": path,
                         "output_sha256": hashlib.sha256(output.encode()).hexdigest(),
                         "score": score,
                         "reason": reason,
                         "failure_disposition": failure_disposition,
+                        "backend": judge_result.get("backend"),
+                        "request_contract_version": judge_result.get("request_contract_version"),
                     }
                     sample_results.append(sample)
                     if isinstance(score, (int, float)):
                         valid_scores.append(float(score))
+                    elif failure_disposition:
+                        failure_dispositions.append(str(failure_disposition))
                     if failure_disposition == "structural_incompatibility":
                         structural_failure = {
                             "status": "rejected_structural_incompatibility",
@@ -394,6 +477,8 @@ def judge_run(
                             "identity_relation": campaign.stable_model_identity_relation(row, selected_judge),
                             "reason": reason,
                             "sample": sample,
+                            "compatibility_fingerprint": compatibility_fingerprint,
+                            "request_contract_version": judge_mod.JUDGE_REQUEST_CONTRACT_VERSION,
                             "elapsed_seconds": round(time.perf_counter() - started, 3),
                         }
                         break
@@ -412,6 +497,19 @@ def judge_run(
                     selected_judge_digest = resolution.get("judge_digest")
                     if selected_judge_model:
                         continue
+                    break
+                final_score = round(float(statistics.median(valid_scores)), 2) if valid_scores else None
+                status = "judged" if final_score is not None else "judge_error"
+                final_failure_disposition = None
+                if status != "judged":
+                    final_failure_disposition = (
+                        failure_dispositions[0]
+                        if failure_dispositions and all(item == failure_dispositions[0] for item in failure_dispositions)
+                        else "backend_failure"
+                    )
+                break
+            if not selected_judge_model:
+                if structural_failures:
                     entry = {
                         "schema_version": 1,
                         "applied_at": datetime.now(timezone.utc).isoformat(),
@@ -436,8 +534,10 @@ def judge_run(
                         "judgement_attempts": structural_failures,
                         "failure_disposition": "structural_incompatibility",
                         "judge_pool_signature": pool_signature,
+                        "judge_execution_fingerprint": execution_fingerprint,
                         "qualified_judge_pool": pool_evidence,
                         "judge_mode_configuration": judge_mode_configuration,
+                        "request_contract_version": judge_mod.JUDGE_REQUEST_CONTRACT_VERSION,
                         "judge_policy_version": campaign.JUDGE_POLICY_VERSION,
                         "model_role_policy_version": campaign.MODEL_ROLE_POLICY_VERSION,
                     }
@@ -446,11 +546,8 @@ def judge_run(
                     result["judge_errors"] += 1
                     result["written"] += 1
                     result["entries"].append(entry)
-                    break
-                final_score = round(float(statistics.median(valid_scores)), 2) if valid_scores else None
-                status = "judged" if final_score is not None else "judge_error"
-                break
-            if not selected_judge_model or structural_failure is not None:
+                continue
+            if structural_failure is not None:
                 continue
             entry = {
                 "schema_version": 1,
@@ -488,12 +585,16 @@ def judge_run(
                         "identity_relation": campaign.stable_model_identity_relation(row, resolution.get("judge") or {}),
                         "sample_count": len(sample_results),
                         "valid_score_count": len(valid_scores),
+                        "failure_disposition": final_failure_disposition,
+                        "compatibility_fingerprint": _compatibility_fingerprint(resolution.get("judge") or {}, judge_mode_configuration),
                     },
                 ],
-                "failure_disposition": None if status == "judged" else "judge_output_failure",
+                "failure_disposition": final_failure_disposition,
                 "judge_pool_signature": pool_signature,
+                "judge_execution_fingerprint": execution_fingerprint,
                 "qualified_judge_pool": pool_evidence,
                 "judge_mode_configuration": judge_mode_configuration,
+                "request_contract_version": judge_mod.JUDGE_REQUEST_CONTRACT_VERSION,
                 "judge_policy_version": campaign.JUDGE_POLICY_VERSION,
                 "model_role_policy_version": campaign.MODEL_ROLE_POLICY_VERSION,
             }
@@ -563,7 +664,7 @@ def latest_judge_sidecars(run_dir: Path) -> Dict[str, Dict[str, Any]]:
     latest: Dict[str, Dict[str, Any]] = {}
     for entry in _jsonl(run_dir / "judge_results.jsonl"):
         row_hash = entry.get("source_row_hash")
-        if not row_hash or entry.get("status") not in {"judged", "awaiting_independent_judge", "judge_exhausted_unavailable"}:
+        if not row_hash or entry.get("status") not in {"judged", "judge_error", "awaiting_independent_judge", "judge_exhausted_unavailable"}:
             continue
         previous = latest.get(row_hash)
         if previous is None or str(entry.get("applied_at") or "") >= str(previous.get("applied_at") or ""):
@@ -596,6 +697,18 @@ def apply_judgements(run_dir: Path, rows: Iterable[Dict[str, Any]]) -> List[Dict
             row["posthoc_judged"] = False
             row["judge_pending_status"] = "awaiting_independent_judge"
             row["disposition"] = "awaiting_independent_judge"
+            row["judge_applied_at"] = overlay.get("applied_at")
+            row["judge_source_row_hash"] = overlay.get("source_row_hash")
+            row["judge_elapsed_seconds"] = overlay.get("elapsed_seconds")
+        elif overlay and overlay.get("status") == "judge_error":
+            row["score"] = None
+            row["reason"] = overlay.get("reason")
+            row["judge_mode"] = overlay.get("judge_mode")
+            row["judge_model"] = overlay.get("judge_model")
+            row["judge_model_digest"] = overlay.get("judge_model_digest")
+            row["posthoc_judged"] = False
+            row["judge_pending_status"] = overlay.get("failure_disposition") or "judge_error"
+            row["disposition"] = overlay.get("failure_disposition") or "judge_output_failure"
             row["judge_applied_at"] = overlay.get("applied_at")
             row["judge_source_row_hash"] = overlay.get("source_row_hash")
             row["judge_elapsed_seconds"] = overlay.get("elapsed_seconds")

@@ -1174,6 +1174,7 @@ TERMINAL_DISPOSITIONS = {
     "terminal_model_failure", "terminal_thinking_only", "terminal_empty",
     "terminal_transient", "recovery_exhausted", "harness_failure", "awaiting_external_judge",
     "awaiting_independent_judge", "judge_exhausted_unavailable",
+    "timeout", "transient_backend_failure", "backend_failure", "judge_output_failure",
 }
 
 
@@ -1469,7 +1470,7 @@ def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_a
     judge_sidecar_by_source = {
         str(row.get("source_row_hash") or ""): row
         for row in judge_rows
-        if row.get("status") in {"judged", "awaiting_independent_judge", "judge_exhausted_unavailable"}
+        if row.get("status") in {"judged", "judge_error", "awaiting_independent_judge", "judge_exhausted_unavailable"}
     }
     judge_by_source = {source: row for source, row in judge_sidecar_by_source.items() if row.get("status") == "judged"}
     superseded = supersession_map(paths)
@@ -1563,9 +1564,12 @@ def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_a
         blockers.append("awaiting_independent_judge")
     if "judge_exhausted_unavailable" in dispositions:
         blockers.append("judge_exhausted_unavailable")
+    judge_failure_dispositions = {"timeout", "transient_backend_failure", "backend_failure", "judge_output_failure"}
+    if any(item in dispositions for item in judge_failure_dispositions):
+        blockers.append("judge_failure")
     state = "ready_for_adoption" if not blockers else (
         "not_ready_harness_failure" if "harness_failure" in blockers else
-        "not_ready_external_judge" if "awaiting_external_judge" in blockers or "awaiting_independent_judge" in blockers or "judge_exhausted_unavailable" in blockers else
+        "not_ready_external_judge" if "awaiting_external_judge" in blockers or "awaiting_independent_judge" in blockers or "judge_exhausted_unavailable" in blockers or "judge_failure" in blockers else
         "not_ready_manual_items"
     )
     summary = {
@@ -1593,6 +1597,7 @@ def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_a
         "awaiting_external_judge": dispositions.count("awaiting_external_judge"),
         "awaiting_independent_judge": dispositions.count("awaiting_independent_judge"),
         "judge_exhausted_unavailable": dispositions.count("judge_exhausted_unavailable"),
+        "judge_failures": sum(dispositions.count(item) for item in judge_failure_dispositions),
         "harness_failure": dispositions.count("harness_failure"),
         "manual_conflicting_items": sum(d in {"conflicting_evidence/manual_review"} for d in dispositions),
         "blockers": sorted(set(blockers)),
