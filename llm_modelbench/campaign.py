@@ -27,6 +27,8 @@ from typing import Any, Dict, List, Optional
 
 CAMPAIGNS_ROOT = Path("campaigns")
 MANIFEST_SCHEMA_VERSION = 1
+JUDGE_POLICY_VERSION = "rc21.post1"
+SUPERSESSION_POLICY_VERSION = "rc21.post1"
 
 _CAMPAIGN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _RESUMABLE_STATES = ("generating", "recovering", "judging")
@@ -167,6 +169,7 @@ class CampaignPaths:
     judge_results: Path
     judge_summary: Path
     effective_rows: Path
+    supersessions: Path
 
     rankings_dir: Path
     candidate_rankings_dir: Path
@@ -237,6 +240,7 @@ def resolve_paths(
         judge_results=judge_dir / "judge_results.jsonl",
         judge_summary=judge_dir / "judge_summary.json",
         effective_rows=evidence_dir / "effective_rows.jsonl",
+        supersessions=evidence_dir / "supersessions.jsonl",
         rankings_dir=rankings_dir,
         candidate_rankings_dir=rankings_dir / "candidate",
         reports_dir=reports_dir,
@@ -1117,7 +1121,7 @@ TERMINAL_DISPOSITIONS = {
     "scored", "judged", "confirmed_capability_unavailable",
     "capability_measured_failure", "environment_limited", "operator_excluded",
     "terminal_model_failure", "terminal_thinking_only", "terminal_empty",
-    "terminal_transient", "harness_failure", "awaiting_external_judge",
+    "terminal_transient", "recovery_exhausted", "harness_failure", "awaiting_external_judge",
 }
 
 
@@ -1166,6 +1170,52 @@ def classify_recovery_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return {"disposition": "harness_failure", "retry": False, "reason": "unscorable row without error classification"}
 
 
+def reconcile_recovery_rows(rows: List[Dict[str, Any]], *, excluded: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """Make recovery eligibility a complete row-level accounting, never an allowlist.
+
+    ``excluded`` is intentionally keyed by immutable source-row hash and must
+    state an operator/policy reason.  A caller may fail closed on ``balanced``.
+    """
+    excluded = excluded or {}
+    eligible, planned, terminal = [], [], []
+    for row in rows:
+        source = _primary_row_hash(row)
+        state = classify_recovery_row(row)
+        if state["retry"]:
+            eligible.append(source)
+            if source in excluded:
+                terminal.append({"source_row_hash": source, "reason": excluded[source]})
+            else:
+                planned.append(source)
+    return {
+        "eligible_rows": len(eligible), "planned_actions_rows": len(planned),
+        "explicitly_excluded_rows": len(terminal), "eligible_source_row_hashes": eligible,
+        "planned_source_row_hashes": planned, "explicit_exclusions": terminal,
+        "balanced": len(eligible) == len(planned) + len(terminal),
+        "policy_version": RECOVERY_POLICY_VERSION,
+    }
+
+
+def assert_recovery_reconciled(rows: List[Dict[str, Any]], plan: Dict[str, Any], *, excluded: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """Refuse execution/package when every eligible source row is not accounted for."""
+    reconciliation = reconcile_recovery_rows(rows, excluded=excluded)
+    action_sources = {
+        str(source) for action in plan.get("actions") or []
+        for source in (action.get("source_row_hashes") or {}).values() if source
+    }
+    # Older external repair-plan adapters did not expose source hashes.  Keep
+    # their diagnostic compatibility, but all native plans carry source hashes
+    # and therefore fail closed if an eligible row is omitted.
+    missing = (sorted(set(reconciliation["planned_source_row_hashes"]) - action_sources)
+               if action_sources or not (plan.get("actions") or []) else [])
+    reconciliation["unattributed_plan_actions"] = bool((plan.get("actions") or []) and not action_sources)
+    reconciliation["missing_planned_actions"] = missing
+    reconciliation["balanced"] = bool(reconciliation["balanced"] and not missing)
+    if not reconciliation["balanced"]:
+        raise CampaignError("recovery_plan_incomplete")
+    return reconciliation
+
+
 def execute_recovery_phase(paths: CampaignPaths, client: Any, cfg: Any, *, budget: int = 2048,
                            build_plan_fn: Any = None, apply_plan_fn: Any = None) -> Dict[str, Any]:
     """Run bounded recovery while proving primary evidence remains immutable."""
@@ -1183,6 +1233,10 @@ def execute_recovery_phase(paths: CampaignPaths, client: Any, cfg: Any, *, budge
     plan = build_plan_fn(paths.evidence_dir, run_id="primary", think_retry_num_predict=int(budget),
                          judge_mode="off", include_missing=False)
     _atomic_write_text(paths.recovery_plan, json.dumps(plan.to_dict(), indent=2, sort_keys=True))
+    primary_rows = _read_jsonl(paths.primary_raw_results)
+    reconciliation = assert_recovery_reconciled(primary_rows, plan.to_dict())
+    persisted_plan = plan.to_dict() | {"reconciliation": reconciliation}
+    _atomic_write_text(paths.recovery_plan, json.dumps(persisted_plan, indent=2, sort_keys=True))
     result = apply_plan_fn(client, cfg, plan, rankings_dir=paths.candidate_rankings_dir, ranking_scope="separate")
     records = []
     for index, action in enumerate(result.get("actions", []), 1):
@@ -1230,6 +1284,7 @@ def execute_recovery_phase(paths: CampaignPaths, client: Any, cfg: Any, *, budge
             _atomic_write_text(child_dir / "attempt.json", json.dumps(record, indent=2, sort_keys=True))
             records.append(record)
     _atomic_write_text(paths.recovery_attempts, "".join(json.dumps(item, sort_keys=True) + "\n" for item in records))
+    result = dict(result) | {"reconciliation": reconciliation}
     _atomic_write_text(paths.recovery_result, json.dumps(result, indent=2, sort_keys=True))
     if paths.primary_raw_results.read_bytes() != primary_before:
         raise CampaignError("recovery mutated immutable primary evidence")
@@ -1253,6 +1308,37 @@ def _primary_row_hash(row: Dict[str, Any]) -> str:
 
 def _json_compact_hash(row: Dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(row, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
+
+
+def record_supersession(paths: CampaignPaths, *, source_campaign_id: str, source_row: Dict[str, Any],
+                        replacement_run_id: str, replacement_row: Dict[str, Any], reason: str,
+                        operator: str = "operator", tool: str = "llmb") -> Dict[str, Any]:
+    """Append one immutable, unambiguous source-to-replacement evidence link."""
+    source_hash, replacement_hash = _primary_row_hash(source_row), _primary_row_hash(replacement_row)
+    existing = _read_jsonl(paths.supersessions)
+    active = [item for item in existing if item.get("source_row_hash") == source_hash and item.get("active", True)]
+    if active and any(item.get("replacement_row_hash") != replacement_hash for item in active):
+        raise CampaignError("ambiguous_active_supersession")
+    item = {"source_campaign_id": source_campaign_id, "source_row_hash": source_hash,
+            "replacement_run_id": replacement_run_id, "replacement_row_hash": replacement_hash,
+            "reason": str(reason), "policy_version": SUPERSESSION_POLICY_VERSION,
+            "operator": operator, "tool": tool, "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "active": True, "replacement_row": replacement_row}
+    if not active:
+        with paths.supersessions.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(item, sort_keys=True) + "\n")
+    return item
+
+
+def supersession_map(paths: CampaignPaths) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for item in _read_jsonl(paths.supersessions):
+        if item.get("active", True):
+            source = str(item.get("source_row_hash") or "")
+            if source in out and out[source].get("replacement_row_hash") != item.get("replacement_row_hash"):
+                raise CampaignError("ambiguous_active_supersession")
+            out[source] = item
+    return out
 
 
 def _child_rows_by_repair_hash(paths: CampaignPaths) -> Dict[str, Dict[str, Any]]:
@@ -1329,6 +1415,7 @@ def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_a
     action_by_source = _recovery_actions_by_source(paths)
     judge_rows = _read_jsonl(paths.judge_results)
     judge_by_source = {str(row.get("source_row_hash") or ""): row for row in judge_rows if row.get("status") == "judged"}
+    superseded = supersession_map(paths)
     effective: List[Dict[str, Any]] = []
     for index, row in enumerate(rows):
         raw_primary = raw_primary_rows[index] if index < len(raw_primary_rows) else row
@@ -1384,6 +1471,15 @@ def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_a
                 "judge_mode": row.get("judge_mode") or (judge_row or {}).get("judge_mode"),
             },
         }
+        replacement = superseded.get(primary_hash)
+        if replacement:
+            replacement_row = dict(replacement.get("replacement_row") or {})
+            if replacement_row:
+                item["effective_score"] = replacement_row.get("score")
+                item["effective_reason"] = replacement_row.get("reason")
+                item["result_origin"] = "superseded"
+                item["terminal_disposition"] = classify_recovery_row(replacement_row)["disposition"]
+            item["supersession"] = {k: replacement.get(k) for k in ("source_campaign_id", "source_row_hash", "replacement_run_id", "replacement_row_hash", "reason", "policy_version", "operator", "tool", "recorded_at")}
         item["correctness"] = (
             "correct" if item.get("effective_score") == 100 else
             "visible_wrong" if item.get("effective_score") is not None else
@@ -1394,7 +1490,7 @@ def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_a
     _atomic_write_text(paths.effective_rows, "".join(json.dumps(row, sort_keys=True) + "\n" for row in effective))
 
     dispositions = [str(row["terminal_disposition"]) for row in effective]
-    pending = [item for item in dispositions if item not in TERMINAL_DISPOSITIONS]
+    pending = [item for item in dispositions if item not in TERMINAL_DISPOSITIONS or item.endswith("_pending_retry")]
     blockers = list(pending)
     if "harness_failure" in dispositions:
         blockers.append("harness_failure")
@@ -1471,8 +1567,65 @@ def classify_capability_probe(probes: List[Dict[str, Any]]) -> str:
     return "probe_unresolved_transient"
 
 
-def select_campaign_judge(inventory: List[Dict[str, Any]], cohort: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Select an installed text judge outside the tested cohort deterministically."""
+def _judge_candidate_is_generative(item: Dict[str, Any]) -> bool:
+    """Require positive evidence; a label of ``text`` alone is not capability evidence."""
+    capabilities = {str(x).lower() for x in (item.get("capabilities") or item.get("runtime_capabilities") or [])}
+    families = {str(x).lower() for x in (item.get("supported_families") or item.get("families") or [])}
+    non_generative = {"embedding", "embeddings", "rerank", "reranker", "vision"}
+    if capabilities & non_generative and not capabilities & {"completion", "generate", "chat", "text_generation"}:
+        return False
+    # ``supported_families=['text']`` is retained as legacy positive evidence
+    # only when no capability list was supplied.  Modern discovery supplies a
+    # concrete completion/chat capability, which wins over broad labels.
+    return bool(capabilities & {"completion", "generate", "chat", "text_generation"} or
+                families & {"generation", "text_generation"} or (not capabilities and "text" in families))
+
+
+def qualify_judge(client: Any, candidate: Dict[str, Any], *, repeats: int = 2) -> Dict[str, Any]:
+    """Cheap pre-batch qualification using the exact structured judge contract.
+
+    This deliberately does not pull a model.  Any endpoint/HTTP/contract error
+    rejects the candidate before the first source row is judged.
+    """
+    from . import judge as judge_mod
+    started = datetime.now(timezone.utc)
+    name = str(candidate.get("name") or "")
+    result: Dict[str, Any] = {"model": name, "digest": candidate.get("digest"),
+                              "capabilities": candidate.get("capabilities") or [],
+                              "policy_version": JUDGE_POLICY_VERSION, "qualified": False,
+                              "checks": {}, "selection_rationale": ""}
+    if not _judge_candidate_is_generative(candidate):
+        result["selection_rationale"] = "rejected_non_generative_capability"
+        return result
+    scores, errors = [], []
+    for _ in range(max(2, int(repeats))):
+        score, reason = judge_mod.judge_single(
+            client, name, "What is 2 + 2?", "4", "Score correctness; reference answer is 4.", think="off"
+        )
+        if score is None:
+            errors.append(reason)
+            # A structural endpoint/contract failure cannot be repaired by
+            # repeating the same request for the remaining rows.
+            if "http 400" in str(reason).lower() or "invalid json" in str(reason).lower():
+                break
+        else:
+            scores.append(score)
+    result["checks"] = {"endpoint_compatible": not errors, "structured_output": not errors,
+                        "score_range_valid": all(0 <= score <= 100 for score in scores),
+                        "reference_answer_use": bool(scores), "repeated_call_stable": len(set(scores)) <= 1,
+                        "malformed_output_recovery": "parser_diagnostic_available",
+                        "pairwise_order_reversal": "requires_pairwise_capability_probe",
+                        "self_preference_bias": "requires_cohort_probe", "scores": scores,
+                        "errors": errors, "latency_seconds": (datetime.now(timezone.utc) - started).total_seconds()}
+    result["qualified"] = bool(scores) and not errors and len(set(scores)) <= 1
+    result["selection_rationale"] = "qualified_structured_generation_probe" if result["qualified"] else "qualification_failed"
+    return result
+
+
+def select_campaign_judge(inventory: List[Dict[str, Any]], cohort: List[Dict[str, Any]], *,
+                          configured: Optional[List[str]] = None, excluded_families: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+    """Select a positively-confirmed generative judge, respecting project exclusions."""
+    excluded = tuple(str(x).lower() for x in (excluded_families or ["qwen"]))
     cohort_names = {str(item.get("name") or item.get("model") or "") for item in cohort}
     cohort_digests = {str(item.get("digest") or item.get("model_digest_resolved") or "") for item in cohort}
     cohort_families = [str(item.get("architecture_family") or "") for item in cohort]
@@ -1480,19 +1633,43 @@ def select_campaign_judge(inventory: List[Dict[str, Any]], cohort: List[Dict[str
     candidates = []
     for item in inventory:
         name, digest = str(item.get("name") or ""), str(item.get("digest") or "")
-        families = item.get("supported_families") or item.get("families") or []
-        if name in cohort_names or (digest and digest in cohort_digests) or "text" not in families:
+        if name in cohort_names or (digest and digest in cohort_digests):
+            continue
+        if any(token in name.lower() or token in str(item.get("architecture_family") or "").lower() for token in excluded):
+            continue
+        if not _judge_candidate_is_generative(item):
             continue
         if int(item.get("context") or item.get("context_length") or 0) and int(item.get("context") or item.get("context_length")) < 1024:
             continue
         candidates.append(item)
     if not candidates:
         return None
+    configured_rank = {name: index for index, name in enumerate(configured or [])}
     return sorted(candidates, key=lambda item: (
+        configured_rank.get(str(item.get("name") or ""), len(configured_rank)),
         not bool(item.get("calibrated")),
         str(item.get("architecture_family") or "") == majority,
         -int(item.get("priority") or 0), str(item.get("name") or ""),
     ))[0]
+
+
+def select_qualified_campaign_judge(client: Any, inventory: List[Dict[str, Any]], cohort: List[Dict[str, Any]], *,
+                                    configured: Optional[List[str]] = None,
+                                    excluded_families: Optional[List[str]] = None) -> tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Walk the deterministic candidate order, stopping each bad judge once."""
+    remaining = list(inventory)
+    qualifications: List[Dict[str, Any]] = []
+    while remaining:
+        candidate = select_campaign_judge(remaining, cohort, configured=configured,
+                                          excluded_families=excluded_families)
+        if not candidate:
+            break
+        qualification = qualify_judge(client, candidate)
+        qualifications.append(qualification)
+        if qualification.get("qualified"):
+            return candidate, qualifications
+        remaining = [item for item in remaining if str(item.get("name") or "") != str(candidate.get("name") or "")]
+    return None, qualifications
 
 
 def adopt_campaign(paths: CampaignPaths, *, rankings_dir: Path, dry_run: bool = True) -> Dict[str, Any]:

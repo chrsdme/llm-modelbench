@@ -708,6 +708,61 @@ def _validate_campaign_generation_identities(paths, args, cfg, manifest):
 def cmd_campaign(args, cfg):
     """Thin compatibility layer: existing runners receive a normal nested run dir."""
     from . import campaign
+    if args.campaign_cmd == "init":
+        destination = Path(args.path)
+        if destination.exists():
+            raise SystemExit(f"campaign init refused: {destination} already exists")
+        template = {
+            "campaign_id": "my_campaign", "models": ["model:tag"], "level": "full", "samples": 1,
+            "runtime_policy": {"auto": True}, "gpu_topology_policy": "auto",
+            "context_needle_policy": {"needle_max_ctx": 66560},
+            "kv_fallback_policy": {"sequence": ["current", "q8_0", "q4_0"]},
+            "recovery_policy": {"enabled": True, "bounded": True},
+            "judge_policy": {"enabled": True,
+                             "candidates": list(getattr(cfg, "judge_candidates", []) or []),
+                             "family_exclusions": list(getattr(cfg, "judge_family_exclusions", ["qwen"]) or [])},
+            "executable_scorer_policy": {"allow_host_code_execution": False},
+            "telemetry_policy": {"enabled": True}, "reporting_package_policy": {"package": True},
+            "deferred_models": [], "stop_before_adoption": True,
+        }
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(json.dumps(template, indent=2) + "\n", encoding="utf-8")
+        print(f"campaign template -> {destination}")
+        return
+    if args.campaign_cmd == "execute":
+        source = Path(args.campaign_config)
+        try:
+            data = json.loads(source.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"campaign execute requires JSON campaign config: {exc}") from None
+        campaign_id = str(data.get("campaign_id") or data.get("id") or "")
+        models = data.get("models") or []
+        if not campaign_id or not isinstance(models, list) or not models:
+            raise SystemExit("campaign config requires campaign_id and non-empty models")
+        invocation = ["campaign", "run", "--campaign-id", campaign_id, "--models", ";".join(map(str, models)),
+                      "--level", str(data.get("level") or "full"), "--yes", "--unattended-safe"]
+        if data.get("runtime_policy", {}).get("auto", True): invocation.append("--auto")
+        if data.get("samples") is not None: invocation += ["--samples", str(data["samples"])]
+        needle = (data.get("context_needle_policy") or {}).get("needle_max_ctx")
+        if needle is not None: invocation += ["--needle-max-ctx", str(needle)]
+        if (data.get("executable_scorer_policy") or {}).get("allow_host_code_execution"):
+            invocation.append("--allow-host-code-execution")
+        if args.mock: invocation.append("--mock")
+        # Normal lifecycle remains campaign-owned and intentionally stops before adoption.
+        main(invocation)
+        return
+    if args.campaign_cmd == "supersede":
+        paths, _ = _campaign_paths_or_exit(args.campaign_id)
+        try:
+            source = json.loads(Path(args.source_row).read_text(encoding="utf-8"))
+            replacement = json.loads(Path(args.replacement_row).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"campaign supersede requires JSON row files: {exc}") from None
+        item = campaign.record_supersession(paths, source_campaign_id=args.source_campaign_id or args.campaign_id,
+                                            source_row=source, replacement_run_id=args.replacement_run_id,
+                                            replacement_row=replacement, reason=args.reason, operator=args.operator)
+        print(json.dumps(item, indent=2, sort_keys=True))
+        return
     if args.campaign_cmd == "status":
         paths, manifest = _campaign_paths_or_exit(args.campaign_id)
         print(json.dumps({"campaign_id": manifest.campaign_id, "state": manifest.state,
@@ -832,9 +887,17 @@ def cmd_campaign(args, cfg):
                     key = (str(row.get("model") or ""), str(row.get("model_digest_resolved") or ""))
                     cohort_by_key.setdefault(key, {"name": row.get("model"), "digest": row.get("model_digest_resolved")})
                 cohort = list(cohort_by_key.values())
-                candidates = [{"name": item.get("name"), "digest": item.get("digest"), "supported_families": ["text"], "priority": 0, "calibrated": False} for item in inventory]
-                judge = campaign.select_campaign_judge(candidates, cohort)
-                selection = {"eligible": len(eligible), "cohort": cohort, "machine_judged_provisional": True, "judge": judge, "posthoc_judge_model": (judge or {}).get("name"), "posthoc_judge_digest": (judge or {}).get("digest"), "generation_judge_model": None}
+                candidates = [{"name": item.get("name"), "digest": item.get("digest"),
+                               "capabilities": client.capabilities(item.get("name")), "priority": 0,
+                               "calibrated": False} for item in inventory]
+                judge, qualifications = campaign.select_qualified_campaign_judge(
+                    client, candidates, cohort, configured=list(getattr(cfg, "judge_candidates", []) or []),
+                    excluded_families=list(getattr(cfg, "judge_family_exclusions", ["qwen"]) or []),
+                )
+                qualification = qualifications[-1] if qualifications else None
+                selection = {"eligible": len(eligible), "cohort": cohort, "machine_judged_provisional": True, "judge": judge,
+                             "qualification": qualification, "qualification_chain": qualifications, "posthoc_judge_model": (judge or {}).get("name"), "posthoc_judge_digest": (judge or {}).get("digest"), "generation_judge_model": None,
+                             "judge_policy_version": campaign.JUDGE_POLICY_VERSION}
                 campaign._atomic_write_text(paths.judge_dir / "judge_selection.json", json.dumps(selection, indent=2, sort_keys=True))
                 if judge:
                     from . import judge_dumps
@@ -1537,6 +1600,19 @@ def build_parser():
 
     camp = sub.add_parser("campaign", help="manage isolated campaign workspaces")
     camp_sub = camp.add_subparsers(dest="campaign_cmd", required=True)
+    camp_init = camp_sub.add_parser("init", help="write a declarative campaign JSON template")
+    camp_init.add_argument("path", nargs="?", default="campaign.json")
+    camp_execute = camp_sub.add_parser("execute", help="execute the normal campaign lifecycle from one config")
+    camp_execute.add_argument("--config", dest="campaign_config", required=True, help="campaign JSON created by campaign init")
+    camp_execute.add_argument("--mock", action="store_true")
+    camp_supersede = camp_sub.add_parser("supersede", help="append immutable corrected-evidence supersession")
+    camp_supersede.add_argument("--campaign-id", required=True)
+    camp_supersede.add_argument("--source-campaign-id")
+    camp_supersede.add_argument("--source-row", required=True, help="JSON file containing the immutable source row")
+    camp_supersede.add_argument("--replacement-run-id", required=True)
+    camp_supersede.add_argument("--replacement-row", required=True, help="JSON file containing the corrected row")
+    camp_supersede.add_argument("--reason", required=True)
+    camp_supersede.add_argument("--operator", default="operator")
     camp_status = camp_sub.add_parser("status", help="show campaign lifecycle state")
     camp_status.add_argument("campaign_id")
     camp_resume = camp_sub.add_parser("resume", help="resume the exact recorded interrupted campaign phase")
