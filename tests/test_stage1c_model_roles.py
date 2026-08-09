@@ -187,3 +187,147 @@ def test_independent_resolution_is_deterministic_for_repeated_inputs():
     second = campaign.resolve_independent_judge_for_row(dict(row), list(qualified))
     assert first == second
     assert first["judge_model"] == "b"
+
+
+def test_fallback_judged_row_rerun_is_noop_without_duplicate_sidecar(tmp_path):
+    run = _write_subjective_run(tmp_path, [{"model": "source", "digest": "digest-source"}])
+    pool = [
+        {"name": "preferred", "digest": "digest-source", "roles": ["judge"], "qualified": True},
+        {"name": "fallback", "digest": "digest-fallback", "roles": ["judge"], "qualified": True},
+    ]
+    client = RecordingJudgeClient()
+
+    first = judge_dumps.judge_run(client, run, judge_model="preferred", qualified_judges=pool)
+    second = judge_dumps.judge_run(client, run, judge_model="preferred", qualified_judges=pool)
+    entries = (run / "judge_results.jsonl").read_text().splitlines()
+
+    assert first["judged"] == 1
+    assert second["eligible"] == 0
+    assert second["skipped"][0]["reason"] == "already_judged_by_resolved_independent_judge"
+    assert client.models == ["fallback"]
+    assert len(entries) == 1
+
+
+def test_force_rerun_with_fallback_judge_is_explicit_and_appends(tmp_path):
+    run = _write_subjective_run(tmp_path, [{"model": "source", "digest": "digest-source"}])
+    pool = [{"name": "fallback", "digest": "digest-fallback", "roles": ["judge"], "qualified": True}]
+    client = RecordingJudgeClient()
+
+    judge_dumps.judge_run(client, run, judge_model="fallback", qualified_judges=pool)
+    forced = judge_dumps.judge_run(client, run, judge_model="fallback", qualified_judges=pool, force=True)
+
+    assert forced["judged"] == 1
+    assert client.models == ["fallback", "fallback"]
+    assert len((run / "judge_results.jsonl").read_text().splitlines()) == 2
+
+
+def test_unchanged_pending_rerun_is_noop_but_new_independent_judge_can_judge(tmp_path):
+    run = _write_subjective_run(tmp_path, [{"model": "self", "digest": "digest-self"}])
+    self_only = [{"name": "self", "digest": "digest-self", "roles": ["judge", "benchmark_candidate"], "qualified": True}]
+    with_fallback = [*self_only, {"name": "fallback", "digest": "digest-fallback", "roles": ["judge"], "qualified": True}]
+    client = RecordingJudgeClient()
+
+    first = judge_dumps.judge_run(client, run, judge_model="self", qualified_judges=self_only)
+    second = judge_dumps.judge_run(client, run, judge_model="self", qualified_judges=self_only)
+    third = judge_dumps.judge_run(client, run, judge_model="self", qualified_judges=with_fallback)
+
+    assert first["pending"] == 1
+    assert second["eligible"] == 0
+    assert second["skipped"][0]["reason"] == "already_awaiting_independent_judge"
+    assert third["judged"] == 1
+    assert client.models == ["fallback"]
+    assert [json.loads(line)["status"] for line in (run / "judge_results.jsonl").read_text().splitlines()] == [
+        "awaiting_independent_judge",
+        "judged",
+    ]
+
+
+def test_manual_judge_dumps_path_does_not_fabricate_qualification_and_fails_closed(tmp_path):
+    run = _write_subjective_run(tmp_path, [{"model": "alias-a", "digest": "digest-a"}])
+    client = RecordingJudgeClient()
+
+    result = judge_dumps.judge_run(client, run, judge_model="alias-b")
+
+    assert client.models == []
+    assert result["pending"] == 1
+    resolution = result["entries"][0]["judge_resolution"]
+    assert resolution["attempts"][0]["status"] == "skipped_indeterminate_identity"
+    assert resolution["attempts"][0]["judge_identity"]["roles"] == []
+    assert resolution["attempts"][0]["judge_identity"]["digest"] is None
+
+
+def test_pending_sidecar_propagates_to_effective_rows_and_blocks_readiness(tmp_path):
+    paths, manifest = campaign.create_campaign("pending", models=["self"], campaigns_root=tmp_path / "campaigns")
+    run = _write_subjective_run(tmp_path, [{"model": "self", "digest": "digest-self"}])
+    paths.primary_raw_results.write_text((run / "raw_results.jsonl").read_text())
+    paths.primary_run_validity.write_text('{"status":"valid"}')
+    (paths.primary_dir / "model_identities.json").write_text('{"self":{"digest":"digest-self"}}')
+    subjective_dir = paths.primary_dir / "subjective"
+    subjective_dir.mkdir(parents=True, exist_ok=True)
+    for source in (run / "subjective").rglob("*"):
+        if source.is_file():
+            target = paths.primary_dir / source.relative_to(run)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(source.read_text())
+    manifest = campaign.transition(paths, manifest, "planned")
+    manifest = campaign.transition(paths, manifest, "generating")
+    campaign.transition(paths, manifest, "judging")
+
+    judge_dumps.judge_run(
+        RecordingJudgeClient(),
+        paths.primary_dir,
+        judge_model="self",
+        qualified_judges=[{"name": "self", "digest": "digest-self", "roles": ["judge", "benchmark_candidate"], "qualified": True}],
+    )
+    rows = judge_dumps.apply_judgements(paths.primary_dir, [
+        json.loads(paths.primary_raw_results.read_text().splitlines()[0])
+    ])
+    summary = campaign.write_readiness(paths, rows, judge_available=True)
+    effective = json.loads(paths.effective_rows.read_text().splitlines()[0])
+
+    assert rows[0]["posthoc_judged"] is False
+    assert rows[0]["disposition"] == "awaiting_independent_judge"
+    assert effective["terminal_disposition"] == "awaiting_independent_judge"
+    assert effective["effective_score"] is None
+    assert effective["provenance"]["judge_model"] is None
+    assert summary["readiness"] == "not_ready_external_judge"
+    assert "awaiting_independent_judge" in summary["blockers"]
+
+
+def test_bounded_qualification_stops_when_independent_coverage_is_satisfied(monkeypatch):
+    selection = campaign.build_judge_selection([
+        {"name": "self", "digest": "digest-self", "roles": ["judge", "benchmark_candidate"], "capabilities": ["completion"]},
+        {"name": "fallback", "digest": "digest-fallback", "roles": ["judge"], "capabilities": ["completion"]},
+        {"name": "extra", "digest": "digest-extra", "roles": ["judge"], "capabilities": ["completion"]},
+    ], [], _policy(configured_fallbacks=("self", "fallback", "extra")))
+    calls = []
+
+    def fake_qualify(client, candidate):
+        calls.append(candidate["name"])
+        return {"model": candidate["name"], "digest": candidate["digest"], "qualified": True, "aggregate_disposition": "qualified"}
+
+    monkeypatch.setattr(campaign, "qualify_judge", fake_qualify)
+    qualified, qualifications, coverage = campaign.select_qualified_campaign_judges_for_rows(
+        object(),
+        selection,
+        [{"model": "self-alias", "model_digest_resolved": "digest-self"}],
+    )
+
+    assert calls == ["self", "fallback"]
+    assert [item["name"] for item in qualified] == ["self", "fallback"]
+    assert [item["model"] for item in qualifications] == ["self", "fallback"]
+    assert coverage["coverage_complete"] is True
+    assert coverage["considered"][-1]["model"] == "extra"
+    assert coverage["considered"][-1]["decision"] == "not_considered_coverage_satisfied"
+
+
+def test_campaign_role_source_marks_same_model_as_judge_and_benchmark_candidate():
+    policy = _policy(requested_primary="both")
+    candidates = campaign.apply_campaign_roles_to_judge_candidates(
+        [{"name": "both", "digest": "digest-both", "capabilities": ["completion"]}],
+        [{"name": "both-alias", "digest": "digest-both"}],
+        policy,
+    )
+
+    assert candidates[0]["roles"] == ["benchmark_candidate", "judge"]
+    assert candidates[0]["role_sources"] == ["campaign_cohort", "judge_candidate_policy"]

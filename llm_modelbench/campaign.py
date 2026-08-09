@@ -1548,9 +1548,11 @@ def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_a
         blockers.append("harness_failure")
     if "awaiting_external_judge" in dispositions or not judge_available:
         blockers.append("awaiting_external_judge")
+    if "awaiting_independent_judge" in dispositions:
+        blockers.append("awaiting_independent_judge")
     state = "ready_for_adoption" if not blockers else (
         "not_ready_harness_failure" if "harness_failure" in blockers else
-        "not_ready_external_judge" if "awaiting_external_judge" in blockers else
+        "not_ready_external_judge" if "awaiting_external_judge" in blockers or "awaiting_independent_judge" in blockers else
         "not_ready_manual_items"
     )
     summary = {
@@ -1709,6 +1711,19 @@ def same_stable_model_identity(left: Dict[str, Any], right: Dict[str, Any]) -> b
     return bool(left_name and right_name and left_name == right_name)
 
 
+def stable_model_identity_relation(left: Dict[str, Any], right: Dict[str, Any]) -> str:
+    """Return ``same``, ``independent``, or ``indeterminate`` for two identities."""
+    left_digest = _model_identity_digest(left)
+    right_digest = _model_identity_digest(right)
+    if left_digest and right_digest:
+        return "same" if left_digest == right_digest else "independent"
+    left_name = _model_identity_name(left)
+    right_name = _model_identity_name(right)
+    if left_name and right_name and left_name == right_name:
+        return "same"
+    return "indeterminate"
+
+
 def resolve_independent_judge_for_row(
     row: Dict[str, Any],
     qualified_judges: List[Dict[str, Any]],
@@ -1733,15 +1748,20 @@ def resolve_independent_judge_for_row(
                 "status": "skipped_missing_judge_role",
             })
             continue
-        same_identity = same_stable_model_identity(row, judge)
+        relation = stable_model_identity_relation(row, judge)
         attempt = {
             "index": index,
             "judge": _candidate_name(judge),
             "judge_identity": stable_model_identity(judge),
-            "status": "rejected_self_identity" if same_identity else "selected_independent_judge",
+            "identity_relation": relation,
+            "status": (
+                "rejected_self_identity" if relation == "same" else
+                "selected_independent_judge" if relation == "independent" else
+                "skipped_indeterminate_identity"
+            ),
         }
         attempts.append(attempt)
-        if not same_identity:
+        if relation == "independent":
             return {
                 "status": "selected_independent_judge",
                 "judge": judge,
@@ -1760,6 +1780,46 @@ def resolve_independent_judge_for_row(
         "attempts": attempts,
         "policy_version": MODEL_ROLE_POLICY_VERSION,
     }
+
+
+def judge_pool_signature(qualified_judges: List[Dict[str, Any]]) -> str:
+    """Digest the effective ordered judge pool for pending-row idempotency."""
+    payload = [
+        {
+            "name": _candidate_name(judge),
+            "digest": _candidate_digest(judge) or _model_identity_digest(judge) or None,
+            "roles": _model_roles(judge),
+            "qualified": judge.get("qualified"),
+            "qualification_state": judge.get("qualification_state"),
+            "manual_designation": bool(judge.get("manual_designation")),
+        }
+        for judge in qualified_judges
+    ]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
+
+
+def apply_campaign_roles_to_judge_candidates(
+    inventory: List[Dict[str, Any]],
+    cohort: List[Dict[str, Any]],
+    policy: JudgePolicy,
+) -> List[Dict[str, Any]]:
+    """Attach explicit NEW-campaign role evidence without using capabilities."""
+    configured = {name for name in ([policy.requested_primary] if policy.requested_primary else []) + list(policy.configured_fallbacks) if name}
+    out: List[Dict[str, Any]] = []
+    for item in inventory:
+        candidate = dict(item)
+        roles = set(_model_roles(candidate))
+        role_sources = list(candidate.get("role_sources") or [])
+        if policy.enabled and (policy.automatic_selection or _candidate_name(candidate) in configured):
+            roles.add("judge")
+            role_sources.append("judge_candidate_policy")
+        if any(stable_model_identity_relation(candidate, cohort_item) == "same" for cohort_item in cohort):
+            roles.add("benchmark_candidate")
+            role_sources.append("campaign_cohort")
+        candidate["roles"] = sorted(roles)
+        candidate["role_sources"] = sorted(set(str(source) for source in role_sources if str(source)))
+        out.append(candidate)
+    return out
 
 
 def _candidate_capabilities(item: Dict[str, Any]) -> List[str]:
@@ -2090,6 +2150,71 @@ def select_qualified_campaign_judges(client: Any, selection: JudgeSelectionResul
     return qualified, qualifications
 
 
+def select_qualified_campaign_judges_for_rows(
+    client: Any,
+    selection: JudgeSelectionResult,
+    source_rows: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    """Qualify only as far as needed for independent coverage of source rows."""
+    qualified: List[Dict[str, Any]] = []
+    qualifications: List[Dict[str, Any]] = []
+    considered: List[Dict[str, Any]] = []
+
+    def unresolved_rows() -> List[Dict[str, Any]]:
+        return [row for row in source_rows if resolve_independent_judge_for_row(row, qualified)["status"] != "selected_independent_judge"]
+
+    remaining = unresolved_rows()
+    stop_index: Optional[int] = None
+    for index, candidate in enumerate(selection.final_eligible_order):
+        qualification = qualify_judge(client, candidate)
+        qualifications.append(qualification)
+        entry = {
+            "selection_index": candidate.get("selection_index", index),
+            "model": _candidate_name(candidate),
+            "digest": _candidate_digest(candidate) or None,
+            "qualified": bool(qualification.get("qualified")),
+            "aggregate_disposition": qualification.get("aggregate_disposition") or qualification.get("selection_rationale"),
+            "unresolved_before": len(remaining),
+        }
+        if qualification.get("qualified"):
+            qualified.append({
+                **candidate,
+                "qualified": True,
+                "qualification": qualification,
+                "stable_identity": stable_model_identity(candidate),
+                "roles": _model_roles(candidate),
+            })
+        remaining = unresolved_rows()
+        entry["unresolved_after"] = len(remaining)
+        entry["decision"] = "qualified_for_coverage" if qualification.get("qualified") else "rejected_by_qualification"
+        considered.append(entry)
+        if not remaining:
+            stop_index = index
+            break
+
+    if stop_index is not None:
+        for candidate in selection.final_eligible_order[stop_index + 1:]:
+            considered.append({
+                "selection_index": candidate.get("selection_index"),
+                "model": _candidate_name(candidate),
+                "digest": _candidate_digest(candidate) or None,
+                "qualified": None,
+                "decision": "not_considered_coverage_satisfied",
+            })
+
+    coverage = {
+        "policy_version": MODEL_ROLE_POLICY_VERSION,
+        "bounded": True,
+        "source_rows": len(source_rows),
+        "coverage_complete": not remaining,
+        "unresolved_source_identities": [stable_model_identity(row) for row in remaining],
+        "considered": considered,
+        "qualified_count": len(qualified),
+        "judge_pool_signature": judge_pool_signature(qualified),
+    }
+    return qualified, qualifications, coverage
+
+
 def adopt_campaign(paths: CampaignPaths, *, rankings_dir: Path, dry_run: bool = True) -> Dict[str, Any]:
     """Transactionally overlay validated candidate rows into canonical rankings."""
     manifest = load_manifest(paths)
@@ -2128,15 +2253,11 @@ def adopt_campaign(paths: CampaignPaths, *, rankings_dir: Path, dry_run: bool = 
     for judge_row in _read_jsonl(paths.judge_results):
         if judge_row.get("status") != "judged":
             continue
-        source_identity = {
-            "model": judge_row.get("source_model"),
-            "model_digest_resolved": judge_row.get("source_model_digest"),
-        }
-        judge_identity = {
-            "model": judge_row.get("judge_model"),
-            "digest": judge_row.get("judge_model_digest") or judge.get("digest"),
-        }
-        if same_stable_model_identity(source_identity, judge_identity):
+        source_digest = str(judge_row.get("source_model_digest") or "")
+        judge_digest = str(judge_row.get("judge_model_digest") or "")
+        if not source_digest or not judge_digest:
+            raise CampaignError("incomplete judge identity requires review")
+        if source_digest == judge_digest:
             raise CampaignError("self-judged row violates independent judge policy")
     if not candidate_raw.exists():
         raise CampaignError("candidate rankings evidence is missing")

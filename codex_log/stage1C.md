@@ -70,3 +70,52 @@
 - When no independent qualified judge exists, the row is recorded as `awaiting_independent_judge` and no judge backend call is made.
 - No real Selene/Ollama/llama.cpp generation, real judge, real benchmark, or real campaign evidence was used.
 - Stage 1D was not started.
+
+## Corrective pass — integration review findings
+- Baseline for corrective pass: `a13f349dfe612f3c3e6a323f89ac460ae0ff754b`.
+- Approved scope: Stage 1C corrective pass only; Stage 1D not approved.
+- Re-read `AGENTS.md`, `CODEX_START.md`, `PR_RC21POST1_ACCEPTANCE_CONTROLS.md`, and `codex_prompts/stage1C.md`.
+
+### Corrective implementation
+- Made `judge_dumps.scan_run(...)` resolve the actual per-row judge before idempotency checks.
+- Rerun idempotency now keys judged rows against the resolved per-row judge identity, not the global preferred judge name.
+- Pending `awaiting_independent_judge` sidecars carry a deterministic judge-pool signature; unchanged reruns skip rather than appending duplicate pending rows.
+- If the qualified judge pool changes and adds an independent judge, a previously pending row becomes eligible and can be judged.
+- Removed fabricated `qualified=True` / `roles=["judge"]` evidence from legacy/manual `judge_dumps` calls.
+- Legacy/manual judge-dumps now records a truthful `manual_unqualified_designation` pool and fails closed when independence cannot be proven.
+- Added `stable_model_identity_relation(...)` with `same`, `independent`, and `indeterminate` states.
+- Digest-backed independence is required when digest evidence is present; aliases with unresolved digest are not assumed independent merely because names differ.
+- Added `latest_judge_sidecars(...)` and updated `apply_judgements(...)` so `awaiting_independent_judge` sidecars propagate into row state without claiming `posthoc_judged`.
+- Updated readiness state calculation so `awaiting_independent_judge` blocks adoption as `not_ready_external_judge`.
+- Added `apply_campaign_roles_to_judge_candidates(...)` so new campaign judge-candidate records receive explicit role evidence from judge policy/cohort, separate from capabilities.
+- Normal campaign flow now persists explicit roles and role sources in judge selection evidence.
+- Added bounded qualification helper `select_qualified_campaign_judges_for_rows(...)`; it qualifies candidates in Stage 1A order only until the qualified pool provides independent coverage for every subjective source row, then records skipped candidates as `not_considered_coverage_satisfied`.
+- Adoption validation now requires exact per-row `source_model_digest` and `judge_model_digest` for judged sidecars.
+- Adoption rejects actual self digest and incomplete/mixed identity; it no longer borrows top-level preferred judge digest for a sidecar row.
+
+### Corrective validation
+- Focused Stage 1C tests:
+  - `.venv/bin/python -m pytest tests/test_stage1c_model_roles.py -q`
+  - Result: `15 passed in 0.07s`.
+- Directly affected Stage 1A/1B/judge/campaign/config/backend tests:
+  - `.venv/bin/python -m pytest tests/test_stage1c_model_roles.py tests/test_stage1a_judge_policy.py tests/test_stage1b_judge_qualification.py tests/test_judge_dumps.py tests/test_campaign.py tests/test_campaign_final_acceptance.py tests/test_campaign_adoption_transaction.py tests/test_cli_subcommands.py tests/test_config_validation.py tests/test_capability_workflow.py tests/test_backend.py -q`
+  - Result: `169 passed in 1.84s`.
+- Broader offline campaign/Ollama-adjacent compatibility tests:
+  - `.venv/bin/python -m pytest tests/test_campaign_runtime_identity_resume.py tests/test_campaign_adoption_transaction.py tests/test_campaign_cleanup_migration_hygiene.py tests/test_campaign_package_integrity.py tests/test_campaign_recovery_matrix.py tests/test_ollama_service_conflict_warning.py tests/test_ollama_service_active_unit.py tests/test_ollama_kv_broker_boundary.py -q`
+  - Result: `139 passed in 1.13s`.
+- Static/check results:
+  - `.venv/bin/python -m ruff check llm_modelbench/campaign.py llm_modelbench/judge_dumps.py llm_modelbench/cli.py tests/test_stage1c_model_roles.py tests/test_judge_dumps.py tests/test_campaign_adoption_transaction.py` — passed.
+  - `.venv/bin/python -m compileall -q llm_modelbench tests/test_stage1c_model_roles.py tests/test_judge_dumps.py tests/test_campaign_adoption_transaction.py` — passed.
+  - `git diff --check` — passed.
+
+### Corrective manual inspection
+- Rerun/no-op behavior: scan resolves the same actual fallback judge and skips an already-judged row without appending.
+- Pending rerun behavior: unchanged pending rows are skipped by matching source hash, mode, and judge-pool signature.
+- Pending-to-judged transition: when a new independent judge appears, the pool signature changes and the row is eligible for judging.
+- No fabricated qualification: manual judge-dumps does not mark the judge qualified and does not fabricate roles/digest.
+- Alias identity safety: `indeterminate` identity is pending, not judged.
+- Normal role propagation: new campaign candidate records get role evidence from judge policy/cohort, not from text capability.
+- Bounded pool: qualification stops once independent coverage is satisfied and records unconsidered tail candidates.
+- Adoption: judged sidecars must carry exact per-row source and judge digests; incomplete identity fails closed.
+- No real Selene/Ollama/llama.cpp generation, real judge, real benchmark, or real campaign evidence was used.
+- Stage 1D was not started.

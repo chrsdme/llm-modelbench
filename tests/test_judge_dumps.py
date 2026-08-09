@@ -41,10 +41,14 @@ def _client():
     return MockClient("http://127.0.0.1:11434", 42, 0.0, 10)
 
 
+def _qualified_judge(name="mock-judge", digest="digest-mock-judge"):
+    return [{"name": name, "digest": digest, "roles": ["judge"], "qualified": True}]
+
+
 def test_posthoc_judge_preserves_raw_and_overlays_sidecar(tmp_path):
     run, raw = _write_run(tmp_path, "r1")
     before = hashlib.sha256(raw.read_bytes()).hexdigest()
-    result = judge_dumps.judge_run(_client(), run, judge_model="mock-judge", judge_mode="single")
+    result = judge_dumps.judge_run(_client(), run, judge_model="mock-judge", qualified_judges=_qualified_judge(), judge_mode="single")
     after = hashlib.sha256(raw.read_bytes()).hexdigest()
     assert before == after
     assert result["judged"] == 1
@@ -59,7 +63,7 @@ def test_everything_scans_runs_sequentially_and_skips_source_errors(tmp_path):
     _write_run(tmp_path, "r1", model="m1")
     _write_run(tmp_path, "r2", model="m2")
     _write_run(tmp_path, "r3", model="m3", error="thinking_only")
-    result = judge_dumps.judge_everything(_client(), tmp_path, judge_model="mock-judge")
+    result = judge_dumps.judge_everything(_client(), tmp_path, judge_model="mock-judge", qualified_judges=_qualified_judge())
     assert result["runs_scanned"] == 3
     assert result["eligible"] == 2
     assert result["judged"] == 2
@@ -69,9 +73,9 @@ def test_everything_scans_runs_sequentially_and_skips_source_errors(tmp_path):
 
 def test_repeated_judge_is_resumable_unless_force(tmp_path):
     run, _ = _write_run(tmp_path, "r1")
-    first = judge_dumps.judge_run(_client(), run, judge_model="mock-judge")
-    second = judge_dumps.judge_run(_client(), run, judge_model="mock-judge")
-    forced = judge_dumps.judge_run(_client(), run, judge_model="mock-judge", force=True)
+    first = judge_dumps.judge_run(_client(), run, judge_model="mock-judge", qualified_judges=_qualified_judge())
+    second = judge_dumps.judge_run(_client(), run, judge_model="mock-judge", qualified_judges=_qualified_judge())
+    forced = judge_dumps.judge_run(_client(), run, judge_model="mock-judge", qualified_judges=_qualified_judge(), force=True)
     assert first["judged"] == 1
     assert second["eligible"] == 0
     assert forced["judged"] == 1
@@ -84,7 +88,7 @@ def test_judge_sidecar_change_reimports_rankings_and_history(tmp_path):
     rankings.write_rankings(runs, out)
     before = json.loads((out / "master_summary.json").read_text())[0]
     assert before["history"][0]["posthoc_judged"] is False
-    judge_dumps.judge_run(_client(), run, judge_model="mock-judge")
+    judge_dumps.judge_run(_client(), run, judge_model="mock-judge", qualified_judges=_qualified_judge())
     rankings.write_rankings(runs, out)
     after = json.loads((out / "master_summary.json").read_text())[0]
     assert after["history"][0]["posthoc_judged"] is True

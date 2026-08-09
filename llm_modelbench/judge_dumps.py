@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-from . import judge as judge_mod
+from . import campaign, judge as judge_mod
 from .runner import _task_hash
 from .tasks import TASKS, Task
 
@@ -92,13 +92,57 @@ def discover_runs(runs_dir: Path) -> List[Path]:
     )
 
 
-def scan_run(run_dir: Path, *, judge_model: str, judge_mode: str, force: bool = False) -> Dict[str, Any]:
+def _manual_judge_pool(judge_model: str) -> List[Dict[str, Any]]:
+    return [{
+        "name": judge_model,
+        "model": judge_model,
+        "manual_designation": True,
+        "qualification_state": "manual_unqualified_designation",
+    }]
+
+
+def _matching_judged_entry(entry: Dict[str, Any], resolution: Dict[str, Any], judge_mode: str) -> bool:
+    if entry.get("status") != "judged" or entry.get("judge_mode") != judge_mode:
+        return False
+    judge = resolution.get("judge") or {}
+    expected = {
+        "model": resolution.get("judge_model"),
+        "digest": resolution.get("judge_digest") or judge.get("digest"),
+    }
+    actual = {
+        "model": entry.get("judge_model"),
+        "digest": entry.get("judge_model_digest"),
+    }
+    if expected["digest"] or actual["digest"]:
+        return bool(expected["digest"] and actual["digest"] and expected["digest"] == actual["digest"])
+    return campaign.same_stable_model_identity(expected, actual)
+
+
+def _matching_pending_entry(entry: Dict[str, Any], pool_signature: str, judge_mode: str) -> bool:
+    return (
+        entry.get("status") == "awaiting_independent_judge"
+        and entry.get("judge_mode") == judge_mode
+        and entry.get("judge_pool_signature") == pool_signature
+    )
+
+
+def scan_run(
+    run_dir: Path,
+    *,
+    judge_model: str,
+    qualified_judges: Optional[List[Dict[str, Any]]] = None,
+    judge_mode: str,
+    force: bool = False,
+) -> Dict[str, Any]:
     raw_rows = _jsonl(run_dir / "raw_results.jsonl")
     existing = _jsonl(run_dir / "judge_results.jsonl")
-    prior_keys = {
-        (entry.get("source_row_hash"), entry.get("judge_model"), entry.get("judge_mode"))
-        for entry in existing if entry.get("status") == "judged"
-    }
+    qualified_judges = qualified_judges if qualified_judges is not None else _manual_judge_pool(judge_model)
+    pool_signature = campaign.judge_pool_signature(qualified_judges)
+    existing_by_source: Dict[str, List[Dict[str, Any]]] = {}
+    for entry in existing:
+        source = str(entry.get("source_row_hash") or "")
+        if source:
+            existing_by_source.setdefault(source, []).append(entry)
     eligible: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
     for row_index, row in enumerate(raw_rows):
@@ -106,10 +150,16 @@ def scan_run(run_dir: Path, *, judge_model: str, judge_mode: str, force: bool = 
         if task is None or task.scorer != "subjective":
             continue
         row_hash = source_row_hash(row)
-        key = (row_hash, judge_model, judge_mode)
-        if key in prior_keys and not force:
-            skipped.append({"row_index": row_index, "model": row.get("model"), "task": row.get("task"), "reason": "already_judged"})
-            continue
+        resolution = campaign.resolve_independent_judge_for_row(row, qualified_judges)
+        if not force:
+            previous = existing_by_source.get(row_hash, [])
+            if resolution.get("status") == "selected_independent_judge":
+                if any(_matching_judged_entry(entry, resolution, judge_mode) for entry in previous):
+                    skipped.append({"row_index": row_index, "model": row.get("model"), "task": row.get("task"), "reason": "already_judged_by_resolved_independent_judge"})
+                    continue
+            elif any(_matching_pending_entry(entry, pool_signature, judge_mode) for entry in previous):
+                skipped.append({"row_index": row_index, "model": row.get("model"), "task": row.get("task"), "reason": "already_awaiting_independent_judge"})
+                continue
         if row.get("task_hash") and row.get("task_hash") != _task_hash(task):
             skipped.append({"row_index": row_index, "model": row.get("model"), "task": row.get("task"), "reason": "stale_task_hash"})
             continue
@@ -120,13 +170,14 @@ def scan_run(run_dir: Path, *, judge_model: str, judge_mode: str, force: bool = 
         if not outputs:
             skipped.append({"row_index": row_index, "model": row.get("model"), "task": row.get("task"), "reason": "missing_or_empty_dump"})
             continue
-        eligible.append({"row_index": row_index, "row": row, "row_hash": row_hash, "task": task, "outputs": outputs})
+        eligible.append({"row_index": row_index, "row": row, "row_hash": row_hash, "task": task, "outputs": outputs, "judge_resolution": resolution})
     return {
         "run_dir": str(run_dir),
         "raw_rows": len(raw_rows),
         "eligible": eligible,
         "skipped": skipped,
         "already_recorded": len(existing),
+        "judge_pool_signature": pool_signature,
     }
 
 
@@ -144,8 +195,10 @@ def judge_run(
 ) -> Dict[str, Any]:
     if judge_mode not in {"single", "panel"}:
         raise ValueError("judge mode must be single or panel")
-    scan = scan_run(run_dir, judge_model=judge_model, judge_mode=judge_mode, force=force)
+    qualified_judges = qualified_judges if qualified_judges is not None else _manual_judge_pool(judge_model)
+    scan = scan_run(run_dir, judge_model=judge_model, qualified_judges=qualified_judges, judge_mode=judge_mode, force=force)
     eligible = scan.pop("eligible")
+    pool_signature = str(scan.get("judge_pool_signature") or "")
     result = {
         **scan,
         "judge_model": judge_model,
@@ -171,15 +224,11 @@ def judge_run(
 
     sidecar = run_dir / "judge_results.jsonl"
     run_dir.mkdir(parents=True, exist_ok=True)
-    if qualified_judges is None:
-        qualified_judges = [{"name": judge_model, "model": judge_model, "roles": ["judge"], "qualified": True}]
-    from . import campaign
-
     with sidecar.open("a") as handle:
         for item in eligible:
             row = item["row"]
             task: Task = item["task"]
-            resolution = campaign.resolve_independent_judge_for_row(row, qualified_judges)
+            resolution = item["judge_resolution"]
             selected_judge_model = str(resolution.get("judge_model") or "")
             selected_judge_digest = resolution.get("judge_digest")
             if not selected_judge_model:
@@ -202,6 +251,7 @@ def judge_run(
                     "elapsed_seconds": 0.0,
                     "samples": [],
                     "judge_resolution": resolution,
+                    "judge_pool_signature": pool_signature,
                 }
                 handle.write(json.dumps(entry, sort_keys=True) + "\n")
                 handle.flush()
@@ -261,6 +311,7 @@ def judge_run(
                 "elapsed_seconds": round(time.perf_counter() - started, 3),
                 "samples": sample_results,
                 "judge_resolution": resolution,
+                "judge_pool_signature": pool_signature,
             }
             handle.write(json.dumps(entry, sort_keys=True) + "\n")
             handle.flush()
@@ -280,6 +331,7 @@ def judge_everything(
     runs_dir: Path,
     *,
     judge_model: str,
+    qualified_judges: Optional[List[Dict[str, Any]]] = None,
     judge_mode: str = "single",
     num_ctx: Optional[int] = None,
     think: str = "auto",
@@ -291,7 +343,7 @@ def judge_everything(
     results = []
     for index, run_dir in enumerate(runs, start=1):
         result = judge_run(
-            client, run_dir, judge_model=judge_model, judge_mode=judge_mode,
+            client, run_dir, judge_model=judge_model, qualified_judges=qualified_judges, judge_mode=judge_mode,
             num_ctx=num_ctx, think=think, dry_run=dry_run, force=force,
         )
         results.append(result)
@@ -323,18 +375,43 @@ def latest_judgements(run_dir: Path) -> Dict[str, Dict[str, Any]]:
     return latest
 
 
+def latest_judge_sidecars(run_dir: Path) -> Dict[str, Dict[str, Any]]:
+    latest: Dict[str, Dict[str, Any]] = {}
+    for entry in _jsonl(run_dir / "judge_results.jsonl"):
+        row_hash = entry.get("source_row_hash")
+        if not row_hash or entry.get("status") not in {"judged", "awaiting_independent_judge"}:
+            continue
+        previous = latest.get(row_hash)
+        if previous is None or str(entry.get("applied_at") or "") >= str(previous.get("applied_at") or ""):
+            latest[row_hash] = entry
+    return latest
+
+
 def apply_judgements(run_dir: Path, rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    overlays = latest_judgements(run_dir)
+    overlays = latest_judge_sidecars(run_dir)
     out: List[Dict[str, Any]] = []
     for raw in rows:
         row = dict(raw)
         overlay = overlays.get(source_row_hash(raw))
-        if overlay:
+        if overlay and overlay.get("status") == "judged":
             row["score"] = overlay.get("score")
             row["reason"] = overlay.get("reason")
             row["judge_mode"] = overlay.get("judge_mode")
             row["judge_model"] = overlay.get("judge_model")
+            row["judge_model_digest"] = overlay.get("judge_model_digest")
             row["posthoc_judged"] = True
+            row["judge_applied_at"] = overlay.get("applied_at")
+            row["judge_source_row_hash"] = overlay.get("source_row_hash")
+            row["judge_elapsed_seconds"] = overlay.get("elapsed_seconds")
+        elif overlay and overlay.get("status") == "awaiting_independent_judge":
+            row["score"] = None
+            row["reason"] = overlay.get("reason")
+            row["judge_mode"] = overlay.get("judge_mode")
+            row["judge_model"] = None
+            row["judge_model_digest"] = None
+            row["posthoc_judged"] = False
+            row["judge_pending_status"] = "awaiting_independent_judge"
+            row["disposition"] = "awaiting_independent_judge"
             row["judge_applied_at"] = overlay.get("applied_at")
             row["judge_source_row_hash"] = overlay.get("source_row_hash")
             row["judge_elapsed_seconds"] = overlay.get("elapsed_seconds")

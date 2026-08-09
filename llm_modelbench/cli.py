@@ -889,16 +889,20 @@ def cmd_campaign(args, cfg):
                     key = (str(row.get("model") or ""), str(row.get("model_digest_resolved") or ""))
                     cohort_by_key.setdefault(key, {"name": row.get("model"), "digest": row.get("model_digest_resolved")})
                 cohort = list(cohort_by_key.values())
-                candidates = [{"name": item.get("name"), "digest": item.get("digest"),
-                               "capabilities": client.capabilities(item.get("name")), "priority": 0,
-                               "calibrated": False} for item in inventory]
                 judge_policy = campaign.JudgePolicy.from_config(cfg, enabled=True)
+                candidates = campaign.apply_campaign_roles_to_judge_candidates([
+                    {"name": item.get("name"), "digest": item.get("digest"),
+                     "capabilities": client.capabilities(item.get("name")), "priority": 0,
+                     "calibrated": False}
+                    for item in inventory
+                ], cohort, judge_policy)
                 judge_selection = campaign.build_judge_selection(candidates, cohort, judge_policy)
-                qualified_judges, qualifications = campaign.select_qualified_campaign_judges(client, judge_selection)
+                qualified_judges, qualifications, coverage = campaign.select_qualified_campaign_judges_for_rows(client, judge_selection, eligible)
                 judge = qualified_judges[0] if qualified_judges else None
                 qualification = (judge or {}).get("qualification") if judge else (qualifications[-1] if qualifications else None)
                 selection = {"eligible": len(eligible), "cohort": cohort, "machine_judged_provisional": True, "judge": judge,
-                             "qualified_judges": qualified_judges, "qualification": qualification, "qualification_chain": qualifications, "posthoc_judge_model": (judge or {}).get("name"), "posthoc_judge_digest": (judge or {}).get("digest"), "generation_judge_model": None,
+                             "qualified_judges": qualified_judges, "qualification": qualification, "qualification_chain": qualifications, "qualification_coverage": coverage,
+                             "posthoc_judge_model": (judge or {}).get("name"), "posthoc_judge_digest": (judge or {}).get("digest"), "generation_judge_model": None,
                              "model_role_policy_version": campaign.MODEL_ROLE_POLICY_VERSION,
                              "judge_policy_version": campaign.JUDGE_POLICY_VERSION,
                              "judge_policy_selection": judge_selection.to_dict()}
