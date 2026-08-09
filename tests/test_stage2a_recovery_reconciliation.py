@@ -316,13 +316,14 @@ def test_stage2a_successful_reconciliation_permits_mocked_execution(tmp_path):
     actions = [{"action_id": "a1", "kind": "retry_generation", "model": "m", "task": "json_extract",
                 "source_row_hashes": {"json_extract": _hash(primary)}}]
     calls = []
-    result = campaign.execute_recovery_phase(
-        paths, object(), object(),
-        build_plan_fn=lambda *a, **k: _Plan(actions),
-        apply_plan_fn=lambda *a, **k: calls.append("called") or {"actions": [], "completed": 0},
-    )
+    with pytest.raises(campaign.CampaignError, match="recovery_post_execution_incomplete"):
+        campaign.execute_recovery_phase(
+            paths, object(), object(),
+            build_plan_fn=lambda *a, **k: _Plan(actions),
+            apply_plan_fn=lambda *a, **k: calls.append("called") or {"actions": [], "completed": 0},
+        )
     assert calls == ["called"]
-    assert result["reconciliation"]["exact"] is True
+    assert json.loads(paths.recovery_result.read_text())["reconciliation"]["exact"] is True
     assert paths.primary_raw_results.read_bytes() == before
 
 

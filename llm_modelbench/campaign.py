@@ -1299,6 +1299,13 @@ def _invalid_attribution(action: Dict[str, Any], index: int, task: str, source_h
     }
 
 
+def _source_lookup(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        out.setdefault(_primary_row_hash(row), []).append(row)
+    return out
+
+
 def reconcile_recovery_rows(rows: List[Dict[str, Any]], *, excluded: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Make recovery eligibility a complete row-level accounting, never an allowlist.
 
@@ -1362,9 +1369,7 @@ def recovery_reconciliation_evidence(rows: List[Dict[str, Any]], plan: Dict[str,
     actions = list(plan.get("actions") or [])
     eligible_set = set(reconciliation["eligible_source_row_hashes"])
     excluded_set = {str(item["source_row_hash"]) for item in reconciliation["explicit_exclusions"]}
-    rows_by_source: Dict[str, List[Dict[str, Any]]] = {}
-    for row in rows:
-        rows_by_source.setdefault(_primary_row_hash(row), []).append(row)
+    rows_by_source = _source_lookup(rows)
     planned: List[str] = []
     planned_identities: List[Dict[str, Any]] = []
     unattributed: List[Dict[str, Any]] = []
@@ -1550,8 +1555,18 @@ def execute_recovery_phase(paths: CampaignPaths, client: Any, cfg: Any, *, budge
             _atomic_write_text(child_dir / "attempt.json", json.dumps(record, indent=2, sort_keys=True))
             records.append(record)
     _atomic_write_text(paths.recovery_attempts, "".join(json.dumps(item, sort_keys=True) + "\n" for item in records))
-    result = dict(result) | {"reconciliation": reconciliation}
+    copied_child_rows = []
+    for child_dir in sorted(paths.recovery_children_dir.iterdir() if paths.recovery_children_dir.exists() else []):
+        for row in _read_jsonl(child_dir / "raw_results.jsonl"):
+            candidate = dict(row)
+            candidate["_recovery_child_id"] = child_dir.name
+            copied_child_rows.append(candidate)
+    outcome_rows = copied_child_rows or _result_action_outcome_rows(plan.to_dict(), result)
+    post_reconciliation = reconcile_recovery_post_execution(primary_rows, plan.to_dict(), result, outcome_rows)
+    result = dict(result) | {"reconciliation": reconciliation, "post_execution_reconciliation": post_reconciliation}
     _atomic_write_text(paths.recovery_result, json.dumps(result, indent=2, sort_keys=True))
+    if not post_reconciliation["balanced"]:
+        raise CampaignError("recovery_post_execution_incomplete")
     if paths.primary_raw_results.read_bytes() != primary_before:
         raise CampaignError("recovery mutated immutable primary evidence")
     return result
@@ -1574,6 +1589,174 @@ def _primary_row_hash(row: Dict[str, Any]) -> str:
 
 def _json_compact_hash(row: Dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(row, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
+
+
+def _planned_recovery_sources(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+    planned: List[Dict[str, Any]] = []
+    for index, action in enumerate(plan.get("actions") or []):
+        for task, source in sorted((action.get("source_row_hashes") or {}).items()):
+            source_hash = str(source or "")
+            if not source_hash:
+                continue
+            planned.append({
+                "source_row_hash": source_hash,
+                "task": str(task),
+                "model": str(action.get("model") or ""),
+                "model_digest": str(action.get("model_digest") or action.get("model_digest_resolved") or ""),
+                "action_id": str(action.get("action_id") or ""),
+                "action_index": index,
+                "kind": str(action.get("kind") or ""),
+            })
+    return _sorted_identities(planned)
+
+
+def _child_outcome_identity(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "source_row_hash": str(row.get("repair_source_row_hash") or row.get("parent_row_hash") or ""),
+        "task": str(row.get("task") or ""),
+        "model": str(row.get("model") or ""),
+        "model_digest": str(row.get("model_digest_resolved") or row.get("model_digest") or ""),
+        "action_id": str(row.get("repair_action_id") or row.get("action_id") or ""),
+        "child_run_id": str(row.get("_recovery_child_id") or row.get("child_run_id") or ""),
+        "attempt_number": row.get("repair_attempt_number") or row.get("attempt_number"),
+    }
+
+
+def _recovery_terminal_disposition(primary: Dict[str, Any], outcome: Optional[Dict[str, Any]]) -> str:
+    if outcome and outcome.get("score") is not None and not outcome.get("error_kind"):
+        return "scored"
+    status = str((outcome or {}).get("status") or (outcome or {}).get("output_classification") or "")
+    kind = str((outcome or {}).get("error_kind") or primary.get("error_kind") or "")
+    if status == "measured_failure":
+        return "capability_measured_failure"
+    if kind in {"capability_measured_failure", "measured_failure"}:
+        return "capability_measured_failure"
+    if kind == "thinking_only":
+        return "terminal_thinking_only"
+    if kind == "empty_output":
+        return "terminal_empty"
+    text = str((outcome or {}).get("reason") or (outcome or {}).get("error") or primary.get("reason") or primary.get("error") or "")
+    if status in {"timeout", "terminal_transient_failure"} or kind in TRANSIENT_GENERATION_ERROR_KINDS or LEGACY_TRANSIENT_TEXT_RE.search(text):
+        return "terminal_transient"
+    if kind == "harness_error":
+        return "harness_failure"
+    return "recovery_unresolved"
+
+
+def reconcile_recovery_post_execution(primary_rows: List[Dict[str, Any]], plan: Dict[str, Any], result: Dict[str, Any],
+                                      recovery_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Account for every Stage 2A planned source row after recovery execution."""
+    planned = _planned_recovery_sources(plan)
+    planned_by_source = {item["source_row_hash"]: item for item in planned}
+    planned_set = set(planned_by_source)
+    primary_by_source = _source_lookup(primary_rows)
+    outcomes: List[Dict[str, Any]] = []
+    recovered: List[Dict[str, Any]] = []
+    terminal: List[Dict[str, Any]] = []
+    invalid: List[Dict[str, Any]] = []
+    for row in recovery_rows:
+        identity = _child_outcome_identity(row)
+        source_hash = identity["source_row_hash"]
+        primary_candidates = primary_by_source.get(source_hash, [])
+        primary = primary_candidates[0] if len(primary_candidates) == 1 else None
+        reason: Optional[str] = None
+        if not source_hash:
+            reason = "missing_source_hash"
+        elif source_hash not in planned_set:
+            reason = "unexpected_source_hash"
+        elif not primary_candidates:
+            reason = "source_hash_not_found"
+        elif len(primary_candidates) > 1:
+            reason = "ambiguous_source_hash"
+        elif identity["task"] != str(primary.get("task") or ""):
+            reason = "task_source_mismatch"
+        else:
+            declared = planned_by_source[source_hash]
+            if identity["task"] != declared["task"]:
+                reason = "action_task_mapping_mismatch"
+            else:
+                declared_digest = str(declared.get("model_digest") or "")
+                actual_digest = str(primary.get("model_digest_resolved") or primary.get("model_digest") or "")
+                child_digest = str(identity.get("model_digest") or "")
+                if child_digest and actual_digest and child_digest != actual_digest:
+                    reason = "model_digest_source_mismatch"
+                elif child_digest and declared_digest and child_digest != declared_digest:
+                    reason = "model_digest_action_mismatch"
+                elif not (child_digest and actual_digest):
+                    actual_model = str(primary.get("model") or "")
+                    child_model = str(identity.get("model") or "")
+                    if child_model and actual_model and child_model != actual_model:
+                        reason = "model_source_mismatch"
+        disposition = _recovery_terminal_disposition(primary or {}, row)
+        item = identity | {
+            "disposition": disposition,
+            "category": "recovered" if disposition == "scored" else "terminal",
+            "policy_version": str(row.get("repair_policy_version") or row.get("policy_version") or RECOVERY_POLICY_VERSION),
+        }
+        outcomes.append(item)
+        if reason:
+            invalid.append(item | {"reason": reason})
+            continue
+        if disposition == "recovery_unresolved":
+            invalid.append(item | {"reason": "unresolved_recovery_outcome"})
+            continue
+        (recovered if disposition == "scored" else terminal).append(item)
+    counts = Counter(item["source_row_hash"] for item in outcomes if item.get("source_row_hash"))
+    duplicates = sorted(source for source, count in counts.items() if count > 1)
+    outcome_set = {item["source_row_hash"] for item in outcomes if item.get("source_row_hash")}
+    missing = sorted(planned_set - outcome_set)
+    unexpected = sorted(outcome_set - planned_set)
+    exact = bool(planned_set == outcome_set and not missing and not unexpected and not duplicates and not invalid)
+    missing_identities = [planned_by_source[source] for source in missing]
+    unexpected_identities = [item for item in outcomes if item["source_row_hash"] in unexpected]
+    evidence = {
+        "planned_source_identities": _sorted_identities(planned),
+        "recovered_source_identities": _sorted_identities(recovered),
+        "terminal_source_identities": _sorted_identities(terminal),
+        "missing_source_identities": _sorted_identities(missing_identities),
+        "unexpected_recovery_identities": _sorted_identities(unexpected_identities),
+        "duplicate_recovery_source_row_hashes": duplicates,
+        "invalid_child_attributions": _sorted_identities(invalid),
+        "per_row_outcomes": _sorted_identities(outcomes),
+        "recovery_policy_version": RECOVERY_POLICY_VERSION,
+        "exact": exact,
+        "balanced": exact,
+    }
+    return evidence
+
+
+def _result_action_outcome_rows(plan: Dict[str, Any], result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    planned = {str(action.get("action_id") or ""): action for action in plan.get("actions") or []}
+    planned_actions = list(plan.get("actions") or [])
+    rows: List[Dict[str, Any]] = []
+    for index, action in enumerate(result.get("actions") or [], 1):
+        action_id = str(action.get("action_id") or "")
+        planned_action = planned.get(action_id) or (planned_actions[0] if not action_id and len(planned_actions) == 1 else {})
+        if not action_id:
+            action_id = str(planned_action.get("action_id") or "")
+        source_hashes = planned_action.get("source_row_hashes") or {}
+        tasks = [str(task) for task in (action.get("tasks") or planned_action.get("tasks") or [])]
+        if not tasks and action.get("task"):
+            tasks = [str(action.get("task"))]
+        attempts = list(action.get("attempts") or []) or [{"attempt_number": action.get("attempt_number") or index}]
+        for task in tasks:
+            for attempt in attempts:
+                child_id = str(attempt.get("child_run_id") or action.get("child_run_id") or f"recovery-{index:04d}")
+                rows.append({
+                    "model": action.get("model") or planned_action.get("model"),
+                    "model_digest_resolved": action.get("model_digest") or planned_action.get("model_digest"),
+                    "task": task,
+                    "score": action.get("score", attempt.get("score")),
+                    "reason": action.get("reason") or attempt.get("status") or action.get("status"),
+                    "error_kind": action.get("error_kind"),
+                    "status": attempt.get("status") or action.get("status"),
+                    "repair_source_row_hash": source_hashes.get(task),
+                    "repair_action_id": action_id,
+                    "repair_attempt_number": attempt.get("attempt_number") or index,
+                    "repair_policy_version": RECOVERY_POLICY_VERSION,
+                    "_recovery_child_id": child_id,
+                })
+    return rows
 
 
 def record_supersession(paths: CampaignPaths, *, source_campaign_id: str, source_row: Dict[str, Any],
@@ -1609,11 +1792,21 @@ def supersession_map(paths: CampaignPaths) -> Dict[str, Dict[str, Any]]:
 
 def _child_rows_by_repair_hash(paths: CampaignPaths) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
+    recovery = _json_object(paths.recovery_result)
+    post = recovery.get("post_execution_reconciliation") or {}
+    if post and not post.get("exact"):
+        return out
+    valid_sources = {
+        str(item.get("source_row_hash") or "")
+        for item in (post.get("recovered_source_identities") or []) + (post.get("terminal_source_identities") or [])
+    } if post else set()
     for child_dir in sorted(paths.recovery_children_dir.iterdir() if paths.recovery_children_dir.exists() else []):
         raw = child_dir / "raw_results.jsonl"
         for row in _read_jsonl(raw):
             source = str(row.get("repair_source_row_hash") or "")
             task = str(row.get("task") or "")
+            if valid_sources and source not in valid_sources:
+                continue
             if source and task:
                 candidate = dict(row)
                 candidate["_recovery_child_id"] = child_dir.name
@@ -1637,22 +1830,13 @@ def _recovery_actions_by_source(paths: CampaignPaths) -> Dict[str, Dict[str, Any
 
 
 def _terminal_after_recovery(primary: Dict[str, Any], action: Optional[Dict[str, Any]], child: Optional[Dict[str, Any]]) -> str:
-    if child and child.get("score") is not None and not child.get("error_kind"):
-        return "scored"
-    status = str((action or {}).get("status") or "")
-    kind = str(primary.get("error_kind") or "")
-    if status == "measured_failure":
-        return "capability_measured_failure"
-    if status in {"timeout"}:
-        return "terminal_transient"
-    if kind == "thinking_only":
-        return "terminal_thinking_only"
-    if kind == "empty_output":
-        return "terminal_empty"
-    text = str(primary.get("reason") or primary.get("error") or "").lower()
-    if "timeout" in text or " 5" in text or ("http" in text and "5" in text):
-        return "terminal_transient"
-    return classify_recovery_row(primary)["disposition"]
+    outcome = dict(child or {})
+    if action and "status" not in outcome:
+        outcome["status"] = action.get("status")
+    disposition = _recovery_terminal_disposition(primary, outcome if outcome else None)
+    if disposition == "recovery_unresolved":
+        return classify_recovery_row(primary)["disposition"]
+    return disposition
 
 
 def _candidate_from_effective(row: Dict[str, Any], manifest: CampaignManifest) -> Dict[str, Any]:
