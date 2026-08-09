@@ -135,6 +135,7 @@ def judge_run(
     run_dir: Path,
     *,
     judge_model: str,
+    qualified_judges: Optional[List[Dict[str, Any]]] = None,
     judge_mode: str = "single",
     num_ctx: Optional[int] = None,
     think: str = "auto",
@@ -152,6 +153,7 @@ def judge_run(
         "eligible": len(eligible),
         "attempted": 0,
         "judged": 0,
+        "pending": 0,
         "judge_errors": 0,
         "written": 0,
         "dry_run": bool(dry_run),
@@ -169,10 +171,44 @@ def judge_run(
 
     sidecar = run_dir / "judge_results.jsonl"
     run_dir.mkdir(parents=True, exist_ok=True)
+    if qualified_judges is None:
+        qualified_judges = [{"name": judge_model, "model": judge_model, "roles": ["judge"], "qualified": True}]
+    from . import campaign
+
     with sidecar.open("a") as handle:
         for item in eligible:
             row = item["row"]
             task: Task = item["task"]
+            resolution = campaign.resolve_independent_judge_for_row(row, qualified_judges)
+            selected_judge_model = str(resolution.get("judge_model") or "")
+            selected_judge_digest = resolution.get("judge_digest")
+            if not selected_judge_model:
+                entry = {
+                    "schema_version": 1,
+                    "applied_at": datetime.now(timezone.utc).isoformat(),
+                    "run_id": run_dir.name,
+                    "source_row_index": item["row_index"],
+                    "source_row_hash": item["row_hash"],
+                    "source_model": row.get("model"),
+                    "source_model_digest": row.get("model_digest_resolved") or row.get("model_digest"),
+                    "task": task.id,
+                    "task_hash": row.get("task_hash") or _task_hash(task),
+                    "judge_model": None,
+                    "judge_model_digest": None,
+                    "judge_mode": judge_mode,
+                    "status": "awaiting_independent_judge",
+                    "score": None,
+                    "reason": "awaiting independent judge: no qualified non-self judge available",
+                    "elapsed_seconds": 0.0,
+                    "samples": [],
+                    "judge_resolution": resolution,
+                }
+                handle.write(json.dumps(entry, sort_keys=True) + "\n")
+                handle.flush()
+                result["pending"] += 1
+                result["written"] += 1
+                result["entries"].append(entry)
+                continue
             result["attempted"] += 1
             sample_results = []
             valid_scores: List[float] = []
@@ -181,12 +217,12 @@ def judge_run(
                 try:
                     if judge_mode == "panel":
                         score, reason = judge_mod.judge_panel(
-                            client, judge_model, task.prompt, output, task.rubric,
+                            client, selected_judge_model, task.prompt, output, task.rubric,
                             num_ctx=num_ctx, think=think,
                         )
                     else:
                         score, reason = judge_mod.judge_single(
-                            client, judge_model, task.prompt, output, task.rubric,
+                            client, selected_judge_model, task.prompt, output, task.rubric,
                             num_ctx=num_ctx, think=think,
                         )
                 except Exception as exc:
@@ -209,10 +245,11 @@ def judge_run(
                 "source_row_index": item["row_index"],
                 "source_row_hash": item["row_hash"],
                 "source_model": row.get("model"),
-                "source_model_digest": row.get("model_digest"),
+                "source_model_digest": row.get("model_digest_resolved") or row.get("model_digest"),
                 "task": task.id,
                 "task_hash": row.get("task_hash") or _task_hash(task),
-                "judge_model": judge_model,
+                "judge_model": selected_judge_model,
+                "judge_model_digest": selected_judge_digest,
                 "judge_mode": judge_mode,
                 "status": status,
                 "score": final_score,
@@ -223,6 +260,7 @@ def judge_run(
                 ),
                 "elapsed_seconds": round(time.perf_counter() - started, 3),
                 "samples": sample_results,
+                "judge_resolution": resolution,
             }
             handle.write(json.dumps(entry, sort_keys=True) + "\n")
             handle.flush()

@@ -31,6 +31,7 @@ from .classify import families_for, families_from_capabilities
 CAMPAIGNS_ROOT = Path("campaigns")
 MANIFEST_SCHEMA_VERSION = 1
 JUDGE_POLICY_VERSION = "rc21.post1"
+MODEL_ROLE_POLICY_VERSION = "rc21.post1.roles"
 SUPERSESSION_POLICY_VERSION = "rc21.post1"
 
 _CAMPAIGN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -1172,6 +1173,7 @@ TERMINAL_DISPOSITIONS = {
     "capability_measured_failure", "environment_limited", "operator_excluded",
     "terminal_model_failure", "terminal_thinking_only", "terminal_empty",
     "terminal_transient", "recovery_exhausted", "harness_failure", "awaiting_external_judge",
+    "awaiting_independent_judge",
 }
 
 
@@ -1625,6 +1627,141 @@ def _candidate_digest(item: Dict[str, Any]) -> str:
     return str(item.get("digest") or item.get("model_digest_resolved") or "")
 
 
+def _model_roles(item: Dict[str, Any]) -> List[str]:
+    """Return normalized model roles, distinct from runtime capabilities.
+
+    An absent role field means historical evidence did not record roles.  It
+    does not imply any capability and is kept compatible with older fixtures.
+    When roles are explicit, a judge candidate must include ``judge``.
+    """
+    raw = item.get("roles", item.get("model_roles", ()))
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        values = [raw]
+    else:
+        try:
+            values = list(raw)
+        except TypeError:
+            values = [raw]
+    roles = []
+    for value in values:
+        role = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+        if role:
+            roles.append(role)
+    return sorted(set(roles))
+
+
+def _model_identity_name(item: Dict[str, Any]) -> str:
+    runtime_identity = item.get("runtime_identity") if isinstance(item.get("runtime_identity"), dict) else {}
+    return str(
+        item.get("name")
+        or item.get("model")
+        or runtime_identity.get("model")
+        or runtime_identity.get("name")
+        or ""
+    )
+
+
+def _model_identity_digest(item: Dict[str, Any]) -> str:
+    runtime_identity = item.get("runtime_identity") if isinstance(item.get("runtime_identity"), dict) else {}
+    return str(
+        item.get("digest")
+        or item.get("model_digest_resolved")
+        or item.get("model_digest")
+        or runtime_identity.get("digest")
+        or runtime_identity.get("model_digest")
+        or ""
+    )
+
+
+def stable_model_identity(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a stable identity record for role and no-self-judging checks."""
+    name = _model_identity_name(item)
+    digest = _model_identity_digest(item)
+    identity_type = "digest" if digest else "name"
+    identity_value = digest or name
+    return {
+        "name": name,
+        "digest": digest or None,
+        "identity_type": identity_type,
+        "identity_value": identity_value,
+        "identity_key": f"{identity_type}:{identity_value}" if identity_value else "",
+        "roles": _model_roles(item),
+        "policy_version": MODEL_ROLE_POLICY_VERSION,
+    }
+
+
+def same_stable_model_identity(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
+    """Compare stable model identity, preferring digest over name fallback.
+
+    If both sides expose digests, digest equality is authoritative.  If either
+    side lacks a digest, matching names are treated conservatively as the same
+    identity so a row is never self-judged merely because digest metadata was
+    incomplete.
+    """
+    left_digest = _model_identity_digest(left)
+    right_digest = _model_identity_digest(right)
+    if left_digest and right_digest:
+        return left_digest == right_digest
+    left_name = _model_identity_name(left)
+    right_name = _model_identity_name(right)
+    return bool(left_name and right_name and left_name == right_name)
+
+
+def resolve_independent_judge_for_row(
+    row: Dict[str, Any],
+    qualified_judges: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Select the first qualified judge whose stable identity differs from row.
+
+    The input order must already be the Stage 1A deterministic selection order
+    after Stage 1B qualification.  This function does not fabricate judges and
+    never returns a self-identical judge for the source row.
+    """
+    source_identity = stable_model_identity(row)
+    attempts: List[Dict[str, Any]] = []
+    for index, judge in enumerate(qualified_judges):
+        if judge.get("qualified") is False:
+            continue
+        roles = _model_roles(judge)
+        if roles and "judge" not in roles:
+            attempts.append({
+                "index": index,
+                "judge": _candidate_name(judge),
+                "judge_identity": stable_model_identity(judge),
+                "status": "skipped_missing_judge_role",
+            })
+            continue
+        same_identity = same_stable_model_identity(row, judge)
+        attempt = {
+            "index": index,
+            "judge": _candidate_name(judge),
+            "judge_identity": stable_model_identity(judge),
+            "status": "rejected_self_identity" if same_identity else "selected_independent_judge",
+        }
+        attempts.append(attempt)
+        if not same_identity:
+            return {
+                "status": "selected_independent_judge",
+                "judge": judge,
+                "judge_model": _candidate_name(judge),
+                "judge_digest": _candidate_digest(judge) or _model_identity_digest(judge) or None,
+                "source_identity": source_identity,
+                "attempts": attempts,
+                "policy_version": MODEL_ROLE_POLICY_VERSION,
+            }
+    return {
+        "status": "awaiting_independent_judge",
+        "judge": None,
+        "judge_model": None,
+        "judge_digest": None,
+        "source_identity": source_identity,
+        "attempts": attempts,
+        "policy_version": MODEL_ROLE_POLICY_VERSION,
+    }
+
+
 def _candidate_capabilities(item: Dict[str, Any]) -> List[str]:
     return [str(value).lower() for value in (item.get("capabilities") or item.get("runtime_capabilities") or []) if str(value)]
 
@@ -1800,8 +1937,6 @@ def build_judge_selection(
 
     by_name, identity_rejections = _resolve_inventory_identities(inventory)
     rejection_reasons.extend(identity_rejections)
-    cohort_names = {_candidate_name(item) for item in cohort}
-    cohort_digests = {_candidate_digest(item) for item in cohort if _candidate_digest(item)}
     cohort_families = [str(item.get("architecture_family") or "") for item in cohort if item.get("architecture_family")]
     majority = _deterministic_majority_family(cohort_families)
 
@@ -1827,8 +1962,9 @@ def build_judge_selection(
             rejection_reasons.append({"model": name, "source": source, "reason": "not_in_inventory"})
             continue
         digest = _candidate_digest(item)
-        if name in cohort_names or (digest and digest in cohort_digests):
-            rejection_reasons.append({"model": name, "digest": digest, "source": source, "reason": "in_tested_cohort"})
+        roles = _model_roles(item)
+        if roles and "judge" not in roles:
+            rejection_reasons.append({"model": name, "digest": digest, "source": source, "reason": "missing_judge_role", "roles": roles})
             continue
         excluded = _is_excluded_judge_family(item, exclusions)
         if excluded and not (source == "configured_primary" and policy.allow_excluded_primary):
@@ -1861,6 +1997,8 @@ def build_judge_selection(
             "selection_index": index,
             "canonical_families": _canonical_candidate_families(item),
             "excluded_family_override": bool(excluded and source == "configured_primary" and policy.allow_excluded_primary),
+            "roles": roles,
+            "stable_identity": stable_model_identity(item),
         })
 
     return JudgeSelectionResult(
@@ -1885,6 +2023,8 @@ def qualify_judge(client: Any, candidate: Dict[str, Any], *, repeats: int = 2) -
     name = str(candidate.get("name") or "")
     result: Dict[str, Any] = {"model": name, "digest": candidate.get("digest"),
                               "capabilities": candidate.get("capabilities") or [],
+                              "roles": _model_roles(candidate),
+                              "stable_identity": stable_model_identity(candidate),
                               "policy_version": JUDGE_POLICY_VERSION, "qualified": False,
                               "checks": {}, "selection_rationale": ""}
     if not _judge_candidate_is_generative(candidate):
@@ -1894,6 +2034,8 @@ def qualify_judge(client: Any, candidate: Dict[str, Any], *, repeats: int = 2) -
 
     qualification = qualify_candidate(client, candidate, repeats=max(2, int(repeats)))
     qualification["selection_rationale"] = qualification["aggregate_disposition"]
+    qualification["roles"] = _model_roles(candidate)
+    qualification["stable_identity"] = stable_model_identity(candidate)
     return qualification
 
 
@@ -1928,6 +2070,24 @@ def select_qualified_campaign_judge(client: Any, selection: JudgeSelectionResult
         if qualification.get("qualified"):
             return candidate, qualifications
     return None, qualifications
+
+
+def select_qualified_campaign_judges(client: Any, selection: JudgeSelectionResult) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Return every qualified judge in Stage 1A order after Stage 1B checks."""
+    qualified: List[Dict[str, Any]] = []
+    qualifications: List[Dict[str, Any]] = []
+    for candidate in selection.final_eligible_order:
+        qualification = qualify_judge(client, candidate)
+        qualifications.append(qualification)
+        if qualification.get("qualified"):
+            qualified.append({
+                **candidate,
+                "qualified": True,
+                "qualification": qualification,
+                "stable_identity": stable_model_identity(candidate),
+                "roles": _model_roles(candidate),
+            })
+    return qualified, qualifications
 
 
 def adopt_campaign(paths: CampaignPaths, *, rankings_dir: Path, dry_run: bool = True) -> Dict[str, Any]:
@@ -1965,8 +2125,19 @@ def adopt_campaign(paths: CampaignPaths, *, rankings_dir: Path, dry_run: bool = 
     judge_selection = json.loads(selection_path.read_text()) if selection_path.exists() else {}
     judge = judge_selection.get("judge") or {}
     cohort_digests = {str(item.get("digest") or "") for item in judge_selection.get("cohort") or []}
-    if judge.get("digest") and str(judge["digest"]) in cohort_digests:
-        raise CampaignError("judge digest conflicts with tested cohort")
+    for judge_row in _read_jsonl(paths.judge_results):
+        if judge_row.get("status") != "judged":
+            continue
+        source_identity = {
+            "model": judge_row.get("source_model"),
+            "model_digest_resolved": judge_row.get("source_model_digest"),
+        }
+        judge_identity = {
+            "model": judge_row.get("judge_model"),
+            "digest": judge_row.get("judge_model_digest") or judge.get("digest"),
+        }
+        if same_stable_model_identity(source_identity, judge_identity):
+            raise CampaignError("self-judged row violates independent judge policy")
     if not candidate_raw.exists():
         raise CampaignError("candidate rankings evidence is missing")
     current = read_rows(rankings_dir / "master_raw.jsonl")

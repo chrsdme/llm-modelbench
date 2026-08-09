@@ -15,6 +15,14 @@ def fixture(tmp_path, *, signature="sig-new", score=100, effective_hash="h", jud
     paths.effective_rows.write_text(json.dumps({"model":"x","task":"exact","task_hash":effective_hash,"terminal_disposition":"scored","result_origin":"primary"})+'\n')
     if judge_conflict:
         (paths.judge_dir/"judge_selection.json").write_text('{"judge":{"digest":"d"},"cohort":[{"digest":"d"}]}')
+        (paths.judge_dir/"judge_results.jsonl").write_text(json.dumps({
+            "status": "judged",
+            "source_model": "x",
+            "source_model_digest": "d",
+            "source_row_hash": "source",
+            "judge_model": "x",
+            "judge_model_digest": "d",
+        }) + "\n")
     ready={"readiness":"ready_for_adoption","blockers":[]}; paths.readiness_json.write_text(json.dumps(ready)); (paths.reports_dir/"readiness.json").write_text(json.dumps(ready)); (paths.reports_dir/"readiness.md").write_text('# Ready\n')
     row={"run_id":"primary","_source_signature":signature,"model":"x","model_digest_resolved":"d","task":"exact","task_hash":"h","score":score,"reason":"new","terminal_disposition":"scored","ranking_scope":"separate","canonical_rankings":False}
     paths.candidate_rankings_dir.joinpath("master_raw.jsonl").write_text(json.dumps(row)+'\n'); paths.candidate_rankings_dir.joinpath("master_summary.json").write_text('[]')
@@ -97,7 +105,7 @@ def test_validation_refusals(tmp_path):
     paths,_=fixture(tmp_path/"hash",effective_hash="wrong"); out=canonical(tmp_path/"hash")
     with pytest.raises(campaign.CampaignError,match="task hash mismatch"): campaign.adopt_campaign(paths,rankings_dir=out)
     paths,_=fixture(tmp_path/"judge",judge_conflict=True); out=canonical(tmp_path/"judge")
-    with pytest.raises(campaign.CampaignError,match="judge digest"): campaign.adopt_campaign(paths,rankings_dir=out)
+    with pytest.raises(campaign.CampaignError,match="self-judged row"): campaign.adopt_campaign(paths,rankings_dir=out)
 
 
 def test_cli_requires_typed_confirmation_and_has_no_yes_bypass(tmp_path,monkeypatch):

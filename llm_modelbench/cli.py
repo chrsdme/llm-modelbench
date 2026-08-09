@@ -894,16 +894,18 @@ def cmd_campaign(args, cfg):
                                "calibrated": False} for item in inventory]
                 judge_policy = campaign.JudgePolicy.from_config(cfg, enabled=True)
                 judge_selection = campaign.build_judge_selection(candidates, cohort, judge_policy)
-                judge, qualifications = campaign.select_qualified_campaign_judge(client, judge_selection)
-                qualification = qualifications[-1] if qualifications else None
+                qualified_judges, qualifications = campaign.select_qualified_campaign_judges(client, judge_selection)
+                judge = qualified_judges[0] if qualified_judges else None
+                qualification = (judge or {}).get("qualification") if judge else (qualifications[-1] if qualifications else None)
                 selection = {"eligible": len(eligible), "cohort": cohort, "machine_judged_provisional": True, "judge": judge,
-                             "qualification": qualification, "qualification_chain": qualifications, "posthoc_judge_model": (judge or {}).get("name"), "posthoc_judge_digest": (judge or {}).get("digest"), "generation_judge_model": None,
+                             "qualified_judges": qualified_judges, "qualification": qualification, "qualification_chain": qualifications, "posthoc_judge_model": (judge or {}).get("name"), "posthoc_judge_digest": (judge or {}).get("digest"), "generation_judge_model": None,
+                             "model_role_policy_version": campaign.MODEL_ROLE_POLICY_VERSION,
                              "judge_policy_version": campaign.JUDGE_POLICY_VERSION,
                              "judge_policy_selection": judge_selection.to_dict()}
                 campaign._atomic_write_text(paths.judge_dir / "judge_selection.json", json.dumps(selection, indent=2, sort_keys=True))
                 if judge:
                     from . import judge_dumps
-                    judged = judge_dumps.judge_run(client, paths.primary_dir, judge_model=judge["name"], judge_mode="single")
+                    judged = judge_dumps.judge_run(client, paths.primary_dir, judge_model=judge["name"], qualified_judges=qualified_judges, judge_mode="single")
                     if (paths.primary_dir / "judge_results.jsonl").exists():
                         __import__("shutil").copy2(paths.primary_dir / "judge_results.jsonl", paths.judge_results)
                     campaign._atomic_write_text(paths.judge_summary, json.dumps({**judged, "selection": selection}, indent=2, sort_keys=True))
