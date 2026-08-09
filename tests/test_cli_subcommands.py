@@ -73,6 +73,30 @@ def test_repair_with_zero_actions_returns_before_prompt_client_or_sudo(tmp_path,
     assert "--force" in output
 
 
+def test_judge_dumps_requires_configured_or_cli_judge_model_before_client(monkeypatch):
+    import pytest
+    from types import SimpleNamespace
+    from llm_modelbench import cli
+
+    args = SimpleNamespace(
+        judge_model=None,
+        ctx=None,
+        think=None,
+        everything=False,
+        runs_dir="runs",
+        judge="single",
+        dry_run=True,
+        force=False,
+        run_id="run",
+        out=None,
+        mock=True,
+    )
+    cfg = SimpleNamespace(judge_model="", ctx_override=None, think="auto")
+    monkeypatch.setattr(cli, "_client", lambda *a, **k: (_ for _ in ()).throw(AssertionError("empty judge model must fail before client")))
+    with pytest.raises(SystemExit, match="requires --judge-model"):
+        cli.cmd_judge_dumps(args, cfg)
+
+
 def test_auto_confirm_requires_restart_cascade(tmp_path):
     import pytest
     from llm_modelbench import cli

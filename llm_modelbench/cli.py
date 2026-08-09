@@ -894,12 +894,7 @@ def cmd_campaign(args, cfg):
                                "calibrated": False} for item in inventory]
                 judge_policy = campaign.JudgePolicy.from_config(cfg, enabled=True)
                 judge_selection = campaign.build_judge_selection(candidates, cohort, judge_policy)
-                judge, qualifications = campaign.select_qualified_campaign_judge(
-                    client, candidates, cohort, configured=list(getattr(cfg, "judge_candidates", []) or []),
-                    excluded_families=list(getattr(cfg, "judge_family_exclusions", ["qwen"]) or []),
-                    requested_primary=getattr(cfg, "judge_model", None),
-                    allow_excluded_primary=bool(getattr(cfg, "judge_allow_excluded_primary", False)),
-                )
+                judge, qualifications = campaign.select_qualified_campaign_judge(client, judge_selection)
                 qualification = qualifications[-1] if qualifications else None
                 selection = {"eligible": len(eligible), "cohort": cohort, "machine_judged_provisional": True, "judge": judge,
                              "qualification": qualification, "qualification_chain": qualifications, "posthoc_judge_model": (judge or {}).get("name"), "posthoc_judge_digest": (judge or {}).get("digest"), "generation_judge_model": None,
@@ -956,6 +951,8 @@ def cmd_judge_dumps(args, cfg):
         cfg.ctx_override = int(args.ctx)
     if getattr(args, "think", None):
         cfg.think = args.think
+    if not str(getattr(cfg, "judge_model", "") or "").strip():
+        raise SystemExit("judge-dumps requires --judge-model or configured judge_model")
     client = _client(args, cfg)
 
     if args.everything:

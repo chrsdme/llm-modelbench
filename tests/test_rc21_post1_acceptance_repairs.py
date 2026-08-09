@@ -33,10 +33,11 @@ def test_judge_qualification_uses_deterministic_fallback_chain():
                 return {"ok": False, "error": "HTTP 400 unsupported endpoint"}
             return {"ok": True, "text": '{"score": 90, "confidence": 1, "verdict": "correct"}'}
 
-    selected, chain = campaign.select_qualified_campaign_judge(Fallback(), [
+    selection = campaign.build_judge_selection([
         {"name": "first", "digest": "1", "capabilities": ["completion"]},
         {"name": "second", "digest": "2", "capabilities": ["completion"]},
-    ], [], configured=["first", "second"])
+    ], [], campaign.JudgePolicy(configured_fallbacks=("first", "second"), excluded_families=("qwen",)))
+    selected, chain = campaign.select_qualified_campaign_judge(Fallback(), selection)
     assert selected["name"] == "second"
     assert [item["model"] for item in chain] == ["first", "second"]
 

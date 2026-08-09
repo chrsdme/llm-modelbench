@@ -52,3 +52,48 @@
   - Config semantics: `Config.judge_model` is primary, `judge_candidates` are fallbacks, `judge_allow_excluded_primary` is the explicit override.
   - Stage isolation: no Stage 1B qualification framework, Stage 1C role semantics, or Stage 1D full provenance work started.
   - Real-host/model prohibition: no real inference, judge qualification against live backends, benchmarks, GPU tests, model pulls/deletes, recovery against production evidence, or pushes were performed.
+
+## Corrective pass — review findings
+- Baseline for corrective pass: `f9836f47b56ef9f0d01cc42bce7779fe8a6c6d28`.
+- Approved scope: Stage 1A corrective pass only; Stage 1B not approved.
+- Re-read `AGENTS.md`, `CODEX_START.md`, `PR_RC21POST1_ACCEPTANCE_CONTROLS.md`, and `codex_prompts/stage1A.md`.
+
+### Corrective implementation
+- Replaced nondeterministic tied cohort majority resolution with `Counter` plus deterministic family-name tie-break.
+- Removed duplicate qualification-time selection rebuild. Campaign CLI now uses:
+  - `Config`
+  - `JudgePolicy.from_config(...)`
+  - `build_judge_selection(...)`
+  - `select_qualified_campaign_judge(client, judge_selection)`
+- `select_qualified_campaign_judge(...)` now consumes `JudgeSelectionResult.final_eligible_order` directly.
+- Fixed empty exclusion semantics:
+  - Defaults are applied when creating `JudgePolicy` from config.
+  - Explicit empty exclusion tuples/lists remain empty after policy creation and through the legacy wrapper.
+- Added deterministic inventory identity resolution:
+  - same name + same digest deduplicates safely;
+  - same name + different digest is rejected fail-closed with `conflicting_candidate_identity` independent of inventory order.
+- Clarified capability evidence contract:
+  - raw runtime capabilities are authoritative when present and are resolved via canonical `families_for(...)`;
+  - `supported_families` is accepted only when raw capabilities are absent, because it is canonical when produced by the capability interrogation/planning pipeline;
+  - contradictory raw embedding capability plus stale `supported_families=["text"]` is rejected.
+- Replaced arbitrary substring family exclusion with canonical family identity matching where metadata exists, and a narrow controlled name fallback for Qwen-family names.
+- Added a CLI guard so `judge-dumps` fails clearly when `Config.judge_model` is empty instead of constructing/invoking an empty judge model.
+
+### Corrective validation
+- Focused corrective tests:
+  - `.venv/bin/python -m pytest tests/test_stage1a_judge_policy.py tests/test_rc21_post1_acceptance_repairs.py tests/test_campaign.py::test_judge_selection_excludes_cohort_and_prefers_calibrated_other_family tests/test_campaign_final_acceptance.py::test_cli_forced_mock_campaign_runs_full_terminal_lifecycle tests/test_cli_subcommands.py::test_judge_dumps_requires_configured_or_cli_judge_model_before_client -q`
+  - Result after fixing a test fixture bug: `31 passed in 0.87s`.
+- Final directly affected tests:
+  - `.venv/bin/python -m pytest tests/test_stage1a_judge_policy.py tests/test_rc21_post1_acceptance_repairs.py tests/test_campaign.py tests/test_campaign_final_acceptance.py tests/test_cli_subcommands.py tests/test_config_validation.py tests/test_judge_dumps.py -q`
+  - Result: `103 passed in 1.59s`.
+- Static/check results:
+  - `.venv/bin/python -m ruff check llm_modelbench/campaign.py llm_modelbench/cli.py llm_modelbench/config.py tests/test_stage1a_judge_policy.py tests/test_rc21_post1_acceptance_repairs.py tests/test_cli_subcommands.py tests/test_campaign_final_acceptance.py` — passed.
+  - `.venv/bin/python -m compileall -q llm_modelbench tests/test_stage1a_judge_policy.py tests/test_rc21_post1_acceptance_repairs.py tests/test_cli_subcommands.py tests/test_campaign_final_acceptance.py` — passed.
+  - `git diff --check` — passed.
+- Manual inspection:
+  - No remaining `max(set(cohort_families), key=cohort_families.count)`.
+  - Campaign CLI no longer reconstructs judge policy for qualification after persistence selection.
+  - No remaining `excluded_families or ["qwen"]` in the corrected qualification path.
+  - `judge-dumps` cannot proceed with an empty judge model.
+  - Stage isolation maintained; no Stage 1B qualification framework, Stage 1C roles, or Stage 1D provenance integration was implemented.
+  - No real-host/model work was performed.
