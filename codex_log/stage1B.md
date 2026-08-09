@@ -116,3 +116,38 @@
   - Strict structured output: raw JSON and whitespace-wrapped JSON pass; prose before/after JSON fails as malformed output.
   - Stage isolation maintained; no Stage 1C role or no-self-judging logic was implemented.
   - No real Selene/Ollama/llama.cpp generation, real judge, real benchmark, or real campaign evidence was used.
+
+## Final corrective pass — residual contract defects
+- Baseline for final corrective pass: `3b4a550397f12074c9d87d923b932d06fcc69d18`.
+- Approved scope: final Stage 1B corrective pass only; Stage 1C not approved.
+- Re-read `AGENTS.md`, `CODEX_START.md`, `PR_RC21POST1_ACCEPTANCE_CONTROLS.md`, and `codex_prompts/stage1B.md`.
+
+### Final corrective implementation
+- Preserved real Ollama transport timeouts as typed timeout payloads in `OllamaClient` error normalization.
+- `_exception_payload(...)` now marks both direct `TimeoutError`/`socket.timeout` and transport wrappers whose typed `reason` is `TimeoutError`/`socket.timeout` with `error_kind="timeout"`.
+- Did not infer timeout from error-message strings.
+- Tightened qualification numeric schema validation so `score` and `confidence` accept only JSON number values represented as Python `int`/`float`.
+- Explicitly reject `bool`, strings including numeric strings, `null`, arrays, objects, and non-finite numeric values.
+- Preserved existing score/confidence range rules.
+
+### Final corrective validation
+- Focused Stage 1B tests:
+  - `.venv/bin/python -m pytest tests/test_stage1b_judge_qualification.py -q`
+  - Result: `21 passed in 0.11s`.
+- Directly affected judge/config/campaign/backend tests:
+  - `.venv/bin/python -m pytest tests/test_stage1b_judge_qualification.py tests/test_stage1a_judge_policy.py tests/test_campaign.py tests/test_cli_subcommands.py tests/test_config_validation.py tests/test_capability_workflow.py tests/test_backend.py tests/test_judge_dumps.py -q`
+  - Result: `139 passed in 0.87s`.
+- Additional campaign/Ollama-adjacent offline compatibility tests:
+  - `.venv/bin/python -m pytest tests/test_campaign_runtime_identity_resume.py tests/test_campaign_final_acceptance.py tests/test_campaign_adoption_transaction.py tests/test_campaign_cleanup_migration_hygiene.py tests/test_campaign_package_integrity.py tests/test_campaign_recovery_matrix.py tests/test_ollama_service_conflict_warning.py tests/test_ollama_service_active_unit.py tests/test_ollama_kv_broker_boundary.py -q`
+  - Result: `138 passed in 1.89s`.
+- Static/check results:
+  - `.venv/bin/python -m ruff check llm_modelbench/ollama.py llm_modelbench/judge_qualification.py tests/test_stage1b_judge_qualification.py` — passed.
+  - `.venv/bin/python -m compileall -q llm_modelbench tests/test_stage1b_judge_qualification.py` — passed.
+  - `git diff --check` — passed.
+- Manual inspection:
+  - Production timeout preservation: `OllamaClient.chat(...)` catches transport exceptions and normalizes direct or wrapped typed timeout exceptions to `ok=False, error_kind="timeout"`; qualification maps that to `rejected_timeout`.
+  - No timeout classification depends on substring matching.
+  - Qualification `_required_number(...)` no longer coerces values with `float(value)` unless the parsed JSON value is already an `int`/`float`; booleans and numeric strings fail as schema violations.
+  - The final changes are limited to Stage 1B contracts and tests.
+  - No Stage 1C model-role or no-self-judging logic was implemented.
+  - No real Selene/Ollama/llama.cpp generation, real judge, real benchmark, or real campaign evidence was used.

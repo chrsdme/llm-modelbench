@@ -1,4 +1,5 @@
 import json
+import urllib.error
 
 from llm_modelbench import campaign
 from llm_modelbench.judge_qualification import PROTOCOL_VERSION, qualify_candidate
@@ -30,6 +31,11 @@ class FakeJudgeBackend:
             return {"ok": True, "text": json.dumps(self.replacement)}
         if self.behavior == "replace_pairwise" and control_id == "pair_equal":
             return {"ok": True, "text": json.dumps(self.replacement)}
+        if self.behavior == "float_numbers" and request["mode"] == "score":
+            response = self._score_response(control_id)
+            response["score"] = float(response["score"])
+            response["confidence"] = 0.75
+            return {"ok": True, "text": json.dumps(response)}
         if self.behavior == "whitespace_json" and control_id == "obviously_correct":
             return {"ok": True, "text": " \n\t" + json.dumps(self._score_response(control_id)) + "\n "}
         if self.behavior == "prose_before_json" and control_id == "obviously_correct":
@@ -173,6 +179,45 @@ def test_ollama_chat_propagates_per_request_timeout_to_stream_transport():
     assert observed == {"path": "/api/chat", "timeout": 1.25}
 
 
+def test_ollama_chat_preserves_direct_transport_timeout_error_kind():
+    client = OllamaClient(timeout=300)
+
+    def fake_post_stream(path, payload, timeout=None):
+        raise TimeoutError("stream timed out")
+
+    client._post_stream = fake_post_stream
+    result = client.chat("judge", "prompt", think="auto", timeout=1.25)
+    assert result["ok"] is False
+    assert result["error_kind"] == "timeout"
+
+
+def test_ollama_chat_preserves_wrapped_transport_timeout_error_kind():
+    client = OllamaClient(timeout=300)
+
+    def fake_post_stream(path, payload, timeout=None):
+        raise urllib.error.URLError(TimeoutError("stream timed out"))
+
+    client._post_stream = fake_post_stream
+    result = client.chat("judge", "prompt", think="auto", timeout=1.25)
+    assert result["ok"] is False
+    assert result["error_kind"] == "timeout"
+
+
+def test_qualification_rejects_ollama_transport_timeout_as_timeout_without_live_network():
+    client = OllamaClient(timeout=300)
+    client.supports_thinking = lambda model: False
+
+    def fake_post_stream(path, payload, timeout=None):
+        raise TimeoutError("stream timed out")
+
+    client._post_stream = fake_post_stream
+    result = qualify_candidate(client, _candidate(), timeout_seconds=1.25)
+    assert result["qualified"] is False
+    assert result["aggregate_disposition"] == "rejected_timeout"
+    assert result["checks"]["timeout"] is True
+    assert len(result["controls"]) == 1
+
+
 def test_malformed_structured_judge_output_rejects_candidate():
     result = qualify_candidate(FakeJudgeBackend("malformed_output"), _candidate())
     assert result["qualified"] is False
@@ -258,6 +303,14 @@ def test_raw_json_and_surrounding_whitespace_are_valid_structured_outputs():
     assert whitespace["qualified"] is True
 
 
+def test_json_number_fields_accept_real_int_and_float_numbers():
+    result = qualify_candidate(FakeJudgeBackend("float_numbers"), _candidate())
+    assert result["qualified"] is True
+    first = result["controls"][0]["parse"]["parsed"]
+    assert first["score"] == 95.0
+    assert first["confidence"] == 0.75
+
+
 def test_prose_before_or_after_json_is_malformed_structured_output():
     before = qualify_candidate(FakeJudgeBackend("prose_before_json"), _candidate())
     after = qualify_candidate(FakeJudgeBackend("prose_after_json"), _candidate())
@@ -281,8 +334,16 @@ def test_score_schema_requires_every_declared_field_and_type():
         cases.append((f"missing_{field}", payload))
     cases.extend([
         ("score_must_be_numeric", {**_valid_score_response(), "score": "high"}),
+        ("score_must_be_numeric", {**_valid_score_response(), "score": "95"}),
         ("score_must_be_numeric", {**_valid_score_response(), "score": True}),
+        ("score_must_be_numeric", {**_valid_score_response(), "score": None}),
+        ("score_must_be_numeric", {**_valid_score_response(), "score": []}),
+        ("score_must_be_numeric", {**_valid_score_response(), "score": {}}),
+        ("score_must_be_finite_number", {**_valid_score_response(), "score": float("nan")}),
+        ("score_must_be_finite_number", {**_valid_score_response(), "score": float("inf")}),
         ("confidence_must_be_numeric", {**_valid_score_response(), "confidence": "certain"}),
+        ("confidence_must_be_numeric", {**_valid_score_response(), "confidence": "0.9"}),
+        ("confidence_must_be_finite_number", {**_valid_score_response(), "confidence": float("nan")}),
         ("verdict_must_be_nonempty_string", {**_valid_score_response(), "verdict": ""}),
         ("rubric_adherence_must_be_boolean", {**_valid_score_response(), "rubric_adherence": "true"}),
         ("reference_used_must_be_boolean", {**_valid_score_response(), "reference_used": 1}),
@@ -305,6 +366,8 @@ def test_pairwise_schema_requires_every_declared_field_and_type():
         ("invalid_pairwise_winner", {**_valid_pairwise_response(), "winner": "C"}),
         ("winner_must_be_nonempty_string", {**_valid_pairwise_response(), "winner": 7}),
         ("confidence_must_be_numeric", {**_valid_pairwise_response(), "confidence": "certain"}),
+        ("confidence_must_be_numeric", {**_valid_pairwise_response(), "confidence": "0.9"}),
+        ("confidence_must_be_finite_number", {**_valid_pairwise_response(), "confidence": float("nan")}),
         ("verdict_must_be_nonempty_string", {**_valid_pairwise_response(), "verdict": ""}),
     ])
     for expected_error, replacement in cases:

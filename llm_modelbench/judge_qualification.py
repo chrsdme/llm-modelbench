@@ -8,6 +8,7 @@ campaign judging and is fully testable with fake backends.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -268,12 +269,11 @@ def _required_number(data: Dict[str, Any], field: str, *, low: float, high: floa
     if field not in data:
         return None, _schema_violation(f"missing_{field}", data)
     value = data.get(field)
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None, _schema_violation(f"{field}_must_be_numeric", data)
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None, _schema_violation(f"{field}_must_be_numeric", data)
+    number = float(value)
+    if not math.isfinite(number):
+        return None, _schema_violation(f"{field}_must_be_finite_number", data)
     if not low <= number <= high:
         disposition = "score_out_of_range" if field == "score" else "schema_violation"
         return None, {"ok": False, "disposition": disposition, "error": f"{field}_out_of_range:{number}", "parsed": data}

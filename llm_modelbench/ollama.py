@@ -23,7 +23,8 @@ from typing import Any, Dict, List, Optional
 def _exception_payload(exc: Exception) -> Dict[str, Any]:
     """Preserve HTTP status and response body instead of reducing failures to repr()."""
     payload: Dict[str, Any] = {"error": repr(exc)}
-    if isinstance(exc, (TimeoutError, socket.timeout)):
+    reason = getattr(exc, "reason", None)
+    if isinstance(exc, (TimeoutError, socket.timeout)) or isinstance(reason, (TimeoutError, socket.timeout)):
         payload["error_kind"] = "timeout"
     if isinstance(exc, urllib.error.HTTPError):
         payload["http_status"] = getattr(exc, "code", None)
