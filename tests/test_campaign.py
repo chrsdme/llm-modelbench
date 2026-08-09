@@ -614,12 +614,15 @@ def test_campaign_adoption_dry_run_and_transactional_temp_canonical(tmp_path):
 
 def test_execute_recovery_phase_persists_attempt_and_preserves_primary(tmp_path):
     paths, manifest = campaign.create_campaign("recover_exec", models=["x"], campaigns_root=tmp_path / "campaigns")
-    paths.primary_raw_results.write_text(json.dumps({"model": "x", "task": "exact", "error_kind": "thinking_only"}) + "\n")
+    primary = {"model": "x", "task": "exact", "error_kind": "thinking_only"}
+    paths.primary_raw_results.write_text(json.dumps(primary) + "\n")
+    source = campaign._primary_row_hash(primary)
     manifest = campaign.transition(paths, manifest, "planned")
     campaign.transition(paths, manifest, "generating")
     before = paths.primary_raw_results.read_bytes()
     class Plan:
-        def to_dict(self): return {"actions": [{"kind": "retry_generation"}]}
+        def to_dict(self): return {"actions": [{"action_id": "a1", "kind": "retry_generation",
+                                                "source_row_hashes": {"exact": source}}]}
     def build(*args, **kwargs): return Plan()
     def apply(*args, **kwargs):
         return {"actions": [{"status": "recovered", "reason": "visible score=0", "score": 0}], "completed": 1}

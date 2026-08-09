@@ -5,17 +5,24 @@ from llm_modelbench import campaign
 
 
 class Plan:
-    def to_dict(self): return {"actions": [{"kind": "retry_generation"}]}
+    def __init__(self, source):
+        self.source = source
+
+    def to_dict(self):
+        return {"actions": [{"action_id": "a1", "kind": "retry_generation",
+                             "source_row_hashes": {"exact": self.source}}]}
 
 
 def _run(tmp_path, actions):
     paths, manifest = campaign.create_campaign("matrix", models=["m"], campaigns_root=tmp_path / "campaigns")
-    paths.primary_raw_results.write_text('{"model":"m","task":"exact","error_kind":"thinking_only"}\n')
+    primary = {"model": "m", "task": "exact", "error_kind": "thinking_only"}
+    paths.primary_raw_results.write_text(json.dumps(primary) + "\n")
+    source = campaign._primary_row_hash(primary)
     manifest = campaign.transition(paths, manifest, "planned")
     campaign.transition(paths, manifest, "generating")
     before = paths.primary_raw_results.read_bytes()
     result = campaign.execute_recovery_phase(
-        paths, object(), object(), build_plan_fn=lambda *a, **k: Plan(),
+        paths, object(), object(), build_plan_fn=lambda *a, **k: Plan(source),
         apply_plan_fn=lambda *a, **k: {"actions": actions, "completed": len(actions)},
     )
     records = [json.loads(line) for line in paths.recovery_attempts.read_text().splitlines()]

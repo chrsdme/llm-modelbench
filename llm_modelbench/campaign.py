@@ -24,7 +24,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from .classify import families_for, families_from_capabilities
 
@@ -1176,11 +1176,25 @@ TERMINAL_DISPOSITIONS = {
     "awaiting_independent_judge", "judge_exhausted_unavailable",
     "timeout", "transient_backend_failure", "backend_failure", "judge_output_failure",
 }
+JUDGE_RECOVERY_TERMINAL_STATES = {
+    "awaiting_external_judge", "awaiting_independent_judge", "judge_exhausted_unavailable",
+    "judge_output_failure",
+}
+TRANSIENT_GENERATION_ERROR_KINDS = {"timeout", "transient_backend_failure"}
 
 
 def visible_answer(row: Dict[str, Any]) -> bool:
     """A scored row, including score zero, is immutable evidence not a retry cue."""
     return row.get("score") is not None and not row.get("error_kind")
+
+
+def _row_evidence_lane(row: Dict[str, Any]) -> str:
+    lane = str(row.get("evidence_lane") or row.get("lane") or row.get("source_lane") or "").lower()
+    if lane:
+        return lane
+    if row.get("judge_failure_disposition") or row.get("judge_source_row_hash") or row.get("judge_row_hash"):
+        return "judge"
+    return str(row.get("result_origin") or "generation").lower()
 
 
 def recovery_profiles(default_budget: int, *, allow_extended: bool = False) -> List[Dict[str, Any]]:
@@ -1199,6 +1213,14 @@ def classify_recovery_row(row: Dict[str, Any]) -> Dict[str, Any]:
     if visible_answer(row):
         return {"disposition": "scored", "retry": False, "reason": "visible scorable answer"}
     kind = str(row.get("error_kind") or "")
+    lane = _row_evidence_lane(row)
+    status = str(row.get("status") or row.get("disposition") or "")
+    if lane == "judge" or kind in JUDGE_RECOVERY_TERMINAL_STATES or status in JUDGE_RECOVERY_TERMINAL_STATES:
+        return {
+            "disposition": status or kind or "awaiting_external_judge",
+            "retry": False,
+            "reason": "judge-side state is not a generation recovery cue",
+        }
     text = str(row.get("error") or row.get("reason") or "").lower()
     if kind in {"capability_unavailable", "confirmed_capability_unavailable"}:
         return {"disposition": "confirmed_capability_unavailable", "retry": False, "reason": kind}
@@ -1212,6 +1234,8 @@ def classify_recovery_row(row: Dict[str, Any]) -> Dict[str, Any]:
         return {"disposition": "thinking_only_pending_retry", "retry": True, "reason": kind}
     if kind == "empty_output":
         return {"disposition": "empty_output_pending_retry", "retry": True, "reason": kind}
+    if kind in TRANSIENT_GENERATION_ERROR_KINDS:
+        return {"disposition": "transient_retry_pending", "retry": True, "reason": kind}
     if "timeout" in text or " 5" in text or "http" in text and "5" in text:
         return {"disposition": "transient_retry_pending", "retry": True, "reason": "transient transport failure"}
     if kind == "harness_error":
@@ -1223,47 +1247,156 @@ def classify_recovery_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return {"disposition": "harness_failure", "retry": False, "reason": "unscorable row without error classification"}
 
 
+def _source_identity(row: Dict[str, Any], source_hash: Optional[str] = None) -> Dict[str, Any]:
+    return {
+        "source_row_hash": str(source_hash or _primary_row_hash(row)),
+        "task": str(row.get("task") or ""),
+        "model": str(row.get("model") or ""),
+        "model_digest": str(row.get("model_digest_resolved") or row.get("model_digest") or ""),
+    }
+
+
+def _sorted_identities(values: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(
+        values,
+        key=lambda item: (
+            str(item.get("source_row_hash") or ""),
+            str(item.get("task") or ""),
+            str(item.get("model_digest") or ""),
+            str(item.get("model") or ""),
+            str(item.get("action_id") or ""),
+        ),
+    )
+
+
 def reconcile_recovery_rows(rows: List[Dict[str, Any]], *, excluded: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Make recovery eligibility a complete row-level accounting, never an allowlist.
 
     ``excluded`` is intentionally keyed by immutable source-row hash and must
     state an operator/policy reason.  A caller may fail closed on ``balanced``.
     """
-    excluded = excluded or {}
-    eligible, planned, terminal = [], [], []
+    excluded = {str(source): str(reason) for source, reason in (excluded or {}).items()}
+    eligible: List[str] = []
+    planned: List[str] = []
+    terminal: List[Dict[str, Any]] = []
+    classifications: List[Dict[str, Any]] = []
+    eligible_identities: List[Dict[str, Any]] = []
+    invalid_exclusions: List[Dict[str, Any]] = []
     for row in rows:
         source = _primary_row_hash(row)
         state = classify_recovery_row(row)
+        category = "recovery_eligible" if state["retry"] else "terminal_non_retry"
+        classification = _source_identity(row, source) | {
+            "category": category,
+            "disposition": state["disposition"],
+            "reason": state["reason"],
+        }
+        classifications.append(classification)
         if state["retry"]:
             eligible.append(source)
+            eligible_identities.append(_source_identity(row, source))
             if source in excluded:
-                terminal.append({"source_row_hash": source, "reason": excluded[source]})
+                reason = str(excluded[source])
+                terminal.append(_source_identity(row, source) | {"reason": reason})
             else:
                 planned.append(source)
+    eligible_set = set(eligible)
+    for source, reason in sorted(excluded.items()):
+        reason_text = str(reason)
+        if not reason_text.strip():
+            invalid_exclusions.append({"source_row_hash": str(source), "reason": reason_text, "error": "empty_reason"})
+        if source not in eligible_set:
+            invalid_exclusions.append({"source_row_hash": str(source), "reason": reason_text, "error": "unexpected_exclusion"})
+    excluded_set = {str(item["source_row_hash"]) for item in terminal}
     return {
         "eligible_rows": len(eligible), "planned_actions_rows": len(planned),
         "explicitly_excluded_rows": len(terminal), "eligible_source_row_hashes": eligible,
         "planned_source_row_hashes": planned, "explicit_exclusions": terminal,
-        "balanced": len(eligible) == len(planned) + len(terminal),
+        "row_classifications": _sorted_identities(classifications),
+        "eligible_source_identities": _sorted_identities(eligible_identities),
+        "invalid_exclusions": invalid_exclusions,
+        "unexpected_exclusions": sorted(str(source) for source in set(excluded) - eligible_set),
+        "balanced": bool(set(planned) | excluded_set == eligible_set
+                         and not (set(planned) & excluded_set)
+                         and not invalid_exclusions
+                         and len(eligible) == len(set(eligible))),
         "policy_version": RECOVERY_POLICY_VERSION,
     }
 
 
-def assert_recovery_reconciled(rows: List[Dict[str, Any]], plan: Dict[str, Any], *, excluded: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-    """Refuse execution/package when every eligible source row is not accounted for."""
+def recovery_reconciliation_evidence(rows: List[Dict[str, Any]], plan: Dict[str, Any],
+                                     *, excluded: Optional[Dict[str, str]] = None,
+                                     native: bool = True) -> Dict[str, Any]:
+    """Return exact pre-execution recovery accounting without mutating inputs."""
     reconciliation = reconcile_recovery_rows(rows, excluded=excluded)
-    action_sources = {
-        str(source) for action in plan.get("actions") or []
-        for source in (action.get("source_row_hashes") or {}).values() if source
-    }
-    # Older external repair-plan adapters did not expose source hashes.  Keep
-    # their diagnostic compatibility, but all native plans carry source hashes
-    # and therefore fail closed if an eligible row is omitted.
-    missing = (sorted(set(reconciliation["planned_source_row_hashes"]) - action_sources)
-               if action_sources or not (plan.get("actions") or []) else [])
-    reconciliation["unattributed_plan_actions"] = bool((plan.get("actions") or []) and not action_sources)
-    reconciliation["missing_planned_actions"] = missing
-    reconciliation["balanced"] = bool(reconciliation["balanced"] and not missing)
+    actions = list(plan.get("actions") or [])
+    eligible_set = set(reconciliation["eligible_source_row_hashes"])
+    excluded_set = {str(item["source_row_hash"]) for item in reconciliation["explicit_exclusions"]}
+    planned: List[str] = []
+    planned_identities: List[Dict[str, Any]] = []
+    unattributed: List[Dict[str, Any]] = []
+    for index, action in enumerate(actions):
+        source_map = action.get("source_row_hashes") or {}
+        if not source_map:
+            unattributed.append({"action_index": index, "action_id": action.get("action_id"), "reason": "missing_source_row_hashes"})
+            continue
+        for task, source in sorted(source_map.items()):
+            source_text = str(source or "")
+            if not source_text:
+                unattributed.append({
+                    "action_index": index,
+                    "action_id": action.get("action_id"),
+                    "task": str(task),
+                    "reason": "empty_source_row_hash",
+                })
+                continue
+            planned.append(source_text)
+            planned_identities.append({
+                "source_row_hash": source_text,
+                "task": str(task),
+                "model": str(action.get("model") or ""),
+                "model_digest": str(action.get("model_digest") or ""),
+                "action_id": str(action.get("action_id") or ""),
+                "kind": str(action.get("kind") or ""),
+            })
+    counts = Counter(planned)
+    duplicate_planned = sorted(source for source, count in counts.items() if count > 1)
+    planned_set = set(planned)
+    missing = sorted(eligible_set - planned_set - excluded_set)
+    unexpected_planned = sorted(planned_set - eligible_set)
+    overlap = sorted(planned_set & excluded_set)
+    unexpected_exclusions = sorted(excluded_set - eligible_set)
+    exact = bool(
+        eligible_set == (planned_set | excluded_set)
+        and not overlap
+        and not unexpected_planned
+        and not unexpected_exclusions
+        and not duplicate_planned
+        and not reconciliation["invalid_exclusions"]
+        and not missing
+        and (not native or not unattributed)
+    )
+    reconciliation.update({
+        "planned_source_row_hashes": sorted(planned_set),
+        "planned_source_identities": _sorted_identities(planned_identities),
+        "missing_source_row_hashes": missing,
+        "missing_planned_actions": missing,
+        "unexpected_planned_source_row_hashes": unexpected_planned,
+        "unexpected_exclusion_source_row_hashes": unexpected_exclusions,
+        "overlapping_planned_and_excluded_source_row_hashes": overlap,
+        "duplicate_planned_source_row_hashes": duplicate_planned,
+        "unattributed_plan_actions": unattributed,
+        "native_plan": bool(native),
+        "exact": exact,
+        "balanced": exact,
+    })
+    return reconciliation
+
+
+def assert_recovery_reconciled(rows: List[Dict[str, Any]], plan: Dict[str, Any], *, excluded: Optional[Dict[str, str]] = None,
+                               native: bool = True) -> Dict[str, Any]:
+    """Refuse execution/package when every eligible source row is not accounted for."""
+    reconciliation = recovery_reconciliation_evidence(rows, plan, excluded=excluded, native=native)
     if not reconciliation["balanced"]:
         raise CampaignError("recovery_plan_incomplete")
     return reconciliation
@@ -1287,9 +1420,11 @@ def execute_recovery_phase(paths: CampaignPaths, client: Any, cfg: Any, *, budge
                          judge_mode="off", include_missing=False)
     _atomic_write_text(paths.recovery_plan, json.dumps(plan.to_dict(), indent=2, sort_keys=True))
     primary_rows = _read_jsonl(paths.primary_raw_results)
-    reconciliation = assert_recovery_reconciled(primary_rows, plan.to_dict())
+    reconciliation = recovery_reconciliation_evidence(primary_rows, plan.to_dict())
     persisted_plan = plan.to_dict() | {"reconciliation": reconciliation}
     _atomic_write_text(paths.recovery_plan, json.dumps(persisted_plan, indent=2, sort_keys=True))
+    if not reconciliation["balanced"]:
+        raise CampaignError("recovery_plan_incomplete")
     result = apply_plan_fn(client, cfg, plan, rankings_dir=paths.candidate_rankings_dir, ranking_scope="separate")
     records = []
     for index, action in enumerate(result.get("actions", []), 1):

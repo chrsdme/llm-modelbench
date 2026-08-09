@@ -648,6 +648,8 @@ def build_plan(
     gpu_total_gb: Optional[float] = None,
     force: bool = False,
 ) -> RepairPlan:
+    from .campaign import classify_recovery_row
+
     if int(think_retry_num_predict) <= 0:
         raise ValueError("think retry --num-predict must be greater than zero")
     if float(emergency_headroom_gb) < 0:
@@ -729,7 +731,28 @@ def build_plan(
     for row in current:
         task_id = str(row.get("task") or "")
         task = _TASKS.get(task_id)
-        if task is None or task.difficulty <= 0:
+        recovery_state = classify_recovery_row(row)
+        if task is None:
+            if recovery_state["retry"]:
+                disposition = str(recovery_state.get("disposition") or "")
+                if disposition in {"thinking_only_pending_retry", "empty_output_pending_retry"}:
+                    profiles = _thinking_retry_profiles(row, int(think_retry_num_predict))
+                    add_action(
+                        "retry_generation", row, [task_id],
+                        f"{recovery_state['reason']}: bounded visible-answer recovery",
+                        overrides={"retry_profiles": profiles},
+                        details={"attempt_limit": len(profiles), "unknown_task": True},
+                    )
+                else:
+                    add_action("retry_transient", row, [task_id], "transient runtime/API failure; unload and retry once")
+            else:
+                observations.append({
+                    "kind": "unknown_task_not_repairable", "model": row.get("model"),
+                    "run_id": row.get("run_id"), "task": task_id,
+                    "reason": recovery_state["reason"],
+                })
+            continue
+        if task.difficulty <= 0 and not recovery_state["retry"]:
             continue
         error_kind = str(row.get("error_kind") or "")
         text = _error_text(row)
@@ -748,7 +771,7 @@ def build_plan(
                            "model build; generic --force does not re-probe terminal capability evidence"),
             })
             continue
-        if error_kind and task.family not in current_families:
+        if error_kind and task.family not in current_families and not recovery_state["retry"]:
             observations.append({
                 "kind": "obsolete_misrouted_task", "model": row.get("model"),
                 "run_id": row.get("run_id"), "task": task_id,
@@ -779,6 +802,9 @@ def build_plan(
                     overrides={"retry_profiles": profiles},
                     details={"attempt_limit": len(profiles)},
                 )
+            continue
+        if recovery_state["retry"] and str(recovery_state.get("disposition") or "") == "transient_retry_pending":
+            add_action("retry_transient", row, [task_id], "transient runtime/API failure; unload and retry once")
             continue
         if error_kind == "harness_error":
             if task.family in {"vision", "tools", "insert"} and (_HTTP_400_RE.search(text) or _TRANSIENT_RE.search(text)):
