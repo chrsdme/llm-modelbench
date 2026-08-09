@@ -15,8 +15,8 @@ def _hash(row):
     return campaign._primary_row_hash(row)
 
 
-def _action(rows, *, action_id="a1", status="recovered"):
-    return {
+def _action(rows, *, action_id="a1", status="recovered", attempt_limit=1):
+    action = {
         "action_id": action_id,
         "kind": "retry_generation",
         "model": "m",
@@ -25,6 +25,9 @@ def _action(rows, *, action_id="a1", status="recovered"):
         "source_row_hashes": {row["task"]: _hash(row) for row in rows},
         "status": status,
     }
+    if attempt_limit != 1:
+        action["overrides"] = {"retry_profiles": [{} for _ in range(attempt_limit)]}
+    return action
 
 
 def _child(source, *, task=None, score=100, error_kind=None, reason="ok", model="m", digest="d", action_id="a1",
@@ -182,7 +185,7 @@ def test_stage2b_duplicate_child_attribution_fails():
 
 def test_stage2b_legitimate_two_attempt_chain_is_not_duplicate():
     source = _primary(error_kind="thinking_only")
-    evidence = _stage2b([source], [_action([source])], [
+    evidence = _stage2b([source], [_action([source], attempt_limit=2)], [
         _child(source, score=None, error_kind="thinking_only", child_id="c1", attempt=1),
         _child(source, score=100, child_id="c2", attempt=2),
     ])
@@ -193,7 +196,7 @@ def test_stage2b_legitimate_two_attempt_chain_is_not_duplicate():
 
 def test_stage2b_three_attempt_chain_ending_visible_zero_final_scored():
     source = _primary(error_kind="thinking_only")
-    evidence = _stage2b([source], [_action([source])], [
+    evidence = _stage2b([source], [_action([source], attempt_limit=3)], [
         _child(source, score=None, error_kind="thinking_only", child_id="c1", attempt=1),
         _child(source, score=None, error_kind="empty_output", child_id="c2", attempt=2),
         _child(source, score=0, reason="visible wrong", child_id="c3", attempt=3),
@@ -205,7 +208,7 @@ def test_stage2b_three_attempt_chain_ending_visible_zero_final_scored():
 
 def test_stage2b_bounded_repeated_transient_attempts_final_terminal_transient():
     source = _primary(error_kind="timeout")
-    evidence = _stage2b([source], [_action([source])], [
+    evidence = _stage2b([source], [_action([source], attempt_limit=2)], [
         _child(source, score=None, error_kind="timeout", child_id="c1", attempt=1),
         _child(source, score=None, error_kind="timeout", child_id="c2", attempt=2),
     ])
@@ -291,11 +294,55 @@ def test_stage2b_attempt_history_and_final_outcomes_are_deterministic():
         _child(source, score=None, error_kind="thinking_only", child_id="c1", attempt=1),
         _child(source, score=None, error_kind="empty_output", child_id="c2", attempt=2),
     ]
-    first = _stage2b([source], [_action([source])], children)
-    second = _stage2b([source], [_action([source])], list(reversed(children)))
+    first = _stage2b([source], [_action([source], attempt_limit=3)], children)
+    second = _stage2b([source], [_action([source], attempt_limit=3)], list(reversed(children)))
     assert first["attempt_history"] == second["attempt_history"]
     assert len(first["final_per_row_outcomes"]) == 1
     assert first["final_per_row_outcomes"][0]["attempt_number"] == 3
+
+
+@pytest.mark.parametrize("first_score", [0, 50])
+def test_stage2b_attempt_after_first_visible_result_fails(first_score):
+    source = _primary(error_kind="empty_output")
+    evidence = _stage2b([source], [_action([source], attempt_limit=2)], [
+        _child(source, score=first_score, child_id="z-first", attempt=1),
+        _child(source, score=100, child_id="a-second", attempt=2),
+    ])
+    assert evidence["exact"] is False
+    assert any(item["reason"] == "attempt_after_visible_result" for item in evidence["invalid_child_attributions"])
+    assert [item["attempt_number"] for item in evidence["attempt_history"]] == [1, 2]
+
+
+def test_stage2b_valid_bounded_retry_sequence_from_policy_succeeds():
+    source = _primary(error_kind="thinking_only")
+    evidence = _stage2b([source], [_action([source], attempt_limit=3)], [
+        _child(source, score=None, error_kind="thinking_only", child_id="c1", attempt=1),
+        _child(source, score=None, error_kind="empty_output", child_id="c2", attempt=2),
+        _child(source, score=100, child_id="c3", attempt=3),
+    ])
+    assert evidence["exact"] is True
+    assert [item["attempt_number"] for item in evidence["attempt_history"]] == [1, 2, 3]
+
+
+@pytest.mark.parametrize("attempt", [3, 999])
+def test_stage2b_attempt_beyond_policy_bound_fails(attempt):
+    source = _primary(error_kind="timeout")
+    evidence = _stage2b([source], [_action([source], attempt_limit=2)], [
+        _child(source, score=None, error_kind="timeout", child_id="c1", attempt=1),
+        _child(source, score=None, error_kind="timeout", child_id="cX", attempt=attempt),
+    ])
+    assert evidence["exact"] is False
+    assert any(item["reason"] == "attempt_out_of_policy" for item in evidence["invalid_child_attributions"])
+
+
+def test_stage2b_malformed_bounded_attempt_gap_fails():
+    source = _primary(error_kind="timeout")
+    evidence = _stage2b([source], [_action([source], attempt_limit=3)], [
+        _child(source, score=None, error_kind="timeout", child_id="c1", attempt=1),
+        _child(source, score=None, error_kind="timeout", child_id="c3", attempt=3),
+    ])
+    assert evidence["exact"] is False
+    assert any(item["reason"] == "invalid_attempt_sequence" for item in evidence["invalid_child_attributions"])
 
 
 def test_stage2b_mixed_child_and_action_result_evidence_resolves_per_source():
@@ -396,3 +443,134 @@ def test_stage2b_invalid_post_reconciliation_is_not_effective_recovery(tmp_path)
     assert row["result_origin"] == "primary"
     assert row["terminal_disposition"] == "empty_output_pending_retry"
     assert summary["readiness"] == "not_ready_manual_items"
+
+
+def test_stage2b_readiness_uses_final_outcome_not_child_directory_order(tmp_path):
+    paths, _ = campaign.create_campaign("stage2b_authoritative_child", models=["m"], campaigns_root=tmp_path / "campaigns")
+    primary = _primary(error_kind="thinking_only")
+    before_row = json.dumps(primary) + "\n"
+    paths.primary_raw_results.write_text(before_row)
+    action = _action([primary], attempt_limit=2)
+    plan = {"actions": [action], "reconciliation": {"exact": True}}
+    paths.recovery_plan.write_text(json.dumps(plan, sort_keys=True))
+
+    later_sorting_first = paths.recovery_children_dir / "a_attempt2"
+    earlier_sorting_later = paths.recovery_children_dir / "z_attempt1"
+    later_sorting_first.mkdir(parents=True)
+    earlier_sorting_later.mkdir(parents=True)
+    attempt1 = _child(primary, score=None, error_kind="empty_output", child_id="z_attempt1", attempt=1)
+    attempt2 = _child(primary, score=0, reason="visible wrong", child_id="a_attempt2", attempt=2)
+    earlier_sorting_later.joinpath("raw_results.jsonl").write_text(json.dumps(attempt1) + "\n")
+    later_sorting_first.joinpath("raw_results.jsonl").write_text(json.dumps(attempt2) + "\n")
+    post = campaign.reconcile_recovery_post_execution([primary], plan, {"actions": []}, [attempt1, attempt2])
+    assert post["exact"] is True
+    paths.recovery_result.write_text(json.dumps({
+        "actions": [{"action_id": "a1", "tasks": ["json_extract"], "status": "recovered"}],
+        "post_execution_reconciliation": post,
+    }, sort_keys=True))
+
+    campaign.write_readiness(paths, [primary])
+    row = json.loads(paths.effective_rows.read_text().splitlines()[0])
+    assert row["effective_score"] == 0
+    assert row["result_origin"] == "recovered"
+    assert row["terminal_disposition"] == "scored"
+    assert row["recovery_attempt_number"] == 2
+    assert row["recovery_child_id"] == "a_attempt2"
+    assert row["provenance"]["recovery_evidence_source"] == "child_raw"
+    assert paths.primary_raw_results.read_text() == before_row
+
+
+def test_stage2b_readiness_materializes_mixed_child_and_action_result_finals(tmp_path):
+    paths, _ = campaign.create_campaign("stage2b_authoritative_mixed", models=["m"], campaigns_root=tmp_path / "campaigns")
+    h1 = _primary("json_extract", error_kind="empty_output")
+    h2 = _primary("git_commit", error_kind="thinking_only")
+    primary_text = "".join(json.dumps(row) + "\n" for row in [h1, h2])
+    paths.primary_raw_results.write_text(primary_text)
+    action = _action([h1, h2])
+    plan = {"actions": [action], "reconciliation": {"exact": True}}
+    result = {"actions": [{"action_id": "a1", "tasks": ["git_commit"], "status": "recovered",
+                           "score": 0, "reason": "visible wrong"}]}
+    child_dir = paths.recovery_children_dir / "child-h1"
+    child_dir.mkdir(parents=True)
+    h1_child = _child(h1, score=100, child_id="child-h1")
+    child_dir.joinpath("raw_results.jsonl").write_text(json.dumps(h1_child) + "\n")
+    post = campaign.reconcile_recovery_post_execution([h1, h2], plan, result, [h1_child])
+    assert post["exact"] is True
+    paths.recovery_plan.write_text(json.dumps(plan, sort_keys=True))
+    paths.recovery_result.write_text(json.dumps(result | {"post_execution_reconciliation": post}, sort_keys=True))
+
+    campaign.write_readiness(paths, [h1, h2])
+    rows = [json.loads(line) for line in paths.effective_rows.read_text().splitlines()]
+    by_task = {row["task"]: row for row in rows}
+    assert by_task["json_extract"]["effective_score"] == 100
+    assert by_task["json_extract"]["recovery_child_id"] == "child-h1"
+    assert by_task["json_extract"]["provenance"]["recovery_evidence_source"] == "child_raw"
+    assert by_task["git_commit"]["effective_score"] == 0
+    assert by_task["git_commit"]["result_origin"] == "recovered"
+    assert by_task["git_commit"]["terminal_disposition"] == "scored"
+    assert by_task["git_commit"]["recovery_child_id"] is None
+    assert by_task["git_commit"]["provenance"]["recovery_evidence_source"] == "action_result"
+    assert paths.primary_raw_results.read_text() == primary_text
+
+
+def test_stage2b_readiness_materializes_action_result_only_scored_final(tmp_path):
+    paths, _ = campaign.create_campaign("stage2b_action_result_scored", models=["m"], campaigns_root=tmp_path / "campaigns")
+    primary = _primary(error_kind="empty_output")
+    paths.primary_raw_results.write_text(json.dumps(primary) + "\n")
+    action = _action([primary])
+    plan = {"actions": [action], "reconciliation": {"exact": True}}
+    result = {"actions": [{"action_id": "a1", "tasks": ["json_extract"], "status": "recovered",
+                           "score": 0, "reason": "visible wrong"}]}
+    post = campaign.reconcile_recovery_post_execution([primary], plan, result, [])
+    assert post["exact"] is True
+    paths.recovery_plan.write_text(json.dumps(plan, sort_keys=True))
+    paths.recovery_result.write_text(json.dumps(result | {"post_execution_reconciliation": post}, sort_keys=True))
+
+    campaign.write_readiness(paths, [primary])
+    row = json.loads(paths.effective_rows.read_text().splitlines()[0])
+    assert row["effective_score"] == 0
+    assert row["result_origin"] == "recovered"
+    assert row["terminal_disposition"] == "scored"
+    assert row["recovery_child_id"] is None
+    assert row["provenance"]["recovery_evidence_source"] == "action_result"
+
+
+def test_stage2b_readiness_materializes_action_result_terminal_final(tmp_path):
+    paths, _ = campaign.create_campaign("stage2b_action_result_terminal", models=["m"], campaigns_root=tmp_path / "campaigns")
+    primary = _primary(error_kind="empty_output")
+    paths.primary_raw_results.write_text(json.dumps(primary) + "\n")
+    action = _action([primary])
+    plan = {"actions": [action], "reconciliation": {"exact": True}}
+    result = {"actions": [{"action_id": "a1", "tasks": ["json_extract"], "status": "terminal_empty_output",
+                           "error_kind": "empty_output", "score": None, "reason": "still empty"}]}
+    post = campaign.reconcile_recovery_post_execution([primary], plan, result, [])
+    assert post["exact"] is True
+    paths.recovery_plan.write_text(json.dumps(plan, sort_keys=True))
+    paths.recovery_result.write_text(json.dumps(result | {"post_execution_reconciliation": post}, sort_keys=True))
+
+    campaign.write_readiness(paths, [primary])
+    row = json.loads(paths.effective_rows.read_text().splitlines()[0])
+    assert row["effective_score"] is None
+    assert row["result_origin"] == "recovery_terminal"
+    assert row["terminal_disposition"] == "terminal_empty"
+    assert row["provenance"]["recovery_evidence_source"] == "action_result"
+
+
+def test_stage2b_repeated_write_readiness_is_deterministic_with_post_reconciliation(tmp_path):
+    paths, _ = campaign.create_campaign("stage2b_readiness_idempotent", models=["m"], campaigns_root=tmp_path / "campaigns")
+    primary = _primary(error_kind="empty_output")
+    paths.primary_raw_results.write_text(json.dumps(primary) + "\n")
+    action = _action([primary])
+    plan = {"actions": [action], "reconciliation": {"exact": True}}
+    result = {"actions": [{"action_id": "a1", "tasks": ["json_extract"], "status": "recovered",
+                           "score": 0, "reason": "visible wrong"}]}
+    post = campaign.reconcile_recovery_post_execution([primary], plan, result, [])
+    paths.recovery_plan.write_text(json.dumps(plan, sort_keys=True))
+    paths.recovery_result.write_text(json.dumps(result | {"post_execution_reconciliation": post}, sort_keys=True))
+
+    first = campaign.write_readiness(paths, [primary])
+    first_rows = paths.effective_rows.read_text()
+    second = campaign.write_readiness(paths, [primary])
+    second_rows = paths.effective_rows.read_text()
+    assert first == second
+    assert first_rows == second_rows

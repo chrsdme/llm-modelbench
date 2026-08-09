@@ -153,3 +153,54 @@
   - visible final score 0 remains `scored`;
   - no Stage 3A or later work leaked in;
   - no prohibited real-host/model work occurred.
+
+## Final corrective pass after independent review
+- Corrective baseline: `cbe92493bcf53b7779c249c0956763136bbb8719`.
+- Actual HEAD before editing: `cbe92493bcf53b7779c249c0956763136bbb8719`.
+- Stage 3A is not approved and was not started.
+- Required files re-read before final corrective work: `AGENTS.md`, `CODEX_START.md`, `PR_RC21POST1_ACCEPTANCE_CONTROLS.md`, `codex_prompts/stage2B.md`, `codex_logs/Session 3/stage2B.md`.
+- Residual defects addressed:
+  - post-execution reconciliation selected the highest valid attempt instead of rejecting attempts after the first visible/scorable recovery result;
+  - native attempt numbers were validated as positive but not against the actual bounded retry profile emitted by `repair.apply_plan`;
+  - readiness/effective-row materialization could rediscover child rows by directory iteration instead of using persisted `post_execution_reconciliation.final_per_row_outcomes`.
+- Implementation:
+  - records each planned source's bounded attempt limit from the action's `overrides.retry_profiles`, matching `repair.apply_plan` semantics and treating non-`retry_generation` actions as single-attempt;
+  - rejects attempts beyond the action policy with `attempt_out_of_policy`;
+  - rejects malformed non-sequential native attempt histories with `invalid_attempt_sequence`;
+  - treats the first visible/scorable result, including score zero, as terminal evidence and rejects later attempts with `attempt_after_visible_result`;
+  - preserves full deterministic `attempt_history` and persists `reason_text`, `error_kind`, and `status` on final outcome records for later materialization;
+  - makes exact persisted `final_per_row_outcomes` authoritative for readiness child selection;
+  - resolves child-backed finals by exact child run, source hash, task, action ID and attempt number;
+  - materializes action-result-only final outcomes without fabricating a child directory;
+  - preserves invalid post-reconciliation fail-closed behavior.
+- Tests added/extended:
+  - score 0 followed by score 100 fails as attempt-after-visible;
+  - score 50 followed by score 100 fails as attempt-after-visible;
+  - thinking-only -> empty-output -> score 0 succeeds and final is scored;
+  - valid bounded retry sequence succeeds;
+  - attempt 999 and attempts beyond the declared retry profile fail;
+  - malformed attempt gaps fail;
+  - lexical child directory order cannot override final outcome attempt order;
+  - final child score 0 materializes as recovered/scored with the authoritative attempt number;
+  - mixed child_raw and action_result final outcomes both materialize;
+  - action_result-only scored and terminal finals materialize truthfully;
+  - invalid post-reconciliation remains non-effective;
+  - repeated `write_readiness` over unchanged post-reconciliation evidence is deterministic;
+  - primary raw evidence remains byte-identical.
+- Final corrective validation:
+  - `.venv/bin/python -m pytest tests/test_stage2b_recovery_post_execution.py -q` - passed, 55 tests.
+  - `.venv/bin/python -m pytest tests/test_stage2a_recovery_reconciliation.py tests/test_campaign_recovery_matrix.py tests/test_repair.py tests/test_rc9_context_repair.py tests/test_rc10_repair_truth.py -q` - passed, 119 tests, 11 skipped.
+  - `.venv/bin/python -m pytest tests/test_rc21_post1_acceptance_repairs.py tests/test_campaign.py tests/test_campaign_final_acceptance.py tests/test_campaign_runtime_identity_resume.py tests/test_campaign_package_integrity.py tests/test_cli_subcommands.py tests/test_config_validation.py tests/test_stage1a_judge_policy.py tests/test_stage1b_judge_qualification.py tests/test_stage1c_model_roles.py tests/test_stage1d_judge_integration.py tests/test_judge_dumps.py -q` - passed, 184 tests.
+  - `.venv/bin/python -m ruff check llm_modelbench/campaign.py tests/test_stage2b_recovery_post_execution.py tests/test_stage2a_recovery_reconciliation.py` - passed.
+  - `.venv/bin/python -m compileall -q llm_modelbench tests/test_stage2b_recovery_post_execution.py tests/test_stage2a_recovery_reconciliation.py` - passed.
+  - `git diff --check` - passed.
+- Final corrective manual inspection:
+  - no attempt after a visible/scorable answer can become authoritative;
+  - score zero cannot be improved by a later recovery attempt;
+  - attempt history is checked against the real bounded repair profile;
+  - `final_per_row_outcomes` is the authoritative effective-row source when exact post-reconciliation exists;
+  - child directory ordering cannot change effective evidence;
+  - action-result-only final outcomes work without fabricated child IDs;
+  - invalid post-reconciliation remains non-effective;
+  - no Stage 3A or later work leaked in;
+  - no prohibited real-host/model work occurred.
