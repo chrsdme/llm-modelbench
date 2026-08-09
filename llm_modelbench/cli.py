@@ -909,7 +909,18 @@ def cmd_campaign(args, cfg):
                 campaign._atomic_write_text(paths.judge_dir / "judge_selection.json", json.dumps(selection, indent=2, sort_keys=True))
                 if judge:
                     from . import judge_dumps
-                    judged = judge_dumps.judge_run(client, paths.primary_dir, judge_model=judge["name"], qualified_judges=qualified_judges, judge_mode="single")
+                    judged, selection = campaign.judge_run_with_structural_continuation(
+                        client,
+                        paths.primary_dir,
+                        selection=judge_selection,
+                        selection_evidence=selection,
+                        qualified_judges=qualified_judges,
+                        qualifications=qualifications,
+                        source_rows=eligible,
+                        judge_model=judge["name"],
+                        judge_mode="single",
+                    )
+                    campaign._atomic_write_text(paths.judge_dir / "judge_selection.json", json.dumps(selection, indent=2, sort_keys=True))
                     if (paths.primary_dir / "judge_results.jsonl").exists():
                         __import__("shutil").copy2(paths.primary_dir / "judge_results.jsonl", paths.judge_results)
                     campaign._atomic_write_text(paths.judge_summary, json.dumps({**judged, "selection": selection}, indent=2, sort_keys=True))

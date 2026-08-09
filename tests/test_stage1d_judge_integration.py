@@ -37,6 +37,23 @@ def _write_subjective_run(root: Path, rows):
     return run
 
 
+def _campaign_with_subjective_primary(tmp_path, campaign_id="judge_campaign"):
+    paths, manifest = campaign.create_campaign(campaign_id, models=["source"], campaigns_root=tmp_path / "campaigns")
+    run = _write_subjective_run(tmp_path / f"{campaign_id}_source", [{"model": "source", "digest": "digest-source"}])
+    paths.primary_raw_results.write_text((run / "raw_results.jsonl").read_text())
+    paths.primary_run_validity.write_text('{"status":"valid"}')
+    for source in (run / "subjective").rglob("*"):
+        if source.is_file():
+            target = paths.primary_dir / source.relative_to(run)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(source.read_text())
+    manifest = campaign.transition(paths, manifest, "planned")
+    manifest = campaign.transition(paths, manifest, "generating")
+    campaign.transition(paths, manifest, "judging")
+    raw_row = json.loads(paths.primary_raw_results.read_text().splitlines()[0])
+    return paths, raw_row
+
+
 def _policy(**kwargs):
     defaults = {
         "requested_primary": None,
@@ -64,6 +81,33 @@ def _qualified(name: str, digest: str, *, runtime_backend: str = "mock-runtime")
             "controls": [{"control_id": "synthetic", "passed": True}],
         },
     }
+
+
+def _selection_evidence(selection_result, qualified, qualifications, coverage):
+    return {
+        "eligible": 1,
+        "cohort": [{"name": "source", "digest": "digest-source"}],
+        "judge": qualified[0] if qualified else None,
+        "qualified_judges": qualified,
+        "qualification": (qualified[0].get("qualification") if qualified else None),
+        "qualification_chain": qualifications,
+        "qualification_coverage": coverage,
+        "posthoc_judge_model": (qualified[0] if qualified else {}).get("name"),
+        "posthoc_judge_digest": (qualified[0] if qualified else {}).get("digest"),
+        "judge_policy_selection": selection_result.to_dict(),
+    }
+
+
+def _selection(names):
+    inventory = [
+        {"name": name, "digest": f"digest-{name}", "roles": ["judge"], "capabilities": ["completion"]}
+        for name in names
+    ]
+    return campaign.build_judge_selection(
+        inventory,
+        [{"name": "source", "digest": "digest-source"}],
+        _policy(requested_primary=names[0], configured_fallbacks=tuple(names[1:]), excluded_families=()),
+    )
 
 
 class RecordingJudgeClient:
@@ -352,18 +396,7 @@ def test_stage1d_non_structural_failure_effective_row_and_readiness_are_truthful
 
 
 def test_stage1d_mocked_campaign_artifacts_link_selection_fallback_judge_and_readiness(monkeypatch, tmp_path):
-    paths, manifest = campaign.create_campaign("fallback_campaign", models=["source"], campaigns_root=tmp_path / "campaigns")
-    run = _write_subjective_run(tmp_path, [{"model": "source", "digest": "digest-source"}])
-    paths.primary_raw_results.write_text((run / "raw_results.jsonl").read_text())
-    paths.primary_run_validity.write_text('{"status":"valid"}')
-    for source in (run / "subjective").rglob("*"):
-        if source.is_file():
-            target = paths.primary_dir / source.relative_to(run)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(source.read_text())
-    manifest = campaign.transition(paths, manifest, "planned")
-    manifest = campaign.transition(paths, manifest, "generating")
-    campaign.transition(paths, manifest, "judging")
+    paths, raw_row = _campaign_with_subjective_primary(tmp_path, "fallback_campaign")
 
     inventory = [
         {"name": "j1", "digest": "digest-j1", "roles": ["judge"], "capabilities": ["completion"]},
@@ -388,41 +421,33 @@ def test_stage1d_mocked_campaign_artifacts_link_selection_fallback_judge_and_rea
         }
 
     monkeypatch.setattr(campaign, "qualify_judge", fake_qualify)
-    raw_row = json.loads(paths.primary_raw_results.read_text().splitlines()[0])
-    qualified, qualifications = campaign.select_qualified_campaign_judges(object(), selection_result)
-    coverage = {
-        "coverage_complete": True,
-        "qualified_count": len(qualified),
-        "judge_pool_signature": campaign.judge_pool_signature(qualified),
-    }
-    selection = {
-        "eligible": 1,
-        "cohort": [{"name": "source", "digest": "digest-source"}],
-        "judge": qualified[0],
-        "qualified_judges": qualified,
-        "qualification_chain": qualifications,
-        "qualification_coverage": coverage,
-        "posthoc_judge_model": qualified[0]["name"],
-        "judge_policy_selection": selection_result.to_dict(),
-    }
+    qualified, qualifications, coverage = campaign.select_qualified_campaign_judges_for_rows(object(), selection_result, [raw_row])
+    selection = _selection_evidence(selection_result, qualified, qualifications, coverage)
     campaign._atomic_write_text(paths.judge_dir / "judge_selection.json", json.dumps(selection, indent=2, sort_keys=True))
 
-    judged = judge_dumps.judge_run(
+    judged, selection = campaign.judge_run_with_structural_continuation(
         RecordingJudgeClient(structural_models={"j1"}),
         paths.primary_dir,
-        judge_model="j1",
+        selection=selection_result,
+        selection_evidence=selection,
         qualified_judges=qualified,
+        qualifications=qualifications,
+        source_rows=[raw_row],
+        judge_model="j1",
         judge_mode="single",
         num_ctx=4096,
         think="off",
     )
     paths.judge_results.write_text((paths.primary_dir / "judge_results.jsonl").read_text())
+    campaign._atomic_write_text(paths.judge_dir / "judge_selection.json", json.dumps(selection, indent=2, sort_keys=True))
     campaign._atomic_write_text(paths.judge_summary, json.dumps({**judged, "selection": selection}, indent=2, sort_keys=True))
     rows = judge_dumps.apply_judgements(paths.primary_dir, [raw_row])
     summary = campaign.write_readiness(paths, rows, judge_available=True)
 
     persisted_selection = json.loads((paths.judge_dir / "judge_selection.json").read_text())
-    sidecar = json.loads(paths.judge_results.read_text().splitlines()[0])
+    sidecars = [json.loads(line) for line in paths.judge_results.read_text().splitlines()]
+    exhausted_sidecar = next(entry for entry in sidecars if entry["status"] == "judge_exhausted_unavailable")
+    sidecar = next(entry for entry in sidecars if entry["status"] == "judged")
     effective = json.loads(paths.effective_rows.read_text().splitlines()[0])
     readiness = json.loads(paths.readiness_json.read_text())
 
@@ -430,14 +455,22 @@ def test_stage1d_mocked_campaign_artifacts_link_selection_fallback_judge_and_rea
     assert [item["name"] for item in persisted_selection["judge_policy_selection"]["final_eligible_order"]] == ["j1", "j2"]
     assert any(item["model"] == "embedder" and item["reason"] == "non_generative_embedding_only" for item in persisted_selection["judge_policy_selection"]["rejection_reasons"])
     assert persisted_selection["qualification_chain"][0]["protocol_version"] == "judge-qualification-v1"
+    assert [item["name"] for item in persisted_selection["initial_qualified_judges"]] == ["j1"]
+    assert persisted_selection["qualification_coverage"]["coverage_complete"] is True
     assert [item["name"] for item in persisted_selection["qualified_judges"]] == ["j1", "j2"]
+    assert [item["name"] for item in persisted_selection["final_qualified_judges"]] == ["j1", "j2"]
+    assert persisted_selection["qualification_continuations"][0]["reason"] == "qualification_continuation_after_structural_incompatibility"
+    assert persisted_selection["qualification_continuations"][0]["added_qualified_judges"][0]["name"] == "j2"
+    assert exhausted_sidecar["judge_model"] is None
+    assert exhausted_sidecar["judgement_attempts"][0]["judge_model"] == "j1"
+    assert exhausted_sidecar["judgement_attempts"][0]["status"] == "rejected_structural_incompatibility"
     assert sidecar["source_model"] == "source"
     assert sidecar["source_model_digest"] == "digest-source"
     assert sidecar["judge_model"] == "j2"
     assert sidecar["judge_model_digest"] == "digest-j2"
     assert sidecar["identity_relation"] == "independent"
     assert sidecar["judgement_attempts"][0]["judge_model"] == "j1"
-    assert sidecar["judgement_attempts"][0]["status"] == "rejected_structural_incompatibility"
+    assert sidecar["judgement_attempts"][0]["status"] == "reused_structural_incompatibility"
     assert sidecar["task_hash"] == raw_row["task_hash"]
     assert sidecar["source_row_hash"]
     assert sidecar["samples"][0]["output_sha256"]
@@ -447,6 +480,160 @@ def test_stage1d_mocked_campaign_artifacts_link_selection_fallback_judge_and_rea
     assert effective["provenance"]["judge_model_digest"] == "digest-j2"
     assert summary["readiness"] == "ready_for_adoption"
     assert readiness["readiness"] == "ready_for_adoption"
+
+
+def test_stage1d_continuation_skips_failed_tail_qualification_and_uses_j3(monkeypatch, tmp_path):
+    paths, raw_row = _campaign_with_subjective_primary(tmp_path, "fallback_j3")
+    selection_result = _selection(["j1", "j2", "j3"])
+    calls = []
+
+    def fake_qualify(client, candidate):
+        calls.append(candidate["name"])
+        if candidate["name"] == "j2":
+            return {"model": "j2", "digest": "digest-j2", "qualified": False, "aggregate_disposition": "rejected_quality_controls", "protocol_version": "judge-qualification-v1"}
+        return {"model": candidate["name"], "digest": candidate["digest"], "qualified": True, "aggregate_disposition": "qualified", "protocol_version": "judge-qualification-v1"}
+
+    monkeypatch.setattr(campaign, "qualify_judge", fake_qualify)
+    qualified, qualifications, coverage = campaign.select_qualified_campaign_judges_for_rows(object(), selection_result, [raw_row])
+    judged, selection = campaign.judge_run_with_structural_continuation(
+        RecordingJudgeClient(structural_models={"j1"}),
+        paths.primary_dir,
+        selection=selection_result,
+        selection_evidence=_selection_evidence(selection_result, qualified, qualifications, coverage),
+        qualified_judges=qualified,
+        qualifications=qualifications,
+        source_rows=[raw_row],
+        judge_model="j1",
+    )
+
+    assert calls == ["j1", "j2", "j3"]
+    assert judged["judged"] == 1
+    assert judged["entries"][0]["judge_model"] == "j3"
+    assert [item["model"] for item in selection["qualification_continuations"][0]["continued_qualifications"]] == ["j2", "j3"]
+    assert selection["qualification_continuations"][0]["continued_qualifications"][0]["qualified"] is False
+
+
+def test_stage1d_continuation_exhausts_when_tail_fails_qualification(monkeypatch, tmp_path):
+    paths, raw_row = _campaign_with_subjective_primary(tmp_path, "fallback_exhausted")
+    selection_result = _selection(["j1", "j2", "j3"])
+
+    def fake_qualify(client, candidate):
+        return {
+            "model": candidate["name"],
+            "digest": candidate["digest"],
+            "qualified": candidate["name"] == "j1",
+            "aggregate_disposition": "qualified" if candidate["name"] == "j1" else "rejected_quality_controls",
+            "protocol_version": "judge-qualification-v1",
+        }
+
+    monkeypatch.setattr(campaign, "qualify_judge", fake_qualify)
+    qualified, qualifications, coverage = campaign.select_qualified_campaign_judges_for_rows(object(), selection_result, [raw_row])
+    judged, selection = campaign.judge_run_with_structural_continuation(
+        RecordingJudgeClient(structural_models={"j1"}),
+        paths.primary_dir,
+        selection=selection_result,
+        selection_evidence=_selection_evidence(selection_result, qualified, qualifications, coverage),
+        qualified_judges=qualified,
+        qualifications=qualifications,
+        source_rows=[raw_row],
+        judge_model="j1",
+    )
+
+    assert judged["entries"][0]["status"] == "judge_exhausted_unavailable"
+    assert [item["name"] for item in selection["final_qualified_judges"]] == ["j1"]
+    assert selection["qualification_continuations"][0]["coverage_complete"] is False
+    assert [item["model"] for item in selection["qualification_continuations"][0]["continued_qualifications"]] == ["j2", "j3"]
+
+
+def test_stage1d_continuation_reuses_known_bad_j1_after_pool_extension(monkeypatch, tmp_path):
+    paths, raw_row = _campaign_with_subjective_primary(tmp_path, "fallback_reuse")
+    selection_result = _selection(["j1", "j2"])
+
+    def fake_qualify(client, candidate):
+        return {"model": candidate["name"], "digest": candidate["digest"], "qualified": True, "aggregate_disposition": "qualified", "protocol_version": "judge-qualification-v1"}
+
+    monkeypatch.setattr(campaign, "qualify_judge", fake_qualify)
+    qualified, qualifications, coverage = campaign.select_qualified_campaign_judges_for_rows(object(), selection_result, [raw_row])
+    client = RecordingJudgeClient(structural_models={"j1"})
+    judged, updated_selection = campaign.judge_run_with_structural_continuation(
+        client,
+        paths.primary_dir,
+        selection=selection_result,
+        selection_evidence=_selection_evidence(selection_result, qualified, qualifications, coverage),
+        qualified_judges=qualified,
+        qualifications=qualifications,
+        source_rows=[raw_row],
+        judge_model="j1",
+    )
+
+    assert client.calls == ["j1", "j2"]
+    assert judged["judged"] == 1
+    assert judged["entries"][0]["judgement_attempts"][0]["status"] == "reused_structural_incompatibility"
+    assert updated_selection["qualification_continuations"][0]["added_qualified_judges"][0]["name"] == "j2"
+
+
+def test_stage1d_continuation_changed_fingerprint_reconsiders_j1(monkeypatch, tmp_path):
+    paths, raw_row = _campaign_with_subjective_primary(tmp_path, "fallback_changed_fingerprint")
+    selection_result = _selection(["j1", "j2"])
+
+    def fake_qualify(client, candidate):
+        return {"model": candidate["name"], "digest": candidate["digest"], "qualified": True, "aggregate_disposition": "qualified", "protocol_version": "judge-qualification-v1"}
+
+    monkeypatch.setattr(campaign, "qualify_judge", fake_qualify)
+    qualified, qualifications, coverage = campaign.select_qualified_campaign_judges_for_rows(object(), selection_result, [raw_row])
+    client = RecordingJudgeClient(structural_models={"j1"})
+    campaign.judge_run_with_structural_continuation(
+        client,
+        paths.primary_dir,
+        selection=selection_result,
+        selection_evidence=_selection_evidence(selection_result, qualified, qualifications, coverage),
+        qualified_judges=qualified,
+        qualifications=qualifications,
+        source_rows=[raw_row],
+        judge_model="j1",
+        think="auto",
+    )
+    campaign.judge_run_with_structural_continuation(
+        client,
+        paths.primary_dir,
+        selection=selection_result,
+        selection_evidence=_selection_evidence(selection_result, qualified, qualifications, coverage),
+        qualified_judges=qualified,
+        qualifications=qualifications,
+        source_rows=[raw_row],
+        judge_model="j1",
+        think="off",
+    )
+
+    assert client.calls == ["j1", "j2", "j1", "j2"]
+
+
+def test_stage1d_non_structural_runtime_failure_does_not_continue_qualification(monkeypatch, tmp_path):
+    paths, raw_row = _campaign_with_subjective_primary(tmp_path, "fallback_non_structural")
+    selection_result = _selection(["j1", "j2"])
+    calls = []
+
+    def fake_qualify(client, candidate):
+        calls.append(candidate["name"])
+        return {"model": candidate["name"], "digest": candidate["digest"], "qualified": True, "aggregate_disposition": "qualified", "protocol_version": "judge-qualification-v1"}
+
+    monkeypatch.setattr(campaign, "qualify_judge", fake_qualify)
+    qualified, qualifications, coverage = campaign.select_qualified_campaign_judges_for_rows(object(), selection_result, [raw_row])
+    judged, selection = campaign.judge_run_with_structural_continuation(
+        RecordingJudgeClient(failures={"j1": {"ok": False, "error": "deadline", "http_status": 408}}),
+        paths.primary_dir,
+        selection=selection_result,
+        selection_evidence=_selection_evidence(selection_result, qualified, qualifications, coverage),
+        qualified_judges=qualified,
+        qualifications=qualifications,
+        source_rows=[raw_row],
+        judge_model="j1",
+    )
+
+    assert calls == ["j1"]
+    assert judged["entries"][0]["status"] == "judge_error"
+    assert judged["entries"][0]["failure_disposition"] == "timeout"
+    assert selection["qualification_continuations"] == []
 
 
 def test_stage1d_incomplete_identity_and_manual_judge_dump_fail_closed(tmp_path):

@@ -2235,6 +2235,193 @@ def select_qualified_campaign_judges_for_rows(
     return qualified, qualifications, coverage
 
 
+def _qualified_judge_record(candidate: Dict[str, Any], qualification: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        **candidate,
+        "qualified": True,
+        "qualification": qualification,
+        "stable_identity": stable_model_identity(candidate),
+        "roles": _model_roles(candidate),
+    }
+
+
+def _qualification_identity_key(item: Dict[str, Any]) -> tuple[str, str]:
+    return (str(item.get("model") or item.get("name") or ""), str(item.get("digest") or ""))
+
+
+def _structural_exhaustion_entries(judged: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [
+        entry for entry in judged.get("entries") or []
+        if entry.get("status") == "judge_exhausted_unavailable"
+        and entry.get("failure_disposition") == "structural_incompatibility"
+    ]
+
+
+def _failed_structural_identity_keys_by_source(entries: List[Dict[str, Any]]) -> Dict[str, set[str]]:
+    out: Dict[str, set[str]] = {}
+    for entry in entries:
+        source = str(entry.get("source_row_hash") or "")
+        if not source:
+            continue
+        for attempt in entry.get("judgement_attempts") or []:
+            if attempt.get("status") not in {"rejected_structural_incompatibility", "reused_structural_incompatibility"}:
+                continue
+            identity = attempt.get("judge_identity") if isinstance(attempt.get("judge_identity"), dict) else {}
+            key = str(identity.get("identity_key") or "")
+            if key:
+                out.setdefault(source, set()).add(key)
+    return out
+
+
+def continue_qualification_after_runtime_structural_failure(
+    client: Any,
+    selection: JudgeSelectionResult,
+    qualified_judges: List[Dict[str, Any]],
+    qualifications: List[Dict[str, Any]],
+    source_rows: List[Dict[str, Any]],
+    structural_entries: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    """Continue Stage 1B qualification through the Stage 1A tail after runtime structural failure."""
+    from . import judge_dumps
+
+    considered = {
+        _qualification_identity_key(item)
+        for item in [*qualifications, *qualified_judges]
+    }
+    source_by_hash = {judge_dumps.source_row_hash(row): row for row in source_rows}
+    failed_by_source = _failed_structural_identity_keys_by_source(structural_entries)
+    target_hashes = [str(entry.get("source_row_hash") or "") for entry in structural_entries if entry.get("source_row_hash")]
+    target_rows = [source_by_hash.get(source) for source in target_hashes]
+    target_pairs = [(source, row) for source, row in zip(target_hashes, target_rows) if row is not None]
+    continued_qualified = list(qualified_judges)
+    continued_qualifications = list(qualifications)
+    considered_tail: List[Dict[str, Any]] = []
+
+    def unresolved() -> List[Dict[str, Any]]:
+        rows = []
+        for source, row in target_pairs:
+            failed = failed_by_source.get(source, set())
+            usable_pool = [
+                judge for judge in continued_qualified
+                if str(stable_model_identity(judge).get("identity_key") or "") not in failed
+            ]
+            if resolve_independent_judge_for_row(row, usable_pool)["status"] != "selected_independent_judge":
+                rows.append(row)
+        return rows
+
+    for candidate in selection.final_eligible_order:
+        identity = (_candidate_name(candidate), _candidate_digest(candidate))
+        if identity in considered:
+            continue
+        remaining_before = unresolved()
+        if not remaining_before:
+            break
+        qualification = dict(qualify_judge(client, candidate))
+        qualification["qualification_trigger"] = "runtime_structural_fallback"
+        qualification["continuation_reason"] = "qualification_continuation_after_structural_incompatibility"
+        qualification["selection_index"] = candidate.get("selection_index")
+        qualification["selection_source"] = candidate.get("selection_source")
+        continued_qualifications.append(qualification)
+        entry = {
+            "selection_index": candidate.get("selection_index"),
+            "model": _candidate_name(candidate),
+            "digest": _candidate_digest(candidate) or None,
+            "qualified": bool(qualification.get("qualified")),
+            "aggregate_disposition": qualification.get("aggregate_disposition") or qualification.get("selection_rationale"),
+            "reason": "qualification_continuation_after_structural_incompatibility",
+            "unresolved_before": len(remaining_before),
+        }
+        if qualification.get("qualified"):
+            continued_qualified.append(_qualified_judge_record(candidate, qualification))
+        entry["unresolved_after"] = len(unresolved())
+        entry["decision"] = "qualified_for_runtime_structural_fallback" if qualification.get("qualified") else "rejected_by_qualification"
+        considered_tail.append(entry)
+        considered.add(identity)
+        if not unresolved():
+            break
+
+    continuation = {
+        "trigger": "runtime_structural_fallback",
+        "reason": "qualification_continuation_after_structural_incompatibility",
+        "structural_source_row_hashes": target_hashes,
+        "structural_failures": structural_entries,
+        "initial_qualified_count": len(qualified_judges),
+        "final_qualified_count": len(continued_qualified),
+        "added_qualified_judges": continued_qualified[len(qualified_judges):],
+        "continued_qualifications": considered_tail,
+        "coverage_complete": not unresolved(),
+        "judge_pool_signature": judge_pool_signature(continued_qualified),
+        "model_role_policy_version": MODEL_ROLE_POLICY_VERSION,
+        "judge_policy_version": JUDGE_POLICY_VERSION,
+    }
+    return continued_qualified, continued_qualifications, continuation
+
+
+def judge_run_with_structural_continuation(
+    client: Any,
+    run_dir: Path,
+    *,
+    selection: JudgeSelectionResult,
+    selection_evidence: Dict[str, Any],
+    qualified_judges: List[Dict[str, Any]],
+    qualifications: List[Dict[str, Any]],
+    source_rows: List[Dict[str, Any]],
+    judge_model: str,
+    judge_mode: str = "single",
+    num_ctx: Optional[int] = None,
+    think: str = "auto",
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Run post-hoc judging and extend qualification only for structural runtime fallback."""
+    from . import judge_dumps
+
+    initial_qualified = list(qualified_judges)
+    current_qualified = list(qualified_judges)
+    current_qualifications = list(qualifications)
+    continuations: List[Dict[str, Any]] = []
+    attempts: List[Dict[str, Any]] = []
+    judged = judge_dumps.judge_run(
+        client, run_dir, judge_model=judge_model, qualified_judges=current_qualified,
+        judge_mode=judge_mode, num_ctx=num_ctx, think=think,
+    )
+    attempts.append({k: v for k, v in judged.items() if k != "entries"})
+    while True:
+        structural_entries = _structural_exhaustion_entries(judged)
+        if not structural_entries:
+            break
+        next_qualified, next_qualifications, continuation = continue_qualification_after_runtime_structural_failure(
+            client, selection, current_qualified, current_qualifications, source_rows, structural_entries
+        )
+        continuations.append(continuation)
+        if len(next_qualified) == len(current_qualified):
+            current_qualified = next_qualified
+            current_qualifications = next_qualifications
+            break
+        current_qualified = next_qualified
+        current_qualifications = next_qualifications
+        judged = judge_dumps.judge_run(
+            client, run_dir, judge_model=judge_model, qualified_judges=current_qualified,
+            judge_mode=judge_mode, num_ctx=num_ctx, think=think,
+        )
+        attempts.append({k: v for k, v in judged.items() if k != "entries"})
+
+    updated_selection = dict(selection_evidence)
+    updated_selection["initial_qualified_judges"] = initial_qualified
+    updated_selection["qualified_judges"] = current_qualified
+    updated_selection["final_qualified_judges"] = current_qualified
+    updated_selection["qualification_chain"] = current_qualifications
+    updated_selection["qualification_continuations"] = continuations
+    updated_selection["posthoc_judge_model"] = (current_qualified[0] if current_qualified else {}).get("name")
+    updated_selection["posthoc_judge_digest"] = (current_qualified[0] if current_qualified else {}).get("digest")
+    judged = {
+        **judged,
+        "attempts": attempts,
+        "initial_qualified_judges": initial_qualified,
+        "final_qualified_judges": current_qualified,
+        "qualification_continuations": continuations,
+    }
+    return judged, updated_selection
+
+
 def adopt_campaign(paths: CampaignPaths, *, rankings_dir: Path, dry_run: bool = True) -> Dict[str, Any]:
     """Transactionally overlay validated candidate rows into canonical rankings."""
     manifest = load_manifest(paths)
