@@ -96,14 +96,13 @@ class Config:
     gpu_policy_ceilings_mib: Dict[str, float] = field(default_factory=dict)
     aggregate_policy_ceiling_mib: Optional[float] = None
     # A generation-time --judge off is deliberately unrelated to this policy.
-    # Qwen is kept as a backwards-compatible configured value, but is excluded
-    # by default from automatic post-hoc judge selection.
-    judge_model: str = "qwen2.5:14b"
-    judge_candidates: list[str] = field(default_factory=lambda: [
-        "hf.co/AtlaAI/Selene-1-Mini-Llama-3.1-8B-Q4_K_M-GGUF:Q4_K_M",
-        "prometheus-eval/prometheus-7b-v2.0-GGUF",
-    ])
+    # No judge model is hard-coded; operators can configure a primary and
+    # ordered fallbacks, while automatic post-hoc selection excludes Qwen by
+    # default unless an explicit primary override permits it.
+    judge_model: str = ""
+    judge_candidates: list[str] = field(default_factory=list)
     judge_family_exclusions: list[str] = field(default_factory=lambda: ["qwen"])
+    judge_allow_excluded_primary: bool = False
     embed_model: str = "nomic-embed-text"
     samples: int = 1                       # runs per test; median taken where applicable
     max_reflections: int = 2               # agentic ReAct retries

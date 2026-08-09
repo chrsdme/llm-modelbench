@@ -25,6 +25,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .classify import families_for, families_from_capabilities
+
 CAMPAIGNS_ROOT = Path("campaigns")
 MANIFEST_SCHEMA_VERSION = 1
 JUDGE_POLICY_VERSION = "rc21.post1"
@@ -40,6 +42,53 @@ class CampaignError(RuntimeError):
     These errors are never silently swallowed. Callers must decide whether
     the campaign should stop, be resumed, or be classified as failed.
     """
+
+
+@dataclass(frozen=True)
+class JudgePolicy:
+    """Typed judge candidate policy.
+
+    ``requested_primary`` is an exact configured model name and is considered
+    first. ``configured_fallbacks`` keep operator order. Remaining inventory
+    forms the deterministic automatic tail. Family exclusions apply to
+    automatic candidates and to configured fallbacks. An excluded primary is
+    eligible only when ``allow_excluded_primary`` is explicitly true.
+    """
+
+    requested_primary: Optional[str] = None
+    configured_fallbacks: tuple[str, ...] = ()
+    excluded_families: tuple[str, ...] = ("qwen",)
+    allow_excluded_primary: bool = False
+    automatic_selection: bool = True
+    enabled: bool = True
+
+    @classmethod
+    def from_config(cls, cfg: Any, *, enabled: bool = True) -> "JudgePolicy":
+        return cls(
+            requested_primary=str(getattr(cfg, "judge_model", "") or "") or None,
+            configured_fallbacks=tuple(str(item) for item in (getattr(cfg, "judge_candidates", []) or []) if str(item)),
+            excluded_families=tuple(str(item).lower() for item in (getattr(cfg, "judge_family_exclusions", ["qwen"]) or [])),
+            allow_excluded_primary=bool(getattr(cfg, "judge_allow_excluded_primary", False)),
+            automatic_selection=True,
+            enabled=bool(enabled),
+        )
+
+
+@dataclass
+class JudgeSelectionResult:
+    """Structured, persistable judge candidate-selection evidence."""
+
+    requested_primary: Optional[str]
+    configured_fallbacks: List[str]
+    automatic_candidates: List[str]
+    exclusions: List[str]
+    rejection_reasons: List[Dict[str, Any]]
+    final_eligible_order: List[Dict[str, Any]]
+    selected: Optional[Dict[str, Any]]
+    policy: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
 
 def _inside(root: Path, candidate: Path) -> Path:
@@ -1567,18 +1616,186 @@ def classify_capability_probe(probes: List[Dict[str, Any]]) -> str:
     return "probe_unresolved_transient"
 
 
+def _candidate_name(item: Dict[str, Any]) -> str:
+    return str(item.get("name") or item.get("model") or "")
+
+
+def _candidate_digest(item: Dict[str, Any]) -> str:
+    return str(item.get("digest") or item.get("model_digest_resolved") or "")
+
+
+def _candidate_capabilities(item: Dict[str, Any]) -> List[str]:
+    return [str(value).lower() for value in (item.get("capabilities") or item.get("runtime_capabilities") or []) if str(value)]
+
+
+def _canonical_candidate_families(item: Dict[str, Any]) -> List[str]:
+    """Return the same canonical family representation used by routing.
+
+    Capability-interrogation payloads already persist ``supported_families``;
+    use them directly when present. Otherwise resolve raw runtime capabilities
+    through ``families_for`` instead of maintaining a judge-local capability
+    table.
+    """
+    supported = item.get("supported_families")
+    if supported is not None:
+        return [str(value).lower() for value in supported if str(value)]
+    families = item.get("families")
+    if families is not None and not _candidate_capabilities(item):
+        return [str(value).lower() for value in families if str(value)]
+    return families_for(_candidate_name(item), _candidate_capabilities(item))
+
+
+def _judge_capability_rejection(item: Dict[str, Any]) -> Optional[str]:
+    """Fail closed unless canonical evidence confirms normal text generation."""
+    name = _candidate_name(item)
+    capabilities = _candidate_capabilities(item)
+    families = _canonical_candidate_families(item)
+    lowered_name = name.lower()
+    if any(token in lowered_name for token in ("rerank", "reranker")) and "text" not in families:
+        return "non_generative_reranker"
+    if "embedding" in families and "text" not in families:
+        return "non_generative_embedding_only"
+    if "vision" in families and "text" not in families:
+        return "non_generative_vision_only"
+    if capabilities and "text" in families and "text" not in families_from_capabilities(capabilities):
+        return "unknown_or_non_generative_capability"
+    if "text" in families:
+        return None
+    if not capabilities and not families:
+        return "unknown_capability_no_positive_text_generation_evidence"
+    return "unknown_or_non_generative_capability"
+
+
 def _judge_candidate_is_generative(item: Dict[str, Any]) -> bool:
-    """Require positive evidence; a label of ``text`` alone is not capability evidence."""
-    capabilities = {str(x).lower() for x in (item.get("capabilities") or item.get("runtime_capabilities") or [])}
-    families = {str(x).lower() for x in (item.get("supported_families") or item.get("families") or [])}
-    non_generative = {"embedding", "embeddings", "rerank", "reranker", "vision"}
-    if capabilities & non_generative and not capabilities & {"completion", "generate", "chat", "text_generation"}:
-        return False
-    # ``supported_families=['text']`` is retained as legacy positive evidence
-    # only when no capability list was supplied.  Modern discovery supplies a
-    # concrete completion/chat capability, which wins over broad labels.
-    return bool(capabilities & {"completion", "generate", "chat", "text_generation"} or
-                families & {"generation", "text_generation"} or (not capabilities and "text" in families))
+    return _judge_capability_rejection(item) is None
+
+
+def _is_excluded_judge_family(item: Dict[str, Any], exclusions: tuple[str, ...]) -> bool:
+    text = f"{_candidate_name(item)} {item.get('architecture_family') or ''}".lower()
+    return any(token and token in text for token in exclusions)
+
+
+def _dedupe_names(values: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for value in values:
+        name = str(value or "")
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def build_judge_selection(
+    inventory: List[Dict[str, Any]],
+    cohort: List[Dict[str, Any]],
+    policy: JudgePolicy,
+) -> JudgeSelectionResult:
+    """Build deterministic judge order and complete rejection evidence."""
+    requested_primary = policy.requested_primary if policy.enabled else None
+    configured_fallbacks = _dedupe_names(list(policy.configured_fallbacks))
+    if requested_primary:
+        configured_fallbacks = [name for name in configured_fallbacks if name != requested_primary]
+    exclusions = tuple(str(item).lower() for item in policy.excluded_families)
+    rejection_reasons: List[Dict[str, Any]] = []
+    final_eligible_order: List[Dict[str, Any]] = []
+
+    if not policy.enabled:
+        return JudgeSelectionResult(
+            requested_primary=None,
+            configured_fallbacks=[],
+            automatic_candidates=[],
+            exclusions=list(exclusions),
+            rejection_reasons=[],
+            final_eligible_order=[],
+            selected=None,
+            policy={
+                "enabled": False,
+                "allow_excluded_primary": bool(policy.allow_excluded_primary),
+                "automatic_selection": bool(policy.automatic_selection),
+                "version": JUDGE_POLICY_VERSION,
+            },
+        )
+
+    by_name = {_candidate_name(item): item for item in inventory if _candidate_name(item)}
+    cohort_names = {_candidate_name(item) for item in cohort}
+    cohort_digests = {_candidate_digest(item) for item in cohort if _candidate_digest(item)}
+    cohort_families = [str(item.get("architecture_family") or "") for item in cohort if item.get("architecture_family")]
+    majority = max(set(cohort_families), key=cohort_families.count) if cohort_families else ""
+
+    automatic_items = sorted(
+        [item for item in inventory if _candidate_name(item) not in set([requested_primary] + configured_fallbacks)],
+        key=lambda item: (
+            not bool(item.get("calibrated")),
+            str(item.get("architecture_family") or "") == majority,
+            -int(item.get("priority") or 0),
+            _candidate_name(item),
+            _candidate_digest(item),
+        ),
+    ) if policy.automatic_selection else []
+    automatic_candidates = [_candidate_name(item) for item in automatic_items]
+    ordered_names = _dedupe_names(([requested_primary] if requested_primary else []) + configured_fallbacks + automatic_candidates)
+
+    for index, name in enumerate(ordered_names):
+        item = by_name.get(name)
+        source = "configured_primary" if requested_primary and name == requested_primary else (
+            "configured_fallback" if name in configured_fallbacks else "automatic"
+        )
+        if item is None:
+            rejection_reasons.append({"model": name, "source": source, "reason": "not_in_inventory"})
+            continue
+        digest = _candidate_digest(item)
+        if name in cohort_names or (digest and digest in cohort_digests):
+            rejection_reasons.append({"model": name, "digest": digest, "source": source, "reason": "in_tested_cohort"})
+            continue
+        excluded = _is_excluded_judge_family(item, exclusions)
+        if excluded and not (source == "configured_primary" and policy.allow_excluded_primary):
+            rejection_reasons.append({
+                "model": name,
+                "digest": digest,
+                "source": source,
+                "reason": "excluded_family",
+                "exclusions": list(exclusions),
+            })
+            continue
+        capability_rejection = _judge_capability_rejection(item)
+        if capability_rejection:
+            rejection_reasons.append({
+                "model": name,
+                "digest": digest,
+                "source": source,
+                "reason": capability_rejection,
+                "capabilities": _candidate_capabilities(item),
+                "canonical_families": _canonical_candidate_families(item),
+            })
+            continue
+        context = int(item.get("context") or item.get("context_length") or 0)
+        if context and context < 1024:
+            rejection_reasons.append({"model": name, "digest": digest, "source": source, "reason": "context_too_small", "context": context})
+            continue
+        final_eligible_order.append({
+            **item,
+            "selection_source": source,
+            "selection_index": index,
+            "canonical_families": _canonical_candidate_families(item),
+            "excluded_family_override": bool(excluded and source == "configured_primary" and policy.allow_excluded_primary),
+        })
+
+    return JudgeSelectionResult(
+        requested_primary=requested_primary,
+        configured_fallbacks=configured_fallbacks,
+        automatic_candidates=automatic_candidates,
+        exclusions=list(exclusions),
+        rejection_reasons=rejection_reasons,
+        final_eligible_order=final_eligible_order,
+        selected=final_eligible_order[0] if final_eligible_order else None,
+        policy={
+            "enabled": True,
+            "allow_excluded_primary": bool(policy.allow_excluded_primary),
+            "automatic_selection": bool(policy.automatic_selection),
+            "version": JUDGE_POLICY_VERSION,
+        },
+    )
 
 
 def qualify_judge(client: Any, candidate: Dict[str, Any], *, repeats: int = 2) -> Dict[str, Any]:
@@ -1595,7 +1812,7 @@ def qualify_judge(client: Any, candidate: Dict[str, Any], *, repeats: int = 2) -
                               "policy_version": JUDGE_POLICY_VERSION, "qualified": False,
                               "checks": {}, "selection_rationale": ""}
     if not _judge_candidate_is_generative(candidate):
-        result["selection_rationale"] = "rejected_non_generative_capability"
+        result["selection_rationale"] = _judge_capability_rejection(candidate) or "rejected_non_generative_capability"
         return result
     scores, errors = [], []
     for _ in range(max(2, int(repeats))):
@@ -1623,52 +1840,52 @@ def qualify_judge(client: Any, candidate: Dict[str, Any], *, repeats: int = 2) -
 
 
 def select_campaign_judge(inventory: List[Dict[str, Any]], cohort: List[Dict[str, Any]], *,
-                          configured: Optional[List[str]] = None, excluded_families: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+                          configured: Optional[List[str]] = None,
+                          excluded_families: Optional[List[str]] = None,
+                          requested_primary: Optional[str] = None,
+                          allow_excluded_primary: bool = False,
+                          automatic_selection: bool = True) -> Optional[Dict[str, Any]]:
     """Select a positively-confirmed generative judge, respecting project exclusions."""
-    excluded = tuple(str(x).lower() for x in (excluded_families or ["qwen"]))
-    cohort_names = {str(item.get("name") or item.get("model") or "") for item in cohort}
-    cohort_digests = {str(item.get("digest") or item.get("model_digest_resolved") or "") for item in cohort}
-    cohort_families = [str(item.get("architecture_family") or "") for item in cohort]
-    majority = max(set(cohort_families), key=cohort_families.count) if cohort_families else ""
-    candidates = []
-    for item in inventory:
-        name, digest = str(item.get("name") or ""), str(item.get("digest") or "")
-        if name in cohort_names or (digest and digest in cohort_digests):
-            continue
-        if any(token in name.lower() or token in str(item.get("architecture_family") or "").lower() for token in excluded):
-            continue
-        if not _judge_candidate_is_generative(item):
-            continue
-        if int(item.get("context") or item.get("context_length") or 0) and int(item.get("context") or item.get("context_length")) < 1024:
-            continue
-        candidates.append(item)
-    if not candidates:
-        return None
-    configured_rank = {name: index for index, name in enumerate(configured or [])}
-    return sorted(candidates, key=lambda item: (
-        configured_rank.get(str(item.get("name") or ""), len(configured_rank)),
-        not bool(item.get("calibrated")),
-        str(item.get("architecture_family") or "") == majority,
-        -int(item.get("priority") or 0), str(item.get("name") or ""),
-    ))[0]
+    selection = build_judge_selection(
+        inventory,
+        cohort,
+        JudgePolicy(
+            requested_primary=requested_primary,
+            configured_fallbacks=tuple(configured or ()),
+            excluded_families=tuple(str(x).lower() for x in (excluded_families or ["qwen"])),
+            allow_excluded_primary=bool(allow_excluded_primary),
+            automatic_selection=bool(automatic_selection),
+            enabled=True,
+        ),
+    )
+    return selection.selected
 
 
 def select_qualified_campaign_judge(client: Any, inventory: List[Dict[str, Any]], cohort: List[Dict[str, Any]], *,
                                     configured: Optional[List[str]] = None,
-                                    excluded_families: Optional[List[str]] = None) -> tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+                                    excluded_families: Optional[List[str]] = None,
+                                    requested_primary: Optional[str] = None,
+                                    allow_excluded_primary: bool = False,
+                                    automatic_selection: bool = True) -> tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     """Walk the deterministic candidate order, stopping each bad judge once."""
-    remaining = list(inventory)
+    selection = build_judge_selection(
+        inventory,
+        cohort,
+        JudgePolicy(
+            requested_primary=requested_primary,
+            configured_fallbacks=tuple(configured or ()),
+            excluded_families=tuple(str(x).lower() for x in (excluded_families or ["qwen"])),
+            allow_excluded_primary=bool(allow_excluded_primary),
+            automatic_selection=bool(automatic_selection),
+            enabled=True,
+        ),
+    )
     qualifications: List[Dict[str, Any]] = []
-    while remaining:
-        candidate = select_campaign_judge(remaining, cohort, configured=configured,
-                                          excluded_families=excluded_families)
-        if not candidate:
-            break
+    for candidate in selection.final_eligible_order:
         qualification = qualify_judge(client, candidate)
         qualifications.append(qualification)
         if qualification.get("qualified"):
             return candidate, qualifications
-        remaining = [item for item in remaining if str(item.get("name") or "") != str(candidate.get("name") or "")]
     return None, qualifications
 
 
