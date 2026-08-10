@@ -4,6 +4,8 @@ Generated during Final Hardening H4 from Git-resolved commit identities. Histori
 
 Some generated handoffs and overnight summaries expanded correct short SHAs to incorrect full SHAs. The canonical values below are from `git rev-parse` and `git log`, not manual abbreviation expansion.
 
+Final provenance correction: the H2 and H3 Final Hardening stage-log baseline values were also found to contain bad manually expanded SHAs. Those two baseline values have been corrected from Git-verified `git rev-parse` output.
+
 Notable corrected values:
 - Stage 3B actual: `dabbe6f6265d522897b7706aeae9d8dae54b2418`
 - Stage 4B actual: `1ab934b0cacd3f0a8803a1a7f84d3f4ed922fe38`

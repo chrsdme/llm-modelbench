@@ -2,7 +2,7 @@
 
 ## Scope
 - Branch: `rc21-post1-topology-budget`
-- Baseline commit: `9ccdac3f0a8f0699b1148693beced44a45265179`
+- Baseline commit: `9ccdac3abbecc7ae20eac4fb6d150e7c4c4c1dfa`
 - Stage: H2 only
 
 ## Requirements Implemented

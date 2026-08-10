@@ -2,7 +2,7 @@
 
 ## Scope
 - Branch: `rc21-post1-topology-budget`
-- Baseline commit: `eaa25015764403cd125b4b275e7f06d41741baf4`
+- Baseline commit: `eaa250133a5d1895154c9143277c56eda6390300`
 - Stage: H3 only
 
 ## Requirements Implemented
