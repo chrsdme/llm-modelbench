@@ -6,6 +6,17 @@ from llm_modelbench.runner import _task_hash
 from llm_modelbench.tasks import TASKS
 
 
+def _measured_text(name, digest, **extra):
+    item = {
+        "name": name,
+        "digest": digest,
+        "capability_schema_version": campaign.CAPABILITY_SCHEMA_VERSION,
+        "measured_capabilities": {"text": {"state": "measured_supported"}},
+    }
+    item.update(extra)
+    return item
+
+
 def _subjective_task():
     return next(task for task in TASKS if task.scorer == "subjective")
 
@@ -64,9 +75,9 @@ def _policy(**kwargs):
 
 def test_roles_are_separate_from_capabilities_and_multiple_roles_are_preserved():
     selection = campaign.build_judge_selection([
-        {"name": "judge-only", "digest": "j", "roles": ["judge"], "capabilities": ["completion"]},
-        {"name": "candidate-only", "digest": "c", "roles": ["benchmark_candidate"], "capabilities": ["completion"]},
-        {"name": "both", "digest": "b", "roles": ["judge", "benchmark_candidate"], "capabilities": ["completion"]},
+        _measured_text("judge-only", "j", roles=["judge"]),
+        _measured_text("candidate-only", "c", roles=["benchmark_candidate"]),
+        _measured_text("both", "b", roles=["judge", "benchmark_candidate"]),
     ], [], _policy(configured_fallbacks=("judge-only", "candidate-only", "both")))
 
     assert [item["name"] for item in selection.final_eligible_order] == ["judge-only", "both"]
@@ -76,7 +87,7 @@ def test_roles_are_separate_from_capabilities_and_multiple_roles_are_preserved()
 
 def test_benchmark_candidate_role_does_not_prevent_judge_eligibility():
     selection = campaign.build_judge_selection([
-        {"name": "both", "digest": "b", "roles": ["benchmark_candidate", "judge"], "capabilities": ["completion"]},
+        _measured_text("both", "b", roles=["benchmark_candidate", "judge"]),
     ], [{"name": "both", "digest": "b"}], _policy())
 
     assert selection.selected["name"] == "both"
@@ -296,9 +307,9 @@ def test_pending_sidecar_propagates_to_effective_rows_and_blocks_readiness(tmp_p
 
 def test_bounded_qualification_stops_when_independent_coverage_is_satisfied(monkeypatch):
     selection = campaign.build_judge_selection([
-        {"name": "self", "digest": "digest-self", "roles": ["judge", "benchmark_candidate"], "capabilities": ["completion"]},
-        {"name": "fallback", "digest": "digest-fallback", "roles": ["judge"], "capabilities": ["completion"]},
-        {"name": "extra", "digest": "digest-extra", "roles": ["judge"], "capabilities": ["completion"]},
+        _measured_text("self", "digest-self", roles=["judge", "benchmark_candidate"]),
+        _measured_text("fallback", "digest-fallback", roles=["judge"]),
+        _measured_text("extra", "digest-extra", roles=["judge"]),
     ], [], _policy(configured_fallbacks=("self", "fallback", "extra")))
     calls = []
 
@@ -324,7 +335,7 @@ def test_bounded_qualification_stops_when_independent_coverage_is_satisfied(monk
 def test_campaign_role_source_marks_same_model_as_judge_and_benchmark_candidate():
     policy = _policy(requested_primary="both")
     candidates = campaign.apply_campaign_roles_to_judge_candidates(
-        [{"name": "both", "digest": "digest-both", "capabilities": ["completion"]}],
+        [_measured_text("both", "digest-both")],
         [{"name": "both-alias", "digest": "digest-both"}],
         policy,
     )

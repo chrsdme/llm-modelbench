@@ -585,10 +585,20 @@ def test_capability_reprobe_taxonomy(probes, expected):
 
 
 def test_judge_selection_excludes_cohort_and_prefers_calibrated_other_family():
+    def measured_text(name, digest, **extra):
+        item = {
+            "name": name,
+            "digest": digest,
+            "capability_schema_version": campaign.CAPABILITY_SCHEMA_VERSION,
+            "measured_capabilities": {"text": {"state": "measured_supported"}},
+        }
+        item.update(extra)
+        return item
+
     chosen = campaign.select_campaign_judge([
-        {"name": "tested-alias", "digest": "same", "supported_families": ["text"], "priority": 99},
-        {"name": "same-family", "digest": "other", "supported_families": ["text"], "architecture_family": "a", "calibrated": True},
-        {"name": "judge", "digest": "judge-digest", "supported_families": ["text"], "architecture_family": "b", "calibrated": True, "priority": 1},
+        measured_text("tested-alias", "same", priority=99),
+        measured_text("same-family", "other", architecture_family="a", calibrated=True),
+        measured_text("judge", "judge-digest", architecture_family="b", calibrated=True, priority=1),
     ], [{"name": "tested", "digest": "same", "architecture_family": "a"}])
     assert chosen["name"] == "judge"
 

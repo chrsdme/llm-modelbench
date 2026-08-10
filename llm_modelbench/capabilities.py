@@ -99,7 +99,6 @@ def _model_identity(client: Any, model: str) -> Dict[str, Any]:
         "backend_model_id": row.get("name") or model,
         "digest": digest,
         "size": row.get("size"),
-        "modified_at": row.get("modified_at"),
         "details": details,
     }
 

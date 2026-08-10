@@ -101,6 +101,8 @@ def _candidate(name="judge"):
         "name": name,
         "digest": f"digest-{name}",
         "capabilities": ["completion"],
+        "capability_schema_version": campaign.CAPABILITY_SCHEMA_VERSION,
+        "measured_capabilities": {"text": {"state": "measured_supported"}},
         "canonical_families": ["text"],
         "runtime_identity": {"provider": "fake", "model": name},
     }

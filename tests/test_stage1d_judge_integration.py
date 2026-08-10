@@ -6,6 +6,28 @@ from llm_modelbench.runner import _task_hash
 from llm_modelbench.tasks import TASKS
 
 
+def _measured_text(name, digest, **extra):
+    item = {
+        "name": name,
+        "digest": digest,
+        "capability_schema_version": campaign.CAPABILITY_SCHEMA_VERSION,
+        "measured_capabilities": {"text": {"state": "measured_supported"}},
+    }
+    item.update(extra)
+    return item
+
+
+def _measured_embedding(name, digest, **extra):
+    item = {
+        "name": name,
+        "digest": digest,
+        "capability_schema_version": campaign.CAPABILITY_SCHEMA_VERSION,
+        "measured_capabilities": {"embedding": {"state": "measured_supported"}},
+    }
+    item.update(extra)
+    return item
+
+
 def _subjective_task():
     return next(task for task in TASKS if task.scorer == "subjective")
 
@@ -100,7 +122,7 @@ def _selection_evidence(selection_result, qualified, qualifications, coverage):
 
 def _selection(names):
     inventory = [
-        {"name": name, "digest": f"digest-{name}", "roles": ["judge"], "capabilities": ["completion"]}
+        _measured_text(name, f"digest-{name}", roles=["judge"])
         for name in names
     ]
     return campaign.build_judge_selection(
@@ -129,10 +151,10 @@ class RecordingJudgeClient:
 
 def test_stage1d_selection_qualification_pool_and_judged_sidecar_provenance(monkeypatch, tmp_path):
     inventory = [
-        {"name": "preferred", "digest": "digest-preferred", "roles": ["judge"], "capabilities": ["completion"]},
-        {"name": "fallback", "digest": "digest-fallback", "roles": ["judge"], "capabilities": ["completion"]},
-        {"name": "embedder", "digest": "digest-embed", "roles": ["judge"], "capabilities": ["embedding"]},
-        {"name": "qwen2.5:7b", "digest": "digest-qwen", "roles": ["judge"], "capabilities": ["completion"]},
+        _measured_text("preferred", "digest-preferred", roles=["judge"]),
+        _measured_text("fallback", "digest-fallback", roles=["judge"]),
+        _measured_embedding("embedder", "digest-embed", roles=["judge"]),
+        _measured_text("qwen2.5:7b", "digest-qwen", roles=["judge"]),
     ]
     selection = campaign.build_judge_selection(
         inventory,
@@ -192,8 +214,8 @@ def test_stage1d_primary_self_falls_back_to_actual_independent_judge(tmp_path):
 
 def test_stage1d_structural_qualification_failure_is_bounded_and_fallback_qualifies(monkeypatch):
     selection = campaign.build_judge_selection([
-        {"name": "preferred", "digest": "digest-preferred", "roles": ["judge"], "capabilities": ["completion"]},
-        {"name": "fallback", "digest": "digest-fallback", "roles": ["judge"], "capabilities": ["completion"]},
+        _measured_text("preferred", "digest-preferred", roles=["judge"]),
+        _measured_text("fallback", "digest-fallback", roles=["judge"]),
     ], [], _policy(requested_primary="preferred", configured_fallbacks=("fallback",)))
     calls = []
 
@@ -399,9 +421,9 @@ def test_stage1d_mocked_campaign_artifacts_link_selection_fallback_judge_and_rea
     paths, raw_row = _campaign_with_subjective_primary(tmp_path, "fallback_campaign")
 
     inventory = [
-        {"name": "j1", "digest": "digest-j1", "roles": ["judge"], "capabilities": ["completion"]},
-        {"name": "j2", "digest": "digest-j2", "roles": ["judge"], "capabilities": ["completion"]},
-        {"name": "embedder", "digest": "digest-embedder", "roles": ["judge"], "capabilities": ["embedding"]},
+        _measured_text("j1", "digest-j1", roles=["judge"]),
+        _measured_text("j2", "digest-j2", roles=["judge"]),
+        _measured_embedding("embedder", "digest-embedder", roles=["judge"]),
     ]
     selection_result = campaign.build_judge_selection(
         inventory,

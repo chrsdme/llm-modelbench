@@ -1,5 +1,32 @@
 from llm_modelbench import campaign
+from llm_modelbench.capabilities import CAPABILITY_SCHEMA_VERSION, MeasuredCapabilityState
 from llm_modelbench.config import Config
+
+
+def _measured_text(name, digest, **extra):
+    item = {
+        "name": name,
+        "digest": digest,
+        "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
+        "measured_capabilities": {
+            "text": {"state": MeasuredCapabilityState.MEASURED_SUPPORTED.value},
+        },
+    }
+    item.update(extra)
+    return item
+
+
+def _measured_embedding(name, digest, **extra):
+    item = {
+        "name": name,
+        "digest": digest,
+        "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
+        "measured_capabilities": {
+            "embedding": {"state": MeasuredCapabilityState.MEASURED_SUPPORTED.value},
+        },
+    }
+    item.update(extra)
+    return item
 
 
 def _policy(**kwargs):
@@ -20,13 +47,13 @@ def _select(inventory, policy=None, cohort=None):
 
 
 def test_text_generative_candidate_is_eligible():
-    result = _select([{"name": "llama:8b", "digest": "l", "capabilities": ["completion"]}])
+    result = _select([_measured_text("llama:8b", "l")])
     assert [item["name"] for item in result.final_eligible_order] == ["llama:8b"]
     assert result.selected["canonical_families"] == ["text"]
 
 
 def test_embedding_only_candidate_is_rejected():
-    result = _select([{"name": "embedder", "digest": "e", "capabilities": ["embedding"]}])
+    result = _select([_measured_embedding("embedder", "e")])
     assert result.selected is None
     assert result.rejection_reasons[0]["reason"] == "non_generative_embedding_only"
 
@@ -34,13 +61,18 @@ def test_embedding_only_candidate_is_rejected():
 def test_reranker_candidate_is_rejected():
     result = _select([{"name": "kalm-reranker:latest", "digest": "r", "capabilities": ["reranker"]}])
     assert result.selected is None
-    assert result.rejection_reasons[0]["reason"] == "non_generative_reranker"
+    assert result.rejection_reasons[0]["reason"] == "capability_reprobe_required"
 
 
 def test_vision_text_candidate_is_eligible_but_vision_only_is_rejected():
     result = _select([
-        {"name": "vision-only", "digest": "v", "supported_families": ["vision"]},
-        {"name": "vision-text", "digest": "vt", "supported_families": ["vision", "text"]},
+        {
+            "name": "vision-only",
+            "digest": "v",
+            "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
+            "measured_capabilities": {"vision": {"state": MeasuredCapabilityState.MEASURED_SUPPORTED.value}},
+        },
+        _measured_text("vision-text", "vt"),
     ])
     assert result.selected["name"] == "vision-text"
     assert result.rejection_reasons[0]["reason"] == "non_generative_vision_only"
@@ -49,13 +81,13 @@ def test_vision_text_candidate_is_eligible_but_vision_only_is_rejected():
 def test_unknown_capability_fails_closed():
     result = _select([{"name": "mystery", "digest": "m", "capabilities": ["unknown_future_lane"]}])
     assert result.selected is None
-    assert result.rejection_reasons[0]["reason"] == "unknown_or_non_generative_capability"
+    assert result.rejection_reasons[0]["reason"] == "capability_reprobe_required"
 
 
 def test_configured_primary_precedence_is_exact_first_order():
     result = _select([
-        {"name": "auto-a", "digest": "a", "capabilities": ["completion"], "calibrated": True},
-        {"name": "primary", "digest": "p", "capabilities": ["completion"]},
+        _measured_text("auto-a", "a", calibrated=True),
+        _measured_text("primary", "p"),
     ], _policy(requested_primary="primary"))
     assert [item["name"] for item in result.final_eligible_order] == ["primary", "auto-a"]
     assert result.selected["name"] == "primary"
@@ -63,8 +95,8 @@ def test_configured_primary_precedence_is_exact_first_order():
 
 def test_unavailable_and_ineligible_primary_rejection_is_preserved_before_fallback():
     result = _select([
-        {"name": "bad-primary", "digest": "b", "capabilities": ["embedding"]},
-        {"name": "fallback", "digest": "f", "capabilities": ["completion"]},
+        _measured_embedding("bad-primary", "b"),
+        _measured_text("fallback", "f"),
     ], _policy(requested_primary="missing-primary", configured_fallbacks=("bad-primary", "fallback")))
     assert result.selected["name"] == "fallback"
     assert [(item["model"], item["reason"]) for item in result.rejection_reasons] == [
@@ -75,8 +107,8 @@ def test_unavailable_and_ineligible_primary_rejection_is_preserved_before_fallba
 
 def test_qwen_family_is_excluded_from_automatic_judging_by_default():
     result = _select([
-        {"name": "qwen9-future:72b", "digest": "q", "capabilities": ["completion"], "calibrated": True},
-        {"name": "llama:8b", "digest": "l", "capabilities": ["completion"]},
+        _measured_text("qwen9-future:72b", "q", calibrated=True),
+        _measured_text("llama:8b", "l"),
     ])
     assert result.selected["name"] == "llama:8b"
     assert result.rejection_reasons[0]["reason"] == "excluded_family"
@@ -84,8 +116,8 @@ def test_qwen_family_is_excluded_from_automatic_judging_by_default():
 
 def test_excluded_primary_requires_explicit_override():
     inventory = [
-        {"name": "qwen9-future:72b", "digest": "q", "capabilities": ["completion"]},
-        {"name": "llama:8b", "digest": "l", "capabilities": ["completion"]},
+        _measured_text("qwen9-future:72b", "q"),
+        _measured_text("llama:8b", "l"),
     ]
     blocked = _select(inventory, _policy(requested_primary="qwen9-future:72b"))
     allowed = _select(inventory, _policy(requested_primary="qwen9-future:72b", allow_excluded_primary=True))
@@ -97,10 +129,10 @@ def test_excluded_primary_requires_explicit_override():
 
 def test_configured_fallback_order_duplicate_removal_and_automatic_exclusions():
     result = _select([
-        {"name": "auto", "digest": "a", "capabilities": ["completion"]},
-        {"name": "qwen-auto", "digest": "q", "capabilities": ["completion"], "calibrated": True},
-        {"name": "fallback-b", "digest": "b", "capabilities": ["completion"]},
-        {"name": "fallback-a", "digest": "fa", "capabilities": ["completion"]},
+        _measured_text("auto", "a"),
+        _measured_text("qwen-auto", "q", calibrated=True),
+        _measured_text("fallback-b", "b"),
+        _measured_text("fallback-a", "fa"),
     ], _policy(configured_fallbacks=("fallback-b", "fallback-a", "fallback-b")))
     assert result.configured_fallbacks == ["fallback-b", "fallback-a"]
     assert [item["name"] for item in result.final_eligible_order] == ["fallback-b", "fallback-a", "auto"]
@@ -109,8 +141,8 @@ def test_configured_fallback_order_duplicate_removal_and_automatic_exclusions():
 
 def test_repeated_selection_is_deterministic_and_structured():
     inventory = [
-        {"name": "b", "digest": "2", "capabilities": ["completion"], "priority": 1},
-        {"name": "a", "digest": "1", "capabilities": ["completion"], "priority": 1},
+        _measured_text("b", "2", priority=1),
+        _measured_text("a", "1", priority=1),
     ]
     first = _select(inventory).to_dict()
     second = _select(list(reversed(inventory))).to_dict()
@@ -129,9 +161,9 @@ def test_repeated_selection_is_deterministic_and_structured():
 
 def test_tied_cohort_majority_family_has_deterministic_tie_breaking_with_reordered_inputs():
     inventory = [
-        {"name": "family-a", "digest": "a", "capabilities": ["completion"], "architecture_family": "a", "calibrated": True},
-        {"name": "family-b", "digest": "b", "capabilities": ["completion"], "architecture_family": "b", "calibrated": True},
-        {"name": "family-c", "digest": "c", "capabilities": ["completion"], "architecture_family": "c", "calibrated": True},
+        _measured_text("family-a", "a", architecture_family="a", calibrated=True),
+        _measured_text("family-b", "b", architecture_family="b", calibrated=True),
+        _measured_text("family-c", "c", architecture_family="c", calibrated=True),
     ]
     cohort_a = [{"name": "tested-a", "digest": "ta", "architecture_family": "a"},
                 {"name": "tested-b", "digest": "tb", "architecture_family": "b"}]
@@ -146,8 +178,8 @@ def test_tied_cohort_majority_family_has_deterministic_tie_breaking_with_reorder
 
 def test_qualification_consumes_the_existing_selection_order(monkeypatch):
     selection = _select([
-        {"name": "first", "digest": "1", "capabilities": ["completion"]},
-        {"name": "second", "digest": "2", "capabilities": ["completion"]},
+        _measured_text("first", "1"),
+        _measured_text("second", "2"),
     ], _policy(configured_fallbacks=("second", "first")))
     consumed = []
 
@@ -165,7 +197,7 @@ def test_qualification_consumes_the_existing_selection_order(monkeypatch):
 
 def test_empty_exclusion_policy_means_no_exclusions():
     result = _select([
-        {"name": "qwen2.5:14b", "digest": "q", "capabilities": ["completion"]},
+        _measured_text("qwen2.5:14b", "q"),
     ], _policy(excluded_families=()))
     assert result.exclusions == []
     assert result.selected["name"] == "qwen2.5:14b"
@@ -174,15 +206,15 @@ def test_empty_exclusion_policy_means_no_exclusions():
 
 def test_legacy_wrapper_preserves_explicit_empty_exclusion_list():
     chosen = campaign.select_campaign_judge([
-        {"name": "qwen2.5:14b", "digest": "q", "capabilities": ["completion"]},
+        _measured_text("qwen2.5:14b", "q"),
     ], [], excluded_families=[])
     assert chosen["name"] == "qwen2.5:14b"
 
 
 def test_duplicate_same_name_same_digest_deduplicates_safely():
     result = _select([
-        {"name": "same", "digest": "d", "capabilities": ["completion"]},
-        {"name": "same", "digest": "d", "capabilities": ["completion"]},
+        _measured_text("same", "d"),
+        _measured_text("same", "d"),
     ])
     assert [item["name"] for item in result.final_eligible_order] == ["same"]
     assert result.rejection_reasons == []
@@ -190,8 +222,8 @@ def test_duplicate_same_name_same_digest_deduplicates_safely():
 
 def test_duplicate_same_name_different_digest_fails_closed_regardless_of_order():
     inventory = [
-        {"name": "same", "digest": "a", "capabilities": ["completion"]},
-        {"name": "same", "digest": "b", "capabilities": ["completion"]},
+        _measured_text("same", "a"),
+        _measured_text("same", "b"),
     ]
     first = _select(inventory).to_dict()
     second = _select(list(reversed(inventory))).to_dict()
@@ -207,29 +239,24 @@ def test_duplicate_same_name_different_digest_fails_closed_regardless_of_order()
 
 
 def test_contradictory_supported_families_cannot_override_embedding_capability():
-    result = _select([{
-        "name": "bge-m3:latest",
-        "digest": "bge",
-        "capabilities": ["embedding"],
-        "supported_families": ["text"],
-    }])
+    result = _select([_measured_embedding("bge-m3:latest", "bge", supported_families=["text"])])
     assert result.selected is None
     assert result.rejection_reasons[0]["reason"] == "non_generative_embedding_only"
     assert result.rejection_reasons[0]["canonical_families"] == ["embedding"]
 
 
-def test_supported_families_text_alone_is_canonical_positive_pipeline_evidence():
+def test_supported_families_text_alone_is_not_new_judge_eligibility_evidence():
     result = _select([{"name": "planned-text", "digest": "p", "supported_families": ["text"]}])
-    assert result.selected["name"] == "planned-text"
-    assert result.selected["canonical_families"] == ["text"]
+    assert result.selected is None
+    assert result.rejection_reasons[0]["reason"] == "capability_reprobe_required"
 
 
 def test_family_exclusion_uses_family_identity_or_controlled_name_fallback_not_substring():
     metadata_excluded = _select([
-        {"name": "neutral-name", "digest": "q", "capabilities": ["completion"], "architecture_family": "qwen"},
-        {"name": "neutral-qwen2-name", "digest": "qf2", "capabilities": ["completion"], "architecture_family": "qwen2"},
-        {"name": "notqwen-model", "digest": "n", "capabilities": ["completion"]},
-        {"name": "qwen2.5:14b", "digest": "q2", "capabilities": ["completion"]},
+        _measured_text("neutral-name", "q", architecture_family="qwen"),
+        _measured_text("neutral-qwen2-name", "qf2", architecture_family="qwen2"),
+        _measured_text("notqwen-model", "n"),
+        _measured_text("qwen2.5:14b", "q2"),
     ])
     rejected = {(item["model"], item["reason"]) for item in metadata_excluded.rejection_reasons}
     assert ("neutral-name", "excluded_family") in rejected
@@ -239,13 +266,13 @@ def test_family_exclusion_uses_family_identity_or_controlled_name_fallback_not_s
 
 
 def test_synthetic_bge_m3_latest_is_never_eligible():
-    result = _select([{"name": "bge-m3:latest", "digest": "bge", "capabilities": ["embedding"]}])
+    result = _select([_measured_embedding("bge-m3:latest", "bge")])
     assert result.selected is None
     assert result.rejection_reasons[0]["reason"] == "non_generative_embedding_only"
 
 
 def test_no_judge_policy_returns_empty_selection():
-    result = _select([{"name": "llama:8b", "digest": "l", "capabilities": ["completion"]}], _policy(enabled=False))
+    result = _select([_measured_text("llama:8b", "l")], _policy(enabled=False))
     assert result.selected is None
     assert result.final_eligible_order == []
     assert result.policy["enabled"] is False

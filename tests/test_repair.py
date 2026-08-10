@@ -24,6 +24,7 @@ def _write_run(root: Path, run_id: str, rows, *, model="qwen2.5-coder:14b", fami
     (run / "filters.json").write_text(json.dumps({"level": "full", "think": "auto"}))
     identity = current_capability_identity(MockClient(seed=42, temperature=0.0, timeout=30), model)
     digest = identity["model"]["digest"] or "digest-1"
+    identity["model"]["digest"] = digest
     (run / "model_identities.json").write_text(json.dumps({model: {"digest": digest, "size": 9_000_000_000}}))
     supported = families or ["text", "tools", "insert"]
     (run / "capability_report.json").write_text(json.dumps({model: {

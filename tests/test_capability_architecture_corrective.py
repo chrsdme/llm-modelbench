@@ -38,6 +38,7 @@ class CapabilityClient:
         backend="mock",
         endpoint="http://fake.invalid",
         template="template-v1",
+        modified_at="2026-08-10T00:00:00Z",
     ):
         self.name = name
         self.digest = digest
@@ -53,12 +54,16 @@ class CapabilityClient:
         self.backend = backend
         self.base = endpoint
         self.template = template
+        self.modified_at = modified_at
 
     def backend_identity(self):
         return type("Identity", (), {"backend": self.backend, "implementation": "fixture", "endpoint": self.base})()
 
     def tags(self):
-        return [{"name": self.name, "size": 1, "digest": self.digest}]
+        row = {"name": self.name, "size": 1, "modified_at": self.modified_at}
+        if self.digest is not None:
+            row["digest"] = self.digest
+        return [row]
 
     def show(self, model):
         return {
@@ -127,13 +132,14 @@ def _profile(model, states, *, digest="digest-1", backend="mock", endpoint="http
     }
 
 
-def _write_repair_run(root: Path, model: str, profile, task_id: str, error_kind: str):
+def _write_repair_run(root: Path, model: str, profile, task_id: str, error_kind: str, *, source_digest=None, write_identity=True):
     run = root / "fleet"
     run.mkdir(parents=True)
     task = _task(task_id)
+    if source_digest is None:
+        source_digest = profile.get("capability_identity", {}).get("model", {}).get("digest")
     row = {
         "model": model,
-        "model_digest_resolved": profile["capability_identity"]["model"]["digest"],
         "task": task.id,
         "category": task.category,
         "family": task.family,
@@ -143,10 +149,15 @@ def _write_repair_run(root: Path, model: str, profile, task_id: str, error_kind:
         "reason": error_kind,
         "timestamp": "2026-08-10T00:00:00Z",
     }
+    if source_digest:
+        row["model_digest_resolved"] = source_digest
     (run / "raw_results.jsonl").write_text(json.dumps(row) + "\n")
     (run / "summary_meta.json").write_text(json.dumps({"level": "full"}))
     (run / "filters.json").write_text(json.dumps({"level": "full", "think": "auto"}))
-    (run / "model_identities.json").write_text(json.dumps({model: {"digest": row["model_digest_resolved"], "size": 1}}))
+    identity = {"size": 1}
+    if source_digest and write_identity:
+        identity["digest"] = source_digest
+    (run / "model_identities.json").write_text(json.dumps({model: identity}))
     (run / "capability_report.json").write_text(json.dumps({model: profile}))
     return run
 
@@ -188,6 +199,59 @@ def test_bge_m3_embedding_only_is_not_generation_judge():
     }], [], campaign.JudgePolicy(excluded_families=()))
     assert result.selected is None
     assert result.rejection_reasons[0]["reason"] == "non_generative_embedding_only"
+
+
+def test_judge_eligibility_requires_schema_v2_measured_text_support():
+    policy = campaign.JudgePolicy(excluded_families=())
+
+    legacy = campaign.build_judge_selection([{
+        "name": "legacy-text",
+        "digest": "legacy",
+        "supported_families": ["text"],
+    }], [], policy)
+    assert legacy.selected is None
+    assert legacy.rejection_reasons[0]["reason"] == "capability_reprobe_required"
+
+    missing = campaign.build_judge_selection([{
+        "name": "missing-profile",
+        "digest": "missing",
+    }], [], policy)
+    assert missing.selected is None
+    assert missing.rejection_reasons[0]["reason"] == "capability_reprobe_required"
+
+    metadata = campaign.build_judge_selection([{
+        "name": "metadata-only",
+        "digest": "metadata",
+        "capabilities": ["completion", "tools"],
+    }], [], policy)
+    assert metadata.selected is None
+    assert metadata.rejection_reasons[0]["reason"] == "capability_reprobe_required"
+
+    supported = campaign.build_judge_selection([{
+        "name": "measured-text",
+        "digest": "text",
+        "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
+        "measured_capabilities": {"text": {"state": MeasuredCapabilityState.MEASURED_SUPPORTED.value}},
+    }], [], policy)
+    assert supported.selected["name"] == "measured-text"
+
+    unsupported = campaign.build_judge_selection([{
+        "name": "measured-unsupported",
+        "digest": "unsupported",
+        "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
+        "measured_capabilities": {"text": {"state": MeasuredCapabilityState.MEASURED_UNSUPPORTED.value}},
+    }], [], policy)
+    assert unsupported.selected is None
+    assert unsupported.rejection_reasons[0]["reason"] == "unknown_or_non_generative_capability"
+
+    inconclusive = campaign.build_judge_selection([{
+        "name": "measured-inconclusive",
+        "digest": "inconclusive",
+        "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
+        "measured_capabilities": {"text": {"state": MeasuredCapabilityState.PROBE_INCONCLUSIVE.value}},
+    }], [], policy)
+    assert inconclusive.selected is None
+    assert inconclusive.rejection_reasons[0]["reason"] == "capability_reprobe_required"
 
 
 def test_native_tool_contract_failure_is_measured_unsupported_and_not_planned():
@@ -256,6 +320,63 @@ def test_recovery_requires_positive_text_and_tool_applicability(tmp_path):
     assert [action.kind for action in supported.actions] == ["retry_generation"]
 
 
+def test_recovery_capability_profile_must_match_source_digest(tmp_path):
+    model = "example:latest"
+    same_runs = tmp_path / "same_digest"
+    same_runs.mkdir()
+    _write_repair_run(same_runs, model, _profile(model, {
+        "text": MeasuredCapabilityState.MEASURED_SUPPORTED.value,
+    }, digest="DIGEST_A"), "txt_sort", "empty_output", source_digest="DIGEST_A")
+    same = repair.build_plan(same_runs, run_id="fleet", include_missing=False)
+    assert [action.kind for action in same.actions] == ["retry_generation"]
+
+    mismatch_runs = tmp_path / "mismatch_digest"
+    mismatch_runs.mkdir()
+    _write_repair_run(mismatch_runs, model, _profile(model, {
+        "text": MeasuredCapabilityState.MEASURED_SUPPORTED.value,
+    }, digest="DIGEST_B"), "txt_sort", "empty_output", source_digest="DIGEST_A")
+    mismatch = repair.build_plan(mismatch_runs, run_id="fleet", include_missing=False)
+    assert mismatch.actions == []
+    assert mismatch.observations[0]["kind"] == "capability_reprobe_required"
+    assert mismatch.observations[0]["capability_identity_compatibility"]["reason"] == "model_digest_changed"
+
+    missing_profile_digest_runs = tmp_path / "missing_profile_digest"
+    missing_profile_digest_runs.mkdir()
+    _write_repair_run(missing_profile_digest_runs, model, _profile(model, {
+        "text": MeasuredCapabilityState.MEASURED_SUPPORTED.value,
+    }, digest=None), "txt_sort", "empty_output", source_digest="DIGEST_A")
+    missing_profile_digest = repair.build_plan(missing_profile_digest_runs, run_id="fleet", include_missing=False)
+    assert missing_profile_digest.actions == []
+    assert missing_profile_digest.observations[0]["capability_identity_compatibility"]["reason"] == "model_digest_changed"
+
+    missing_source_digest_runs = tmp_path / "missing_source_digest"
+    missing_source_digest_runs.mkdir()
+    _write_repair_run(missing_source_digest_runs, model, _profile(model, {
+        "text": MeasuredCapabilityState.MEASURED_SUPPORTED.value,
+    }, digest="DIGEST_A"), "txt_sort", "empty_output", source_digest="", write_identity=False)
+    missing_source_digest = repair.build_plan(missing_source_digest_runs, run_id="fleet", include_missing=False)
+    assert missing_source_digest.actions == []
+    assert missing_source_digest.observations[0]["capability_identity_compatibility"]["reason"] == "source_digest_missing"
+
+
+def test_specialized_recovery_lanes_cannot_cross_digest_boundaries(tmp_path):
+    model = "native:latest"
+    for task_id, family in [
+        ("agent_native_tool_call", "tools"),
+        ("fim_suffix_assertion", "insert"),
+        ("ocr_invoice", "vision"),
+    ]:
+        runs = tmp_path / family
+        runs.mkdir()
+        _write_repair_run(runs, model, _profile(model, {
+            family: MeasuredCapabilityState.MEASURED_SUPPORTED.value,
+        }, digest="DIGEST_B"), task_id, "empty_output", source_digest="DIGEST_A")
+        plan = repair.build_plan(runs, run_id="fleet", include_missing=False)
+        assert plan.actions == []
+        assert plan.observations[0]["kind"] == "capability_reprobe_required"
+        assert plan.observations[0]["capability_identity_compatibility"]["reason"] == "model_digest_changed"
+
+
 def test_capability_identity_rejects_digest_backend_template_and_protocol_changes():
     model = "fixture:latest"
     profile = _profile(model, {"text": MeasuredCapabilityState.MEASURED_SUPPORTED.value})
@@ -267,6 +388,21 @@ def test_capability_identity_rejects_digest_backend_template_and_protocol_change
     changed_protocol["capability_identity"] = dict(profile["capability_identity"])
     changed_protocol["capability_identity"]["probe_protocol_version"] = "old"
     assert capability_identity_compatibility(changed_protocol, current_capability_identity(CapabilityClient(name=model), model))["reason"] == "probe_protocol_version_changed"
+
+
+def test_capability_identity_hash_ignores_modified_at_but_keeps_material_changes():
+    model = "fixture:latest"
+    first = current_capability_identity(CapabilityClient(name=model, modified_at="2026-08-10T00:00:00Z"), model)
+    second = current_capability_identity(CapabilityClient(name=model, modified_at="2026-08-11T00:00:00Z"), model)
+    assert first["identity_hash"] == second["identity_hash"]
+    assert "modified_at" not in first["model"]
+
+    digest_changed = current_capability_identity(CapabilityClient(name=model, digest="digest-2"), model)
+    backend_changed = current_capability_identity(CapabilityClient(name=model, backend="other"), model)
+    template_changed = current_capability_identity(CapabilityClient(name=model, template="template-v2"), model)
+    assert first["identity_hash"] != digest_changed["identity_hash"]
+    assert first["identity_hash"] != backend_changed["identity_hash"]
+    assert first["identity_hash"] != template_changed["identity_hash"]
 
 
 def test_legacy_profile_remains_readable_but_not_authoritative_for_new_plan():

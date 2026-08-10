@@ -5,11 +5,22 @@ import pytest
 from llm_modelbench import campaign
 
 
+def _measured_text(name, digest, **extra):
+    item = {
+        "name": name,
+        "digest": digest,
+        "capability_schema_version": campaign.CAPABILITY_SCHEMA_VERSION,
+        "measured_capabilities": {"text": {"state": "measured_supported"}},
+    }
+    item.update(extra)
+    return item
+
+
 def test_embedding_only_judge_is_never_selected_and_qwen_policy_is_respected():
     chosen = campaign.select_campaign_judge([
         {"name": "bge-m3:latest", "digest": "bge", "capabilities": ["embedding"]},
-        {"name": "qwen2.5:14b", "digest": "q", "capabilities": ["completion"]},
-        {"name": "selene", "digest": "s", "capabilities": ["completion"]},
+        _measured_text("qwen2.5:14b", "q"),
+        _measured_text("selene", "s"),
     ], [])
     assert chosen["name"] == "selene"
 
@@ -22,7 +33,7 @@ def test_structured_judge_qualification_rejects_first_http_failure_without_retry
             return {"ok": False, "error": "unsupported endpoint", "http_status": 400}
 
     client = Broken()
-    result = campaign.qualify_judge(client, {"name": "judge", "capabilities": ["completion"]})
+    result = campaign.qualify_judge(client, _measured_text("judge", "digest-judge"))
     assert result["qualified"] is False
     assert client.calls == 1  # immediate candidate stop; no source rows are touched
     assert result["aggregate_disposition"] == "rejected_structural_incompatibility"
@@ -52,8 +63,8 @@ def test_judge_qualification_uses_deterministic_fallback_chain():
             return {"ok": True, "text": json.dumps({"score": score, "confidence": 1, "verdict": "ok", "rubric_adherence": True, "reference_used": True})}
 
     selection = campaign.build_judge_selection([
-        {"name": "first", "digest": "1", "capabilities": ["completion"]},
-        {"name": "second", "digest": "2", "capabilities": ["completion"]},
+        _measured_text("first", "1"),
+        _measured_text("second", "2"),
     ], [], campaign.JudgePolicy(configured_fallbacks=("first", "second"), excluded_families=("qwen",)))
     selected, chain = campaign.select_qualified_campaign_judge(Fallback(), selection)
     assert selected["name"] == "second"

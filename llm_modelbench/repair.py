@@ -35,9 +35,9 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from .capabilities import interrogate_model
+from .capabilities import capability_identity_compatibility, interrogate_model
 from .capabilities import MeasuredCapabilityState, family_applicability, family_is_applicable, measured_supported_families
 from .hardware import detect_gpu
 from .judge_dumps import apply_judgements, judge_run
@@ -432,9 +432,11 @@ def _load_selected_rows(run_dirs: Sequence[Path]) -> Tuple[List[Dict[str, Any]],
             row = dict(raw)
             model = str(row.get("model") or "")
             identity = identities.get(model) or {}
-            digest = str(identity.get("digest") or row.get("model_digest") or model)
+            source_digest = identity.get("digest") or row.get("model_digest") or row.get("model_digest_resolved")
+            digest = str(source_digest or model)
             row["run_id"] = run_dir.name
             row["model_digest_resolved"] = digest
+            row["_source_digest_available"] = bool(source_digest)
             row["level"] = str(row.get("level") or run_cfg.get("level") or "unknown")
             row["run_configuration"] = run_cfg
             row["_source_row_index"] = index
@@ -461,12 +463,67 @@ def _load_selected_rows(run_dirs: Sequence[Path]) -> Tuple[List[Dict[str, Any]],
     return rows, model_context
 
 
-def _best_profile(context: Dict[str, Any]) -> Dict[str, Any]:
+def _profile_source_identity(profile: Mapping[str, Any], *, model: str, digest: str) -> Optional[Dict[str, Any]]:
+    stored = profile.get("capability_identity")
+    if not isinstance(stored, Mapping):
+        return None
+    identity = copy.deepcopy(dict(stored))
+    model_identity = dict(identity.get("model") or {})
+    model_identity["canonical_name"] = model_identity.get("canonical_name") or model
+    model_identity["digest"] = digest
+    identity["model"] = model_identity
+    return identity
+
+
+def _profile_source_compatibility(
+    profile: Mapping[str, Any],
+    *,
+    source_model: str,
+    source_digest: str,
+    source_digest_available: bool,
+) -> Dict[str, Any]:
+    if not source_digest_available or not source_digest:
+        return {"compatible": False, "reason": "source_digest_missing"}
+    current_identity = _profile_source_identity(profile, model=source_model, digest=source_digest)
+    if current_identity is None:
+        return {"compatible": False, "reason": "legacy_or_unbound_capability_profile"}
+    return capability_identity_compatibility(profile, current_identity)
+
+
+def _best_profile(
+    context: Dict[str, Any],
+    *,
+    source_model: Optional[str] = None,
+    source_digest: Optional[str] = None,
+    source_digest_available: bool = False,
+) -> Dict[str, Any]:
     profiles = list(context.get("profiles") or [])
     if not profiles:
         return {"model": context.get("model"), "supported_families": [], "declared_capabilities": []}
     profiles.sort(key=lambda p: (bool(p.get("functional_probes_enabled")), len(p.get("supported_families") or [])), reverse=True)
-    return copy.deepcopy(profiles[0])
+    if source_model is None:
+        source_model = str(context.get("model") or "")
+    if source_digest is None:
+        source_digest = str(context.get("digest") or "")
+    for profile in profiles:
+        compatibility = _profile_source_compatibility(
+            profile,
+            source_model=str(source_model or ""),
+            source_digest=str(source_digest or ""),
+            source_digest_available=source_digest_available,
+        )
+        if compatibility.get("compatible"):
+            selected = copy.deepcopy(profile)
+            selected["capability_identity_compatibility"] = compatibility
+            return selected
+    selected = copy.deepcopy(profiles[0])
+    selected["capability_identity_compatibility"] = _profile_source_compatibility(
+        selected,
+        source_model=str(source_model or ""),
+        source_digest=str(source_digest or ""),
+        source_digest_available=source_digest_available,
+    )
+    return selected
 
 
 def _capability_observation(row: Dict[str, Any], task_id: str, family: str, state: str) -> Dict[str, Any]:
@@ -487,6 +544,13 @@ def _capability_observation(row: Dict[str, Any], task_id: str, family: str, stat
         "family": family,
         "capability_state": state,
         "reason": reason,
+    }
+
+
+def _capability_identity_observation(row: Dict[str, Any], task_id: str, family: str, compatibility: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        **_capability_observation(row, task_id, family, MeasuredCapabilityState.PROBE_INCONCLUSIVE.value),
+        "capability_identity_compatibility": dict(compatibility),
     }
 
 
@@ -779,8 +843,20 @@ def build_plan(
         text = _error_text(row)
         digest = str(row.get("model_digest_resolved") or row.get("model") or "")
         context = contexts.get(digest) or {}
-        profile = _best_profile(context)
         model_name = str(row.get("model") or "")
+        profile = _best_profile(
+            context,
+            source_model=model_name,
+            source_digest=str(row.get("model_digest_resolved") or ""),
+            source_digest_available=bool(row.get("_source_digest_available")),
+        )
+        capability_compatibility = profile.get("capability_identity_compatibility") or {}
+        if error_kind and not capability_compatibility.get("compatible"):
+            observations.append({
+                **_capability_identity_observation(row, task_id, task.family, capability_compatibility),
+                "previous_error_kind": error_kind,
+            })
+            continue
         capability_state = family_applicability(profile, task.family)
         capability_positive = family_is_applicable(profile, task.family)
         known_unavailable = unavailable_families_by_model.get(model_name, set())
@@ -892,7 +968,14 @@ def build_plan(
         for digest, context in contexts.items():
             if "full" not in set(context.get("levels") or []):
                 continue
-            profile = _best_profile(context)
+            profile = _best_profile(
+                context,
+                source_model=str(context.get("model") or ""),
+                source_digest=str(context.get("digest") or ""),
+                source_digest_available=bool(context.get("digest")),
+            )
+            if not (profile.get("capability_identity_compatibility") or {}).get("compatible"):
+                continue
             families = set(measured_supported_families(profile))
             model_name = str(context.get("model") or "")
             known_unavailable = unavailable_families_by_model.get(model_name, set())

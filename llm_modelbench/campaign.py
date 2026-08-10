@@ -26,9 +26,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .classify import families_for, families_from_capabilities
+from .classify import families_for
 from .capabilities import (
     CAPABILITY_SCHEMA_VERSION,
+    MeasuredCapabilityState,
+    family_applicability,
     measured_supported_families,
 )
 
@@ -3091,24 +3093,32 @@ def _canonical_candidate_families(item: Dict[str, Any]) -> List[str]:
     return families_for(_candidate_name(item), capabilities)
 
 
+def _judge_measured_text_state(item: Dict[str, Any]) -> str:
+    if item.get("capability_schema_version") != CAPABILITY_SCHEMA_VERSION:
+        return MeasuredCapabilityState.PROBE_INCONCLUSIVE.value
+    compatibility = item.get("capability_identity_compatibility")
+    if isinstance(compatibility, dict) and not compatibility.get("compatible"):
+        return MeasuredCapabilityState.PROBE_INCONCLUSIVE.value
+    return family_applicability(item, "text")
+
+
 def _judge_capability_rejection(item: Dict[str, Any]) -> Optional[str]:
     """Fail closed unless canonical evidence confirms normal text generation."""
-    name = _candidate_name(item)
-    capabilities = _candidate_capabilities(item)
+    if item.get("capability_schema_version") != CAPABILITY_SCHEMA_VERSION:
+        return "capability_reprobe_required"
+    compatibility = item.get("capability_identity_compatibility")
+    if isinstance(compatibility, dict) and not compatibility.get("compatible"):
+        return "capability_reprobe_required"
+    state = _judge_measured_text_state(item)
     families = _canonical_candidate_families(item)
-    lowered_name = name.lower()
-    if any(token in lowered_name for token in ("rerank", "reranker")) and "text" not in families:
-        return "non_generative_reranker"
-    if "embedding" in families and "text" not in families:
-        return "non_generative_embedding_only"
-    if "vision" in families and "text" not in families:
-        return "non_generative_vision_only"
-    if capabilities and "text" in families and "text" not in families_from_capabilities(capabilities):
-        return "unknown_or_non_generative_capability"
-    if "text" in families:
+    if state == MeasuredCapabilityState.MEASURED_SUPPORTED.value:
         return None
-    if not capabilities and not families:
-        return "unknown_capability_no_positive_text_generation_evidence"
+    if state == MeasuredCapabilityState.PROBE_INCONCLUSIVE.value:
+        return "capability_reprobe_required"
+    if "embedding" in families:
+        return "non_generative_embedding_only"
+    if "vision" in families:
+        return "non_generative_vision_only"
     return "unknown_or_non_generative_capability"
 
 
