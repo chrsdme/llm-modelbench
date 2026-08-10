@@ -66,17 +66,16 @@ def test_insert_probe_requires_suffix_conditioning_not_generic_completion():
 
     profile = interrogate_model(C(), "coder", functional=True)
     assert profile["probes"]["insert"]["ok"] is False
-    # The endpoint answered a task-equivalent FIM request but failed the tiny
-    # assertion. That is model quality, not capability absence, so the real
-    # scored task remains routed and records the failure honestly.
-    assert "insert" in profile["supported_families"]
+    # The endpoint answered a task-equivalent FIM request but failed the actual
+    # suffix contract. That is not positive FIM capability evidence.
+    assert "insert" not in profile["supported_families"]
     assert profile["probe_states"]["insert"] == "responded_contract_failed"
-    assert "functional_response" in profile["sources"]["insert"]
+    assert profile["measured_capabilities"]["insert"]["state"] == "measured_unsupported"
 
 
 def test_planner_routes_native_tools_and_fim_only_to_capable_model():
     client = MockClient("http://127.0.0.1:11434", 42, 0.0, 10)
-    plan = build_plan(client, Config(), level="short", selected_models=["qwen2.5-coder:14b"])
+    plan = build_plan(client, Config(), level="short", selected_models=["qwen2.5-coder:14b"], auto_probe=True)
     tasks = plan["active_models"][0]["tasks"]
     assert "agent_native_tool_call" in tasks
     assert "fim_suffix_assertion" in tasks
@@ -177,7 +176,7 @@ def test_auto_vision_probe_uses_name_hint_despite_partial_metadata(monkeypatch):
     assert "functional_probe" in profile["sources"]["vision"]
 
 
-def test_planner_routes_known_vlm_with_completion_only_metadata():
+def test_planner_routes_known_vlm_with_measured_vision(monkeypatch):
     model = "hf.co/atahmih/InternVL3-8B-Q4_K_M-GGUF:latest"
 
     class C:
@@ -188,7 +187,14 @@ def test_planner_routes_known_vlm_with_completion_only_metadata():
             assert name == model
             return ["completion"]
 
-    plan = build_plan(C(), Config(), level="short", categories=["ocr", "pdf"], selected_models=[model])
+        def chat(self, name, prompt, **kwargs):
+            return {"ok": True, "text": "V7K9Q2" if kwargs.get("images") else "AIW_TEXT_OK"}
+
+        def chat_tools(self, *args, **kwargs):
+            return {"ok": False, "error": "not supported", "tool_calls": []}
+
+    monkeypatch.setattr("llm_modelbench.capabilities.media.render_text_png", lambda *a, **k: "base64-image")
+    plan = build_plan(C(), Config(), level="short", categories=["ocr", "pdf"], selected_models=[model], auto_probe=True)
     assert plan["models_active"] == 1
     active = plan["active_models"][0]
     assert active["families"] == ["vision", "text"]

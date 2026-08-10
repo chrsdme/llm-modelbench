@@ -2,6 +2,7 @@ import json
 import pytest
 
 from llm_modelbench import runner
+from llm_modelbench.capabilities import CAPABILITY_SCHEMA_VERSION, PROBE_PROTOCOL_VERSION, current_capability_identity
 from llm_modelbench.config import Config
 from llm_modelbench.ollama import MockClient
 from llm_modelbench.runtime_identity import RuntimeIdentity, RuntimeModelIdentity, RuntimeExecutionSettings
@@ -14,7 +15,9 @@ class Client(MockClient):
     def __init__(self): super().__init__(); self.calls=0
     def chat(self,*a,**k): self.calls+=1; return super().chat(*a,**k)
 def run(c,path,identity_value,resume):
-    return runner.run(c,Config(fingerprint=False),level="smoke",out_dir=path,include=None,exclude=None,skip_offload=False,categories=None,task_ids=["py_anagram"],resume=resume,live_ui="off",fingerprint_enabled=False,selected_models=[MODEL],capability_profiles={MODEL:{"declared_capabilities":["completion"],"supported_families":["text"]}},auto_probe=False,runtime_identity={MODEL:identity_value})
+    cap_identity = current_capability_identity(c, MODEL)
+    profile = {MODEL: {"capability_schema_version": CAPABILITY_SCHEMA_VERSION, "probe_protocol_version": PROBE_PROTOCOL_VERSION, "capability_identity": cap_identity, "declared_capabilities": ["completion"], "supported_families": ["text"], "measured_supported_families": ["text"], "measured_capabilities": {"text": {"state": "measured_supported", "route_scored_tasks": True}}}}
+    return runner.run(c,Config(fingerprint=False),level="smoke",out_dir=path,include=None,exclude=None,skip_offload=False,categories=None,task_ids=["py_anagram"],resume=resume,live_ui="off",fingerprint_enabled=False,selected_models=[MODEL],capability_profiles=profile,auto_probe=False,runtime_identity={MODEL:identity_value})
 def test_new_run_writes_model_keyed_identity_and_row_reference(tmp_path):
     run(Client(),tmp_path,identity(),False); artifact=json.loads((tmp_path/"runtime_identity.json").read_text()); row=json.loads((tmp_path/"raw_results.jsonl").read_text().splitlines()[0])
     assert artifact["identities"][MODEL]["model"]["artifact_digest"]=="sha256:one" and row["runtime_identity_hash"]==artifact["identities"][MODEL]["identity_hash"]

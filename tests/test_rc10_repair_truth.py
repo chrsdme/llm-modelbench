@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from llm_modelbench import repair, rankings, watch
+from llm_modelbench.capabilities import CAPABILITY_SCHEMA_VERSION, PROBE_PROTOCOL_VERSION
 from llm_modelbench.config import Config
 from llm_modelbench.ollama import MockClient
 from llm_modelbench.runner import _task_hash
@@ -19,9 +20,22 @@ def _write_full_run(run: Path, model: str, rows):
     (run / "summary_meta.json").write_text(json.dumps({"level": "full"}))
     (run / "filters.json").write_text(json.dumps({"level": "full"}))
     (run / "model_identities.json").write_text(json.dumps({model: {"digest": "d1"}}))
+    supported = ["vision", "text", "insert"]
     (run / "capability_report.json").write_text(json.dumps({model: {
+        "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
+        "probe_protocol_version": PROBE_PROTOCOL_VERSION,
+        "capability_identity": {
+            "schema_version": CAPABILITY_SCHEMA_VERSION,
+            "model": {"canonical_name": model, "backend_model_id": model, "digest": "d1"},
+            "backend": {"backend": "mock", "implementation": "fixture", "endpoint": "http://fake.invalid"},
+            "runtime": {"endpoint": "http://fake.invalid", "implementation": "fixture"},
+            "template_config": {"hash": "fixture-template", "available": True},
+            "probe_protocol_version": PROBE_PROTOCOL_VERSION,
+        },
         "declared_capabilities": ["completion", "insert"],
-        "supported_families": ["vision", "text", "insert"],
+        "supported_families": supported,
+        "measured_supported_families": supported,
+        "measured_capabilities": {family: {"state": "measured_supported", "route_scored_tasks": True} for family in supported},
     }}))
 
 

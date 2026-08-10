@@ -27,6 +27,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .classify import families_for, families_from_capabilities
+from .capabilities import (
+    CAPABILITY_SCHEMA_VERSION,
+    measured_supported_families,
+)
 
 CAMPAIGNS_ROOT = Path("campaigns")
 MANIFEST_SCHEMA_VERSION = 1
@@ -3073,6 +3077,8 @@ def _canonical_candidate_families(item: Dict[str, Any]) -> List[str]:
     interrogation/planning pipeline; arbitrary callers that also provide raw
     capabilities must not use it to override the canonical raw-capability route.
     """
+    if item.get("capability_schema_version") == CAPABILITY_SCHEMA_VERSION:
+        return measured_supported_families(item)
     capabilities = _candidate_capabilities(item)
     if capabilities:
         return families_for(_candidate_name(item), capabilities)

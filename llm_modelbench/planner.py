@@ -11,7 +11,12 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .capabilities import interrogate_models
+from .capabilities import (
+    capability_identity_compatibility,
+    current_capability_identity,
+    interrogate_models,
+    measured_supported_families,
+)
 from .classify import classify_model, size_gb
 from .filters import describe_filters, filter_models, filter_tasks, validate_task_ids
 from .runner import _samples_for_task
@@ -93,15 +98,31 @@ def build_plan(
         raise ValueError(f"unknown task id(s): {', '.join(unknown)}. Known tasks: {known}")
 
     profiles = dict(capability_profiles or {})
+    current_identities = {m: current_capability_identity(client, m) for m in models}
     missing_profiles = [m for m in models if m not in profiles]
+    incompatible_profiles = []
+    for model in models:
+        if model not in profiles:
+            continue
+        compatibility = capability_identity_compatibility(profiles[model], current_identities.get(model))
+        profiles[model]["capability_identity_compatibility"] = compatibility
+        if not compatibility.get("compatible"):
+            incompatible_profiles.append(model)
     if missing_profiles:
         profiles.update(interrogate_models(client, missing_profiles, functional=auto_probe))
+    if incompatible_profiles and auto_probe:
+        profiles.update(interrogate_models(client, incompatible_profiles, functional=True))
 
     task_source_level = "full" if context_only else level
     active: List[Dict[str, Any]] = []
     for model in models:
         profile = profiles[model]
-        fams = list(profile.get("supported_families") or [])
+        compatibility = capability_identity_compatibility(profile, current_identities.get(model))
+        profile["capability_identity_compatibility"] = compatibility
+        fams = measured_supported_families(profile) if compatibility.get("compatible") else []
+        if not fams:
+            skipped.append({"model": model, "reason": "no_measured_supported_capabilities"})
+            continue
         ts = filter_tasks(
             tasks_for(task_source_level, categories, fams),
             task_ids=task_ids,

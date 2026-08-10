@@ -1,9 +1,8 @@
 """Capability interrogation and evidence-aware task routing.
 
-Metadata is cheap and always collected. Actual ``run`` commands perform small
-functional probes by default before routing scored lanes; ``plan`` remains
-metadata-only unless ``--auto`` is explicit. Probes never execute a proposed
-tool call, and ``--no-auto-probe`` is available for deliberate metadata-only runs.
+Metadata is cheap and always collected, but it is only a hint. Actual routing
+requires measured capability evidence from functional smoke probes. Probes never
+execute a proposed tool call.
 """
 from __future__ import annotations
 
@@ -11,7 +10,8 @@ import hashlib
 import json
 import re
 import time
-from typing import Any, Dict, Iterable, List, Optional
+from enum import Enum
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from . import media
 from .classify import (
@@ -23,9 +23,162 @@ from .classify import (
     profile_for,
 )
 
+CAPABILITY_SCHEMA_VERSION = 2
+PROBE_PROTOCOL_VERSION = "capability-smoke-v2"
+
+
+class MeasuredCapabilityState(str, Enum):
+    MEASURED_SUPPORTED = "measured_supported"
+    MEASURED_UNSUPPORTED = "measured_unsupported"
+    PROBE_INCONCLUSIVE = "probe_inconclusive"
+    BACKEND_UNSUPPORTED = "backend_unsupported"
+    NOT_APPLICABLE = "not_applicable"
+
+
+_POSITIVE_STATES = {MeasuredCapabilityState.MEASURED_SUPPORTED.value}
+_NEGATIVE_STATES = {
+    MeasuredCapabilityState.MEASURED_UNSUPPORTED.value,
+    MeasuredCapabilityState.BACKEND_UNSUPPORTED.value,
+    MeasuredCapabilityState.NOT_APPLICABLE.value,
+}
+
 
 def _normalise_text(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _canonical_hash(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _safe_call(obj: Any, name: str, *args: Any) -> Any:
+    fn = getattr(obj, name, None)
+    if not callable(fn):
+        return None
+    try:
+        return fn(*args)
+    except Exception:
+        return None
+
+
+def _backend_identity(client: Any) -> Dict[str, Any]:
+    identity = _safe_call(client, "backend_identity")
+    if identity is not None:
+        return {
+            "backend": str(getattr(identity, "backend", "") or "unknown"),
+            "implementation": str(getattr(identity, "implementation", "") or "unknown"),
+            "endpoint": getattr(identity, "endpoint", None),
+        }
+    endpoint = getattr(client, "base", None)
+    return {
+        "backend": "legacy",
+        "implementation": client.__class__.__name__,
+        "endpoint": endpoint,
+    }
+
+
+def _model_tag_row(client: Any, model: str) -> Dict[str, Any]:
+    tags = _safe_call(client, "tags")
+    if isinstance(tags, list):
+        for row in tags:
+            if isinstance(row, dict) and row.get("name") == model:
+                return dict(row)
+    return {}
+
+
+def _model_identity(client: Any, model: str) -> Dict[str, Any]:
+    row = _model_tag_row(client, model)
+    details = row.get("details") if isinstance(row.get("details"), dict) else {}
+    digest = row.get("digest") or row.get("id") or row.get("model_id")
+    if not digest:
+        digest = details.get("digest") or details.get("id") or details.get("model_id")
+    return {
+        "canonical_name": model,
+        "backend_model_id": row.get("name") or model,
+        "digest": digest,
+        "size": row.get("size"),
+        "modified_at": row.get("modified_at"),
+        "details": details,
+    }
+
+
+def _template_config_identity(client: Any, model: str) -> Dict[str, Any]:
+    show = _safe_call(client, "show", model)
+    show = show if isinstance(show, dict) else {}
+    model_info = show.get("model_info")
+    if not isinstance(model_info, dict):
+        model_info = _safe_call(client, "model_info", model)
+    if not isinstance(model_info, dict):
+        model_info = {}
+    relevant = {
+        "template": show.get("template") or show.get("chat_template"),
+        "parameters": show.get("parameters"),
+        "modelfile": show.get("modelfile"),
+        "system": show.get("system"),
+        "model_info": {
+            key: model_info.get(key)
+            for key in sorted(model_info)
+            if any(token in str(key).lower() for token in ("template", "architecture", "context", "embedding"))
+        },
+    }
+    return {
+        "available": any(value not in (None, {}, []) for value in relevant.values()),
+        "hash": _canonical_hash(relevant),
+        "material": relevant,
+    }
+
+
+def current_capability_identity(client: Any, model: str) -> Dict[str, Any]:
+    backend = _backend_identity(client)
+    model_identity = _model_identity(client, model)
+    template_config = _template_config_identity(client, model)
+    identity = {
+        "schema_version": CAPABILITY_SCHEMA_VERSION,
+        "model": model_identity,
+        "backend": backend,
+        "runtime": {
+            "endpoint": backend.get("endpoint"),
+            "implementation": backend.get("implementation"),
+        },
+        "template_config": template_config,
+        "probe_protocol_version": PROBE_PROTOCOL_VERSION,
+    }
+    identity["identity_hash"] = _canonical_hash(identity)
+    return identity
+
+
+def capability_identity_compatibility(
+    profile: Mapping[str, Any],
+    current_identity: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    stored = profile.get("capability_identity")
+    if not isinstance(stored, Mapping):
+        return {"compatible": False, "reason": "legacy_or_unbound_capability_profile"}
+    if profile.get("capability_schema_version") != CAPABILITY_SCHEMA_VERSION:
+        return {"compatible": False, "reason": "capability_schema_version_changed"}
+    if stored.get("probe_protocol_version") != PROBE_PROTOCOL_VERSION:
+        return {"compatible": False, "reason": "probe_protocol_version_changed"}
+    if current_identity is None:
+        return {"compatible": False, "reason": "current_capability_identity_missing"}
+    checks = [
+        (("model", "canonical_name"), "model_name_changed"),
+        (("model", "digest"), "model_digest_changed"),
+        (("backend", "backend"), "backend_changed"),
+        (("backend", "implementation"), "backend_implementation_changed"),
+        (("runtime", "endpoint"), "endpoint_changed"),
+        (("template_config", "hash"), "template_config_changed"),
+    ]
+    for path, reason in checks:
+        left: Any = stored
+        right: Any = current_identity
+        for key in path:
+            left = left.get(key) if isinstance(left, Mapping) else None
+            right = right.get(key) if isinstance(right, Mapping) else None
+        if left != right:
+            return {"compatible": False, "reason": reason}
+    return {"compatible": True, "reason": "identity_match"}
 
 
 def _probe_result(
@@ -226,6 +379,70 @@ def _probe_state(result: Dict[str, Any]) -> str:
     return "transient_failure" if transient else "probe_failed"
 
 
+def _measured_state(family: str, result: Dict[str, Any]) -> str:
+    if result.get("ok"):
+        return MeasuredCapabilityState.MEASURED_SUPPORTED.value
+    text = " ".join(str(result.get(k) or "") for k in ("error", "detail")).lower()
+    no_interface = any(token in text for token in (
+        "client has no", "backend unsupported", "backend does not support",
+        "method", "unsupported by this endpoint template",
+    ))
+    if no_interface:
+        return MeasuredCapabilityState.BACKEND_UNSUPPORTED.value
+    definitive = any(token in text for token in (
+        "unsupported", "does not support", "not supported", "missing projector",
+        "mmproj", "capability unavailable", "invalid option",
+    ))
+    if definitive:
+        return MeasuredCapabilityState.MEASURED_UNSUPPORTED.value
+    if result.get("responded"):
+        return MeasuredCapabilityState.MEASURED_UNSUPPORTED.value
+    transient = any(token in text for token in (
+        "timeout", "timed out", "connection reset", "connection refused",
+        "temporarily unavailable", "http 429", "http 500", "http 502",
+        "http 503", "http 504",
+    ))
+    return MeasuredCapabilityState.PROBE_INCONCLUSIVE.value if transient else MeasuredCapabilityState.PROBE_INCONCLUSIVE.value
+
+
+def measured_capability_states(profile: Mapping[str, Any]) -> Dict[str, str]:
+    measured = profile.get("measured_capabilities")
+    if isinstance(measured, Mapping):
+        out: Dict[str, str] = {}
+        for family, item in measured.items():
+            if isinstance(item, Mapping):
+                state = item.get("state")
+            else:
+                state = item
+            if str(family) in FAMILY_ORDER and str(state):
+                out[str(family)] = str(state)
+        return out
+    # Legacy compatibility for historical readers only. Do not treat this as
+    # identity-bound authority unless the caller explicitly allows legacy data.
+    out = {}
+    for family in profile.get("supported_families") or []:
+        if str(family) in FAMILY_ORDER:
+            out[str(family)] = MeasuredCapabilityState.MEASURED_SUPPORTED.value
+    return out
+
+
+def measured_supported_families(profile: Mapping[str, Any], *, allow_legacy: bool = False) -> List[str]:
+    if not allow_legacy and profile.get("capability_schema_version") != CAPABILITY_SCHEMA_VERSION:
+        return []
+    states = measured_capability_states(profile)
+    return [family for family in FAMILY_ORDER if states.get(family) in _POSITIVE_STATES]
+
+
+def family_applicability(profile: Mapping[str, Any], family: str, *, allow_legacy: bool = False) -> str:
+    if not allow_legacy and profile.get("capability_schema_version") != CAPABILITY_SCHEMA_VERSION:
+        return MeasuredCapabilityState.PROBE_INCONCLUSIVE.value
+    return measured_capability_states(profile).get(str(family), MeasuredCapabilityState.NOT_APPLICABLE.value)
+
+
+def family_is_applicable(profile: Mapping[str, Any], family: str, *, allow_legacy: bool = False) -> bool:
+    return family_applicability(profile, family, allow_legacy=allow_legacy) == MeasuredCapabilityState.MEASURED_SUPPORTED.value
+
+
 def interrogate_model(
     client: Any, model: str, *, functional: bool = False,
     probe_families: Optional[Iterable[str]] = None,
@@ -236,6 +453,7 @@ def interrogate_model(
     operator profiles and Ollama-declared capabilities remain routed so that a
     real benchmark task records the failure instead of silently hiding it.
     """
+    capability_identity = current_capability_identity(client, model)
     declared = client.capabilities(model) if hasattr(client, "capabilities") else []
     declared = [str(c).lower() for c in declared or []]
     profile = profile_for(model)
@@ -299,6 +517,7 @@ def interrogate_model(
     unavailable: List[str] = []
     unverified: List[str] = []
     probe_states: Dict[str, str] = {}
+    measured: Dict[str, Dict[str, Any]] = {}
 
     if functional:
         # Functional evidence is authoritative for routing. Metadata/name hints
@@ -308,31 +527,59 @@ def interrogate_model(
         supported = [family for family in supported if family not in probed_families]
         for family, result in probes.items():
             state = _probe_state(result)
+            measured_state = _measured_state(family, result)
             probe_states[family] = state
-            if state in {"confirmed_supported", "responded_contract_failed"}:
+            measured[family] = {
+                "state": measured_state,
+                "legacy_probe_state": state,
+                "route_scored_tasks": measured_state == MeasuredCapabilityState.MEASURED_SUPPORTED.value,
+            }
+            if measured_state == MeasuredCapabilityState.MEASURED_SUPPORTED.value:
                 supported.append(family)
-                sources.setdefault(family, []).append(
-                    "functional_probe" if state == "confirmed_supported" else "functional_response"
-                )
-                if state == "responded_contract_failed":
-                    warnings.append(f"routed {family}: endpoint responded, but probe contract failed; scored task will measure quality")
-            elif state == "confirmed_unavailable":
+                sources.setdefault(family, []).append("functional_probe")
+            elif measured_state in _NEGATIVE_STATES:
                 unavailable.append(family)
-                warnings.append(f"removed {family}: functional probe confirmed the installed build cannot serve this lane")
+                if state == "responded_contract_failed":
+                    warnings.append(f"removed {family}: functional probe response did not satisfy the required capability contract")
+                else:
+                    warnings.append(f"removed {family}: functional probe confirmed the installed build cannot serve this lane")
             else:
                 unverified.append(family)
                 warnings.append(f"withheld {family}: functional probe failed without definitive capability evidence")
+        for family in FAMILY_ORDER:
+            if family in set(initial) | set(probes) and family not in measured:
+                measured[family] = {
+                    "state": MeasuredCapabilityState.NOT_APPLICABLE.value,
+                    "legacy_probe_state": probe_states.get(family, "not_probed"),
+                    "route_scored_tasks": False,
+                }
+    else:
+        unverified.extend(supported)
+        supported = []
+        for family in initial:
+            measured[family] = {
+                "state": MeasuredCapabilityState.PROBE_INCONCLUSIVE.value,
+                "legacy_probe_state": "not_probed_metadata_hint",
+                "route_scored_tasks": False,
+            }
+        if initial:
+            warnings.append("metadata capabilities are hints only; run functional probes before routing scored tasks")
 
     supported = [f for f in FAMILY_ORDER if f in set(supported)]
     if not supported:
         warnings.append("no capability lane survived interrogation")
 
     payload = {
+        "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
+        "probe_protocol_version": PROBE_PROTOCOL_VERSION,
         "model": model,
+        "capability_identity": capability_identity,
         "declared_capabilities": declared,
         "profile": profile,
         "initial_families": initial,
         "supported_families": supported,
+        "measured_supported_families": [f for f in FAMILY_ORDER if measured.get(f, {}).get("state") == MeasuredCapabilityState.MEASURED_SUPPORTED.value],
+        "measured_capabilities": measured,
         "sources": sources,
         "functional_probes_enabled": bool(functional),
         "requested_probe_families": sorted(requested_probes) if requested_probes is not None else None,
@@ -342,6 +589,7 @@ def interrogate_model(
             family: {
                 "sources": list(sources.get(family) or []),
                 "probe_state": probe_states.get(family, "not_probed"),
+                "measured_state": measured.get(family, {}).get("state", MeasuredCapabilityState.NOT_APPLICABLE.value),
                 "route_scored_tasks": family in supported,
             }
             for family in FAMILY_ORDER

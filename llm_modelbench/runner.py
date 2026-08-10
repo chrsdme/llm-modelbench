@@ -1432,17 +1432,31 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
     cats = categories
     task_source_level = "full" if context_only else level
     fingerprints: Dict[str, List[str]] = {}
+    from .capabilities import capability_identity_compatibility, current_capability_identity, measured_supported_families
     profiles = dict(capability_profiles or {})
+    current_capability_identities = {model: current_capability_identity(client, model) for model in models}
     if any(model not in profiles for model in models):
         from .capabilities import interrogate_models
         missing_profiles = [model for model in models if model not in profiles]
         profiles.update(interrogate_models(client, missing_profiles, functional=auto_probe))
+    incompatible_profiles = [
+        model for model in models
+        if model in profiles and not capability_identity_compatibility(profiles[model], current_capability_identities.get(model)).get("compatible")
+    ]
+    if incompatible_profiles and auto_probe:
+        from .capabilities import interrogate_models
+        profiles.update(interrogate_models(client, incompatible_profiles, functional=True))
     model_plan: List[Dict[str, Any]] = []
     active_task_union: List[Task] = []
     for model in models:
         profile = profiles[model]
         capabilities = profile.get("declared_capabilities") or []
-        fams = list(profile.get("supported_families") or [])
+        compatibility = capability_identity_compatibility(profile, current_capability_identities.get(model))
+        profile["capability_identity_compatibility"] = compatibility
+        fams = measured_supported_families(profile) if compatibility.get("compatible") else []
+        if not fams:
+            skipped_models.append({"model": model, "reason": "no_measured_supported_capabilities"})
+            continue
         all_tasks = filter_tasks(tasks_for(task_source_level, cats, fams), task_ids=task_ids,
                                  task_regex=task_regex, context_only=context_only)
         if not all_tasks:
@@ -1524,7 +1538,8 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
         for model_index, model in enumerate(active_models, start=1):
             profile = profiles[model]
             capabilities = profile.get("declared_capabilities") or []
-            fams = list(profile.get("supported_families") or [])
+            compatibility = profile.get("capability_identity_compatibility") or {}
+            fams = measured_supported_families(profile) if compatibility.get("compatible") else []
             cls = classify_model(model, capabilities, fams)
             sz = size_gb(models_rows[model])
             all_model_tasks = filter_tasks(tasks_for(task_source_level, cats, fams), task_ids=task_ids,

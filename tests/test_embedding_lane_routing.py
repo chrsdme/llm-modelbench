@@ -57,7 +57,10 @@ def test_planner_schedules_only_retrieval_for_live_embed_model():
         def capabilities(self, _model):
             return ["embedding"]
 
-    plan = build_plan(Client(), Config(), level="smoke")
+        def embed(self, _model, texts):
+            return [[1.0, 0.0] for _ in texts]
+
+    plan = build_plan(Client(), Config(), level="smoke", auto_probe=True)
     assert len(plan["active_models"]) == 1
     entry = plan["active_models"][0]
     assert entry["model"] == model

@@ -4,6 +4,7 @@ import pytest
 from pathlib import Path
 
 from llm_modelbench import repair
+from llm_modelbench.capabilities import CAPABILITY_SCHEMA_VERSION, PROBE_PROTOCOL_VERSION, current_capability_identity
 from llm_modelbench.config import Config
 from llm_modelbench.hardware import GPUInfo
 from llm_modelbench.ollama import MockClient, _exception_payload
@@ -21,11 +22,22 @@ def _write_run(root: Path, run_id: str, rows, *, model="qwen2.5-coder:14b", fami
     (run / "raw_results.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
     (run / "summary_meta.json").write_text(json.dumps({"level": "full"}))
     (run / "filters.json").write_text(json.dumps({"level": "full", "think": "auto"}))
-    (run / "model_identities.json").write_text(json.dumps({model: {"digest": "digest-1", "size": 9_000_000_000}}))
+    identity = current_capability_identity(MockClient(seed=42, temperature=0.0, timeout=30), model)
+    digest = identity["model"]["digest"] or "digest-1"
+    (run / "model_identities.json").write_text(json.dumps({model: {"digest": digest, "size": 9_000_000_000}}))
+    supported = families or ["text", "tools", "insert"]
     (run / "capability_report.json").write_text(json.dumps({model: {
+        "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
+        "probe_protocol_version": PROBE_PROTOCOL_VERSION,
         "model": model,
+        "capability_identity": identity,
         "declared_capabilities": ["completion", "tools", "insert"],
-        "supported_families": families or ["text", "tools", "insert"],
+        "supported_families": supported,
+        "measured_supported_families": supported,
+        "measured_capabilities": {
+            family: {"state": "measured_supported", "route_scored_tasks": True}
+            for family in supported
+        },
         "functional_probes_enabled": False,
     }}))
     return run

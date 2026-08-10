@@ -9,7 +9,7 @@ from llm_modelbench.grade import export_blind
 def test_planner_mock_counts():
     cfg = Config()
     cfg.vram_budget_gb = 12.0
-    plan = build_plan(MockClient(), cfg, level="smoke", sample_mode="smart")
+    plan = build_plan(MockClient(), cfg, level="smoke", sample_mode="smart", auto_probe=True)
     assert plan["models_active"] == 4
     assert plan["tasks_total"] > 0
     assert plan["tasks_unique"] <= plan["tasks_total"]
@@ -20,7 +20,7 @@ def test_planner_mock_counts():
 def test_planner_task_filter_context_only():
     cfg = Config()
     cfg.vram_budget_gb = 12.0
-    plan = build_plan(MockClient(), cfg, level="smoke", context_only=True)
+    plan = build_plan(MockClient(), cfg, level="smoke", context_only=True, auto_probe=True)
     # Mock models all have text/vision/embedding families, but only text/vision get needle where family allows.
     assert plan["tasks_total"] >= 1
     assert all(set(m["tasks"]) <= {"needle"} for m in plan["active_models"])

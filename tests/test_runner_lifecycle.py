@@ -3,6 +3,7 @@ import json
 import pytest
 
 from llm_modelbench.backend import BackendCapabilities, BackendCapability, CapabilityStatus, BackendIdentity
+from llm_modelbench.capabilities import CAPABILITY_SCHEMA_VERSION, PROBE_PROTOCOL_VERSION, current_capability_identity
 from llm_modelbench.config import Config
 from llm_modelbench.llama_cpp import LlamaCppBackendAdapter, LlamaCppClient
 from llm_modelbench.ollama import MockClient
@@ -14,15 +15,24 @@ from llm_modelbench.tasks import TASKS
 MODEL = "qwen2.5-coder:14b"
 
 
-def _profile():
-    return {MODEL: {"declared_capabilities": ["completion"], "supported_families": ["text"]}}
+def _profile(client=None, model=MODEL):
+    identity = current_capability_identity(client or MockClient(), model)
+    return {model: {
+        "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
+        "probe_protocol_version": PROBE_PROTOCOL_VERSION,
+        "capability_identity": identity,
+        "declared_capabilities": ["completion"],
+        "supported_families": ["text"],
+        "measured_supported_families": ["text"],
+        "measured_capabilities": {"text": {"state": "measured_supported", "route_scored_tasks": True}},
+    }}
 
 
 def _run(client, tmp_path):
     return runner.run(client, Config(fingerprint=False), level="smoke", out_dir=tmp_path,
                       include=None, exclude=None, skip_offload=False, categories=None,
                       task_ids=["py_anagram"], resume=False, live_ui="off", fingerprint_enabled=False,
-                      selected_models=[MODEL], capability_profiles=_profile(), auto_probe=False)
+                      selected_models=[MODEL], capability_profiles=_profile(client), auto_probe=False)
 
 
 class _CountingMock(MockClient):
@@ -86,7 +96,7 @@ def test_fixture_llama_cpp_adapter_runs_without_lifecycle_calls(tmp_path):
         if path == "/v1/chat/completions": return {"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}], "usage": {"completion_tokens": 1}}
         raise AssertionError(path)
     adapter = LlamaCppBackendAdapter(LlamaCppClient("http://127.0.0.1:8081", transport=transport))
-    profile = {served: {"declared_capabilities": ["completion"], "supported_families": ["text"]}}
+    profile = _profile(adapter, served)
     runner.run(adapter, Config(fingerprint=False), level="smoke", out_dir=tmp_path,
                include=None, exclude=None, skip_offload=False, categories=None, task_ids=["py_anagram"],
                resume=False, live_ui="off", fingerprint_enabled=False, selected_models=[served],
@@ -108,7 +118,7 @@ def test_runner_attaches_optional_runtime_telemetry_without_extra_generation(tmp
     runner.run(client, Config(fingerprint=False), level="smoke", out_dir=tmp_path,
                include=None, exclude=None, skip_offload=False, categories=None,
                task_ids=["py_anagram"], resume=False, live_ui="off", fingerprint_enabled=False,
-               selected_models=[MODEL], capability_profiles=_profile(), auto_probe=False,
+               selected_models=[MODEL], capability_profiles=_profile(client), auto_probe=False,
                capture_runtime_telemetry=True, runtime_telemetry_factory=factory)
     row = json.loads((tmp_path / "raw_results.jsonl").read_text().splitlines()[0])
     assert calls == [{"backend": "ollama", "endpoint": "http://127.0.0.1:11434", "runtime_profile": None,
@@ -128,7 +138,7 @@ def test_runner_preserves_result_when_runtime_telemetry_fails(tmp_path):
     runner.run(client, Config(fingerprint=False), level="smoke", out_dir=tmp_path,
                include=None, exclude=None, skip_offload=False, categories=None,
                task_ids=["py_anagram"], resume=False, live_ui="off", fingerprint_enabled=False,
-               selected_models=[MODEL], capability_profiles=_profile(), auto_probe=False,
+               selected_models=[MODEL], capability_profiles=_profile(client), auto_probe=False,
                capture_runtime_telemetry=True, runtime_telemetry_factory=broken)
     row = json.loads((tmp_path / "raw_results.jsonl").read_text().splitlines()[0])
     evidence = json.loads((tmp_path / "runtime_telemetry.json").read_text())

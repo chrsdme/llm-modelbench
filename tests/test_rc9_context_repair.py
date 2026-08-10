@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 
 from llm_modelbench import rankings, repair, watch
+from llm_modelbench.capabilities import CAPABILITY_SCHEMA_VERSION, PROBE_PROTOCOL_VERSION
 from llm_modelbench.config import Config
 from llm_modelbench.ollama import MockClient
 from llm_modelbench.runner import (
@@ -200,8 +201,20 @@ def test_missing_fim_task_is_functionally_gated_before_scored_run(tmp_path, monk
     (run / "filters.json").write_text(json.dumps({"level": "full"}))
     (run / "model_identities.json").write_text(json.dumps({model: {"digest": "d1"}}))
     (run / "capability_report.json").write_text(json.dumps({model: {
+        "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
+        "probe_protocol_version": PROBE_PROTOCOL_VERSION,
+        "capability_identity": {
+            "schema_version": CAPABILITY_SCHEMA_VERSION,
+            "model": {"canonical_name": model, "backend_model_id": model, "digest": "d1"},
+            "backend": {"backend": "mock", "implementation": "fixture", "endpoint": "http://fake.invalid"},
+            "runtime": {"endpoint": "http://fake.invalid", "implementation": "fixture"},
+            "template_config": {"hash": "fixture-template", "available": True},
+            "probe_protocol_version": PROBE_PROTOCOL_VERSION,
+        },
         "declared_capabilities": ["completion", "insert"],
         "supported_families": ["insert"],
+        "measured_supported_families": ["insert"],
+        "measured_capabilities": {"insert": {"state": "measured_supported", "route_scored_tasks": True}},
     }}))
     monkeypatch.setattr(repair, "detect_gpu", lambda: SimpleNamespace(total_vram_gb=16.0))
     plan = repair.build_plan(runs, run_id="fleet", include_missing=True)

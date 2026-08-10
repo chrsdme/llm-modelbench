@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from llm_modelbench import campaign, repair
+from llm_modelbench.capabilities import CAPABILITY_SCHEMA_VERSION, PROBE_PROTOCOL_VERSION
 
 
 OMITTED_TASKS = ("git_conflict", "txt_emails", "agent_plan", "txt_sort", "json_extract", "git_commit")
@@ -355,6 +356,22 @@ def test_stage2a_repair_plan_includes_difficulty_zero_recovery_rows(tmp_path, mo
     rows = [_row(task, error_kind="empty_output") for task in OMITTED_TASKS]
     run.joinpath("raw_results.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
     run.joinpath("model_identities.json").write_text(json.dumps({"m": {"digest": "d"}}))
+    run.joinpath("capability_report.json").write_text(json.dumps({"m": {
+        "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
+        "probe_protocol_version": PROBE_PROTOCOL_VERSION,
+        "capability_identity": {
+            "schema_version": CAPABILITY_SCHEMA_VERSION,
+            "model": {"canonical_name": "m", "backend_model_id": "m", "digest": "d"},
+            "backend": {"backend": "mock", "implementation": "fixture", "endpoint": "http://fake.invalid"},
+            "runtime": {"endpoint": "http://fake.invalid", "implementation": "fixture"},
+            "template_config": {"hash": "fixture-template", "available": True},
+            "probe_protocol_version": PROBE_PROTOCOL_VERSION,
+        },
+        "declared_capabilities": ["completion"],
+        "supported_families": ["text"],
+        "measured_supported_families": ["text"],
+        "measured_capabilities": {"text": {"state": "measured_supported", "route_scored_tasks": True}},
+    }}))
     run.joinpath("status.json").write_text(json.dumps({"finished_at": "2026-01-01T00:00:00Z"}))
     monkeypatch.setattr(repair, "detect_gpu", lambda: type("GPU", (), {"total_vram_gb": 0.0})())
     monkeypatch.setattr(repair, "inspect_ollama_kv_environment", lambda: {"effective_kv_type": None, "verified": False})

@@ -43,7 +43,7 @@ def test_capabilities_allow_known_gemma3_vision_model():
     assert families_for("gemma3:12b", ["completion", "vision"]) == ["vision", "text"]
 
 
-def test_planner_uses_capabilities_for_ocr_pdf_routing():
+def test_planner_uses_measured_capabilities_for_ocr_pdf_routing(monkeypatch):
     text_only = "hf.co/yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF:Q4_K_M"
     vision = "gemma3:12b"
 
@@ -54,7 +54,16 @@ def test_planner_uses_capabilities_for_ocr_pdf_routing():
         def capabilities(self, model):
             return ["completion", "vision"] if model == vision else ["tools", "completion"]
 
-    plan = build_plan(Client(), Config(), level="smoke", categories=["ocr", "pdf"])
+        def chat(self, model, prompt, **kwargs):
+            if kwargs.get("images"):
+                return {"ok": model == vision, "text": "V7K9Q2" if model == vision else ""}
+            return {"ok": True, "text": "AIW_TEXT_OK"}
+
+        def chat_tools(self, *args, **kwargs):
+            return {"ok": False, "error": "not supported", "tool_calls": []}
+
+    monkeypatch.setattr("llm_modelbench.capabilities.media.render_text_png", lambda *a, **k: "base64-image")
+    plan = build_plan(Client(), Config(), level="smoke", categories=["ocr", "pdf"], auto_probe=True)
     active = {item["model"]: item["tasks"] for item in plan["active_models"]}
     assert active[vision] == ["ocr_invoice"]
     assert text_only not in active

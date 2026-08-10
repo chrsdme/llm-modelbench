@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .capabilities import interrogate_model
-from .classify import families_for
+from .capabilities import MeasuredCapabilityState, family_applicability, family_is_applicable, measured_supported_families
 from .hardware import detect_gpu
 from .judge_dumps import apply_judgements, judge_run
 from .rankings import _CURRENT_HASHES, rank_for_output
@@ -464,9 +464,30 @@ def _load_selected_rows(run_dirs: Sequence[Path]) -> Tuple[List[Dict[str, Any]],
 def _best_profile(context: Dict[str, Any]) -> Dict[str, Any]:
     profiles = list(context.get("profiles") or [])
     if not profiles:
-        return {"model": context.get("model"), "supported_families": ["text"], "declared_capabilities": []}
+        return {"model": context.get("model"), "supported_families": [], "declared_capabilities": []}
     profiles.sort(key=lambda p: (bool(p.get("functional_probes_enabled")), len(p.get("supported_families") or [])), reverse=True)
     return copy.deepcopy(profiles[0])
+
+
+def _capability_observation(row: Dict[str, Any], task_id: str, family: str, state: str) -> Dict[str, Any]:
+    if state == MeasuredCapabilityState.MEASURED_SUPPORTED.value:
+        kind = "capability_applicable"
+        reason = f"{family} is positively measured applicable"
+    elif state == MeasuredCapabilityState.PROBE_INCONCLUSIVE.value:
+        kind = "capability_reprobe_required"
+        reason = f"{family} capability is inconclusive or profile identity is unbound; do not retry generation before bounded reprobe"
+    else:
+        kind = "capability_not_applicable"
+        reason = f"{family} is not positively measured applicable ({state}); do not retry generation"
+    return {
+        "kind": kind,
+        "model": row.get("model"),
+        "run_id": row.get("run_id"),
+        "task": task_id,
+        "family": family,
+        "capability_state": state,
+        "reason": reason,
+    }
 
 
 def _action_id(
@@ -759,9 +780,9 @@ def build_plan(
         digest = str(row.get("model_digest_resolved") or row.get("model") or "")
         context = contexts.get(digest) or {}
         profile = _best_profile(context)
-        declared = profile.get("declared_capabilities") or row.get("capabilities_declared") or []
         model_name = str(row.get("model") or "")
-        current_families = set(families_for(model_name, list(declared) or None))
+        capability_state = family_applicability(profile, task.family)
+        capability_positive = family_is_applicable(profile, task.family)
         known_unavailable = unavailable_families_by_model.get(model_name, set())
         if task.family in known_unavailable:
             observations.append({
@@ -771,11 +792,10 @@ def build_plan(
                            "model build; generic --force does not re-probe terminal capability evidence"),
             })
             continue
-        if error_kind and task.family not in current_families and not recovery_state["retry"]:
+        if error_kind and not capability_positive:
             observations.append({
-                "kind": "obsolete_misrouted_task", "model": row.get("model"),
-                "run_id": row.get("run_id"), "task": task_id,
-                "reason": f"historical route included {task.family!r}, current route is {sorted(current_families)}; do not retry",
+                **_capability_observation(row, task_id, task.family, capability_state),
+                "previous_error_kind": error_kind,
             })
             continue
         if error_kind == "thinking_only":
@@ -873,7 +893,7 @@ def build_plan(
             if "full" not in set(context.get("levels") or []):
                 continue
             profile = _best_profile(context)
-            families = set(profile.get("supported_families") or [])
+            families = set(measured_supported_families(profile))
             model_name = str(context.get("model") or "")
             known_unavailable = unavailable_families_by_model.get(model_name, set())
             for task in TASKS:
