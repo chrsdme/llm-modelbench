@@ -761,6 +761,20 @@ def cmd_campaign(args, cfg):
                 f"campaign execute refused: campaign state {manifest.state!r} is not safe for config execution; "
                 f"valid next action is campaign status {campaign_id}"
             )
+        paths, manifest = campaign.create_campaign(
+            campaign_id,
+            models=list(map(str, models)),
+            level=str(data.get("level") or "full"),
+            version=__version__,
+        )
+        campaign.transition(paths, manifest, "planned")
+        campaign._atomic_write_text(config_plan_path, json.dumps(config_record, indent=2, sort_keys=True))
+        try:
+            frozen_record = json.loads(config_plan_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"campaign execute refused: immutable config plan verification failed: {exc}") from None
+        if frozen_record != config_record:
+            raise SystemExit("campaign execute refused: immutable config plan verification failed")
         invocation = ["campaign", "run", "--campaign-id", campaign_id, "--models", ";".join(map(str, models)),
                       "--level", str(data.get("level") or "full"), "--yes", "--unattended-safe"]
         if data.get("runtime_policy", {}).get("auto", True): invocation.append("--auto")
@@ -772,7 +786,6 @@ def cmd_campaign(args, cfg):
         if args.mock: invocation.append("--mock")
         # Normal lifecycle remains campaign-owned and intentionally stops before adoption.
         main(invocation)
-        campaign._atomic_write_text(config_plan_path, json.dumps(config_record, indent=2, sort_keys=True))
         return
     if args.campaign_cmd == "supersede":
         paths, _ = _campaign_paths_or_exit(args.campaign_id)
