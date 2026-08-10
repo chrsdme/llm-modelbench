@@ -37,4 +37,3 @@ Notable corrected values:
 | H1 final hardening | `9ccdac3abbecc7ae20eac4fb6d150e7c4c4c1dfa` | `1169ac2c07f486f78914e7ecf7530d5470de7f74` | Harden config execution freeze ordering |
 | H2 final hardening | `eaa250133a5d1895154c9143277c56eda6390300` | `9ccdac3abbecc7ae20eac4fb6d150e7c4c4c1dfa` | Anchor applied supersession replacements |
 | H3 final hardening | `41d54cf2def2b868284be2bc3cd7e65d578646f9` | `eaa250133a5d1895154c9143277c56eda6390300` | Validate packaged supersession and config evidence |
-

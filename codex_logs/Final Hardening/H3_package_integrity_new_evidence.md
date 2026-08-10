@@ -39,4 +39,3 @@
 - Confirmed legacy compatibility remains.
 - Confirmed no real model, judge, recovery, catch-up, adoption, evidence rewrite, or push work occurred.
 - Confirmed no later hardening stage was started in this commit.
-

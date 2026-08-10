@@ -32,4 +32,3 @@
 - Confirmed legacy campaigns without a config plan still fail closed.
 - Confirmed no later hardening stage was started in this commit.
 - Confirmed no real model, judge, recovery, catch-up, adoption, evidence rewrite, or push work occurred.
-
