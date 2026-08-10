@@ -767,6 +767,13 @@ def cmd_campaign(args, cfg):
             level=str(data.get("level") or "full"),
             version=__version__,
         )
+        manifest.notes["campaign_config"] = {
+            "managed": True,
+            "schema_version": campaign.CAMPAIGN_CONFIG_SCHEMA_VERSION,
+            "config_signature": config_record["config_signature"],
+            "path": "plan/campaign_config.json",
+        }
+        campaign.write_manifest(paths, manifest)
         campaign.transition(paths, manifest, "planned")
         campaign._atomic_write_text(config_plan_path, json.dumps(config_record, indent=2, sort_keys=True))
         try:

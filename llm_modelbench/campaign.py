@@ -882,7 +882,8 @@ def verify_package_details(paths: CampaignPaths) -> Dict[str, Any]:
     result: Dict[str, Any] = {"campaign_id": paths.campaign_id, "package_path": str(package), "package_digest": None,
         "verified_at": datetime.now(timezone.utc).isoformat(), "valid": False, "file_count": 0,
         "verified_checksum_count": 0, "required_files_valid": False, "recovery_references_valid": False,
-        "judge_references_valid": False, "terminal_ledger_valid": False, "candidate_rankings_valid": False,
+        "judge_references_valid": False, "supersession_references_valid": False,
+        "config_references_valid": False, "terminal_ledger_valid": False, "candidate_rankings_valid": False,
         "unexpected_file_count": 0, "errors": [], "warnings": []}
     if not paths.checksums_json.exists():
         result["errors"].append("missing external package checksum"); return result
@@ -921,6 +922,11 @@ def verify_package_details(paths: CampaignPaths) -> Dict[str, Any]:
         if not isinstance(inventory, dict):
             result["errors"].append("invalid package inventory format")
             return result
+        try:
+            manifest_data = json.loads(archive.read("manifest.json"))
+        except Exception:
+            manifest_data = {}
+            result["errors"].append("missing or malformed packaged manifest")
         entries = internal.get("files")
         if not isinstance(entries, list) or not all(isinstance(x, dict) for x in entries):
             result["errors"].append("invalid internal checksum format"); return result
@@ -943,11 +949,78 @@ def verify_package_details(paths: CampaignPaths) -> Dict[str, Any]:
         result["candidate_rankings_valid"] = {"rankings/candidate/master_raw.jsonl","rankings/candidate/master_summary.json"} <= set(names)
         result["recovery_references_valid"] = True
         result["judge_references_valid"] = True
+        result["supersession_references_valid"] = True
+        result["config_references_valid"] = True
+        config_note = ((manifest_data.get("notes") or {}).get("campaign_config") or {}) if isinstance(manifest_data, dict) else {}
+        if config_note.get("managed") is True:
+            if config_note.get("path") != "plan/campaign_config.json":
+                result["config_references_valid"] = False; result["errors"].append("config plan manifest binding mismatch")
+            if "plan/campaign_config.json" not in names:
+                result["config_references_valid"] = False; result["errors"].append("missing campaign config plan")
+            else:
+                try:
+                    config_record = json.loads(archive.read("plan/campaign_config.json"))
+                    expected_record = campaign_config_plan_record(config_record.get("config"))
+                except Exception:
+                    result["config_references_valid"] = False; result["errors"].append("malformed campaign config plan")
+                else:
+                    if config_record != expected_record:
+                        result["config_references_valid"] = False; result["errors"].append("campaign config signature mismatch")
+                    if config_note.get("config_signature") != config_record.get("config_signature"):
+                        result["config_references_valid"] = False; result["errors"].append("config plan manifest binding mismatch")
         if "evidence/effective_rows.jsonl" in names:
             try:
                 effective = [json.loads(line) for line in archive.read("evidence/effective_rows.jsonl").decode().splitlines() if line]
             except Exception:
                 effective = []; result["errors"].append("invalid effective terminal ledger")
+            superseded = [row for row in effective if row.get("result_origin") == "superseded" or row.get("supersession")]
+            if superseded:
+                if "evidence/supersessions.jsonl" not in names:
+                    result["supersession_references_valid"] = False; result["errors"].append("missing packaged supersession ledger")
+                else:
+                    try:
+                        records = [
+                            json.loads(line)
+                            for line in archive.read("evidence/supersessions.jsonl").decode().splitlines()
+                            if line.strip()
+                        ]
+                        graph = build_supersession_graph(validate_supersession_record(record) for record in records)
+                    except Exception:
+                        graph = {"valid": False, "errors": [{"reason": "malformed_supersession_ledger"}]}
+                    if not graph.get("valid", False):
+                        result["supersession_references_valid"] = False; result["errors"].append("invalid packaged supersession graph")
+                    else:
+                        identities = list((graph.get("identities") or {}).values())
+                        for row in superseded:
+                            info = row.get("supersession") or {}
+                            source_hash = str(info.get("source_row_hash") or row.get("primary_row_hash") or "")
+                            source_campaign = str(info.get("source_campaign_id") or manifest_data.get("campaign_id") or paths.campaign_id)
+                            candidates = [
+                                identity for identity in identities
+                                if identity.get("campaign_id") == source_campaign
+                                and identity.get("run_id") == "primary"
+                                and identity.get("row_hash") == source_hash
+                            ]
+                            if len(candidates) != 1:
+                                result["supersession_references_valid"] = False
+                                result["errors"].append("effective supersession source inconsistent with graph")
+                                continue
+                            resolution = resolve_supersession_chain(graph, candidates[0])
+                            chain = resolution.get("chain") or []
+                            terminal = (resolution.get("terminal") or {}).get("row_hash")
+                            expected_ids = [edge.get("supersession_id") for edge in chain]
+                            actual_ids = [edge.get("supersession_id") for edge in info.get("chain") or []]
+                            if (
+                                not resolution.get("valid", False)
+                                or not chain
+                                or terminal != info.get("terminal_replacement_row_hash")
+                                or terminal != (row.get("provenance") or {}).get("supersession_terminal_row_hash")
+                                or len(chain) != info.get("chain_length")
+                                or len(chain) != (row.get("provenance") or {}).get("supersession_chain_length")
+                                or expected_ids != actual_ids
+                            ):
+                                result["supersession_references_valid"] = False
+                                result["errors"].append("effective supersession provenance inconsistent with graph")
             recovered = [row for row in effective if row.get("result_origin") == "recovered" or row.get("recovery_attempt_number")]
             judged = [row for row in effective if row.get("result_origin") == "judged" or row.get("judge_row_hash")]
             if recovered:

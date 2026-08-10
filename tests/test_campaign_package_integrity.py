@@ -56,6 +56,126 @@ def rewrite(paths, *, remove=None, change=None, extra=None, duplicate=None):
     paths.checksums_json.write_text(json.dumps({"package":campaign._sha256(package),"size":package.stat().st_size}))
 
 
+def rewrite_verified(paths, *, remove=None, change=None):
+    package = paths.packages_dir / f"{paths.campaign_id}-review.zip"
+    with zipfile.ZipFile(package) as z:
+        members = {info.filename: z.read(info.filename) for info in z.infolist()}
+    if remove:
+        members.pop(remove, None)
+    if change:
+        members[change[0]] = change[1]
+    members.pop("package/sha256.json", None)
+    members.pop("package/inventory.json", None)
+    inventory_files = [
+        {
+            "path": name,
+            "sha256": campaign.hashlib.sha256(content).hexdigest(),
+            "size": len(content),
+            "role": name.split("/", 1)[0],
+        }
+        for name, content in sorted(members.items())
+    ]
+    inventory_bytes = json.dumps(
+        {"campaign_id": paths.campaign_id, "files": inventory_files},
+        indent=2,
+        sort_keys=True,
+    ).encode()
+    checksum_files = [
+        *inventory_files,
+        {
+            "path": "package/inventory.json",
+            "sha256": campaign.hashlib.sha256(inventory_bytes).hexdigest(),
+            "size": len(inventory_bytes),
+            "role": "package",
+        },
+    ]
+    members["package/inventory.json"] = inventory_bytes
+    members["package/sha256.json"] = json.dumps({"files": checksum_files}, indent=2, sort_keys=True).encode()
+    temp = package.with_suffix(".verified-new")
+    with zipfile.ZipFile(temp, "w") as z:
+        for name, content in sorted(members.items()):
+            z.writestr(name, content)
+    os.replace(temp, package)
+    paths.checksums_json.write_text(json.dumps({"package": campaign._sha256(package), "size": package.stat().st_size}))
+
+
+def supersession_fixture(tmp_path, *, chain_length=1):
+    paths = fixture(tmp_path)
+    source = {
+        "model": "x",
+        "model_digest_resolved": "d",
+        "task": "exact",
+        "task_hash": "h",
+        "score": 0,
+        "reason": "source",
+    }
+    replacement_b = {
+        "model": "x",
+        "model_digest_resolved": "d",
+        "task": "exact",
+        "task_hash": "h",
+        "score": 50 if chain_length == 2 else 100,
+        "reason": "replacement b",
+    }
+    replacement_c = {
+        "model": "x",
+        "model_digest_resolved": "d",
+        "task": "exact",
+        "task_hash": "h",
+        "score": 100,
+        "reason": "replacement c",
+    }
+    paths.primary_raw_results.write_text(json.dumps(source, sort_keys=True) + "\n")
+    first = campaign.record_supersession(
+        paths,
+        source_campaign_id=paths.campaign_id,
+        source_run_id="primary",
+        source_row=source,
+        replacement_campaign_id=paths.campaign_id,
+        replacement_run_id="replacement-b",
+        replacement_row=replacement_b,
+        reason="replace a with b",
+        operator="test",
+        tool="pytest",
+    )
+    second = None
+    if chain_length == 2:
+        second = campaign.record_supersession(
+            paths,
+            source_campaign_id=paths.campaign_id,
+            source_run_id="replacement-b",
+            source_row=replacement_b,
+            replacement_campaign_id=paths.campaign_id,
+            replacement_run_id="replacement-c",
+            replacement_row=replacement_c,
+            reason="replace b with c",
+            operator="test",
+            tool="pytest",
+        )
+    campaign.write_readiness(paths, [source])
+    campaign.package_campaign(paths)
+    return paths, first, second
+
+
+def config_fixture(tmp_path):
+    paths = fixture(tmp_path)
+    config = campaign.campaign_config_template()
+    config["campaign_id"] = paths.campaign_id
+    config["models"] = ["x"]
+    record = campaign.campaign_config_plan_record(config)
+    paths.plan_dir.joinpath("campaign_config.json").write_text(json.dumps(record, indent=2, sort_keys=True))
+    manifest = campaign.load_manifest(paths)
+    manifest.notes["campaign_config"] = {
+        "managed": True,
+        "schema_version": campaign.CAMPAIGN_CONFIG_SCHEMA_VERSION,
+        "config_signature": record["config_signature"],
+        "path": "plan/campaign_config.json",
+    }
+    campaign.write_manifest(paths, manifest)
+    campaign.package_campaign(paths)
+    return paths, record
+
+
 def test_complete_package_has_structured_verified_inventory_and_no_duplicate_reports(tmp_path):
     paths=fixture(tmp_path); result=campaign.verify_package_details(paths)
     assert result["valid"] and result["verified_checksum_count"] > 10
@@ -149,3 +269,172 @@ def test_archive_build_failure_preserves_previous_verified_package(tmp_path, mon
         campaign.package_campaign(paths)
     assert package.read_bytes()==before
     assert not list(paths.packages_dir.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("chain_length", [1, 2])
+def test_superseded_effective_rows_require_valid_packaged_supersession_graph(tmp_path, chain_length):
+    paths, _, _ = supersession_fixture(tmp_path, chain_length=chain_length)
+    result = campaign.verify_package_details(paths)
+    assert result["valid"]
+    assert result["supersession_references_valid"]
+
+
+@pytest.mark.parametrize(
+    ("mutator", "message"),
+    [
+        (lambda paths, first, second: ("evidence/supersessions.jsonl", None), "missing"),
+        (lambda paths, first, second: ("evidence/supersessions.jsonl", b"{"), "invalid"),
+        (
+            lambda paths, first, second: (
+                "evidence/supersessions.jsonl",
+                (json.dumps({**first, "replacement_row_hash": "tampered"}, sort_keys=True) + "\n").encode(),
+            ),
+            "invalid",
+        ),
+        (
+            lambda paths, first, second: (
+                "evidence/supersessions.jsonl",
+                (json.dumps({**first, "replacement": {**first["replacement"], "row_hash": "other"}}, sort_keys=True) + "\n").encode(),
+            ),
+            "invalid",
+        ),
+        (
+            lambda paths, first, second: (
+                "evidence/effective_rows.jsonl",
+                (json.dumps({
+                    **json.loads(paths.effective_rows.read_text().splitlines()[0]),
+                    "supersession": {
+                        **json.loads(paths.effective_rows.read_text().splitlines()[0])["supersession"],
+                        "terminal_replacement_row_hash": "other",
+                    },
+                }, sort_keys=True) + "\n").encode(),
+            ),
+            "inconsistent",
+        ),
+    ],
+)
+def test_supersession_package_semantic_tampering_fails(tmp_path, mutator, message):
+    paths, first, second = supersession_fixture(tmp_path, chain_length=1)
+    target, content = mutator(paths, first, second)
+    if content is None:
+        rewrite_verified(paths, remove=target)
+    else:
+        rewrite_verified(paths, change=(target, content))
+    result = campaign.verify_package_details(paths)
+    assert not result["valid"]
+    assert not result["supersession_references_valid"]
+    assert any(message in error for error in result["errors"])
+
+
+def test_supersession_package_rejects_missing_intermediate_fork_and_cycle(tmp_path):
+    paths, first, second = supersession_fixture(tmp_path, chain_length=2)
+    rewrite_verified(paths, change=("evidence/supersessions.jsonl", (json.dumps(first, sort_keys=True) + "\n").encode()))
+    result = campaign.verify_package_details(paths)
+    assert not result["valid"] and not result["supersession_references_valid"]
+    assert any("inconsistent" in error for error in result["errors"])
+
+    paths, first, _ = supersession_fixture(tmp_path / "fork", chain_length=1)
+    replacement = dict(first["replacement_row"])
+    replacement["reason"] = "fork"
+    fork = campaign._native_supersession_record(
+        paths=paths,
+        source_campaign_id=paths.campaign_id,
+        source_run_id="primary",
+        source_row=json.loads(paths.primary_raw_results.read_text().splitlines()[0]),
+        replacement_campaign_id=paths.campaign_id,
+        replacement_run_id="fork",
+        replacement_row=replacement,
+        reason="fork",
+        operator="test",
+        tool="pytest",
+    )
+    rewrite_verified(
+        paths,
+        change=("evidence/supersessions.jsonl", (json.dumps(first, sort_keys=True) + "\n" + json.dumps(fork, sort_keys=True) + "\n").encode()),
+    )
+    result = campaign.verify_package_details(paths)
+    assert not result["valid"] and not result["supersession_references_valid"]
+
+    paths, first, _ = supersession_fixture(tmp_path / "cycle", chain_length=1)
+    replacement = first["replacement_row"]
+    source = json.loads(paths.primary_raw_results.read_text().splitlines()[0])
+    cycle = campaign._native_supersession_record(
+        paths=paths,
+        source_campaign_id=paths.campaign_id,
+        source_run_id="replacement-b",
+        source_row=replacement,
+        replacement_campaign_id=paths.campaign_id,
+        replacement_run_id="primary",
+        replacement_row=source,
+        reason="cycle",
+        operator="test",
+        tool="pytest",
+    )
+    rewrite_verified(
+        paths,
+        change=("evidence/supersessions.jsonl", (json.dumps(first, sort_keys=True) + "\n" + json.dumps(cycle, sort_keys=True) + "\n").encode()),
+    )
+    result = campaign.verify_package_details(paths)
+    assert not result["valid"] and not result["supersession_references_valid"]
+
+
+def test_config_managed_package_binds_campaign_config_plan(tmp_path):
+    paths, _ = config_fixture(tmp_path)
+    result = campaign.verify_package_details(paths)
+    assert result["valid"]
+    assert result["config_references_valid"]
+
+
+@pytest.mark.parametrize(
+    ("target", "content", "message"),
+    [
+        ("plan/campaign_config.json", None, "missing campaign config plan"),
+        ("plan/campaign_config.json", b"{", "malformed campaign config plan"),
+    ],
+)
+def test_config_managed_package_rejects_missing_or_malformed_config_plan(tmp_path, target, content, message):
+    paths, _ = config_fixture(tmp_path)
+    if content is None:
+        rewrite_verified(paths, remove=target)
+    else:
+        rewrite_verified(paths, change=(target, content))
+    result = campaign.verify_package_details(paths)
+    assert not result["valid"] and not result["config_references_valid"]
+    assert any(message in error for error in result["errors"])
+
+
+def test_config_managed_package_rejects_modified_config_signature_and_binding_mismatch(tmp_path):
+    paths, record = config_fixture(tmp_path)
+    changed = json.loads(json.dumps(record))
+    changed["config"]["samples"] = 2
+    changed["config_signature"] = campaign.campaign_config_signature(changed["config"])
+    rewrite_verified(paths, change=("plan/campaign_config.json", json.dumps(changed, sort_keys=True).encode()))
+    result = campaign.verify_package_details(paths)
+    assert not result["valid"] and not result["config_references_valid"]
+    assert any("binding mismatch" in error for error in result["errors"])
+
+    paths, record = config_fixture(tmp_path / "sig")
+    bad = dict(record)
+    bad["config_signature"] = "wrong"
+    rewrite_verified(paths, change=("plan/campaign_config.json", json.dumps(bad, sort_keys=True).encode()))
+    result = campaign.verify_package_details(paths)
+    assert not result["valid"] and not result["config_references_valid"]
+    assert any("signature mismatch" in error for error in result["errors"])
+
+    paths, _ = config_fixture(tmp_path / "manifest")
+    manifest = json.loads(paths.manifest.read_text())
+    manifest["notes"]["campaign_config"]["config_signature"] = "wrong"
+    rewrite_verified(paths, change=("manifest.json", json.dumps(manifest, sort_keys=True).encode()))
+    result = campaign.verify_package_details(paths)
+    assert not result["valid"] and not result["config_references_valid"]
+    assert any("binding mismatch" in error for error in result["errors"])
+
+
+def test_legacy_package_does_not_infer_config_management_from_stray_file(tmp_path):
+    paths = fixture(tmp_path)
+    stray = campaign.campaign_config_plan_record({**campaign.campaign_config_template(), "campaign_id": paths.campaign_id, "models": ["x"]})
+    paths.plan_dir.joinpath("campaign_config.json").write_text(json.dumps(stray, sort_keys=True))
+    campaign.package_campaign(paths)
+    result = campaign.verify_package_details(paths)
+    assert result["valid"]
+    assert result["config_references_valid"]
