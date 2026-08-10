@@ -55,13 +55,21 @@ def repository_files() -> list[str]:
     source that would be published.
     """
     if (ROOT / ".git").exists():
-        output = subprocess.check_output(
-            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+        tracked = subprocess.check_output(
+            ["git", "ls-files", "--cached"],
+            cwd=ROOT,
+            text=True,
+        )
+        untracked = subprocess.check_output(
+            ["git", "ls-files", "--others", "--exclude-standard"],
             cwd=ROOT,
             text=True,
         )
         return sorted({
-            line for line in output.splitlines()
+            line for line in tracked.splitlines()
+            if line
+        } | {
+            line for line in untracked.splitlines()
             if line and not _is_local_generated(Path(line))
         })
 
