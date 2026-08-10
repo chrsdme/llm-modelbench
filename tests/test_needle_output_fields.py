@@ -111,7 +111,7 @@ class _NoThinkClient(OllamaClient):
         self.payloads = []
     def show(self, model):
         return {"capabilities": [], "model_info": {"general.context_length": 4096}}
-    def _post_stream(self, path, payload):
+    def _post_stream(self, path, payload, timeout=None):
         self.payloads.append(payload)
         return _FakeResponse(payload)
 

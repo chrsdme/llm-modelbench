@@ -24,7 +24,8 @@ WATERMARK = re.compile(("generated" + r" by (?:clau" + "de|chat" + r"gpt|gpt)|as
 _EXCLUDED_DIR_NAMES = {
     "__pycache__", ".venv", "venv", "build", "dist", "runs", "rankings",
     ".pytest_cache", ".mypy_cache", ".ruff_cache", "htmlcov", "model_cards",
-    "rankings-separate", "snapshots", ".git",
+    "rankings-separate", "snapshots", "local_only", "codex_log",
+    "codex_logs", "codex_prompts", ".git",
 }
 _EXCLUDED_FILE_NAMES = {".coverage", "coverage.xml", "_last_summary.json"}
 _EXCLUDED_SUFFIXES = {".pyc", ".pyo", ".review.zip"}
@@ -59,7 +60,10 @@ def repository_files() -> list[str]:
             cwd=ROOT,
             text=True,
         )
-        return sorted({line for line in output.splitlines() if line})
+        return sorted({
+            line for line in output.splitlines()
+            if line and not _is_local_generated(Path(line))
+        })
 
     files: list[str] = []
     for path in ROOT.rglob("*"):
