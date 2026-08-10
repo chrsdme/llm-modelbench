@@ -1936,10 +1936,39 @@ def _validate_supersession_row_identity(identity: Dict[str, Any], row: Dict[str,
             raise CampaignError(f"{role}_{key}_mismatch")
 
 
+def _supersession_schema_version(record: Dict[str, Any]) -> Optional[int]:
+    if "schema_version" not in record:
+        return None
+    value = record.get("schema_version")
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise CampaignError("unsupported_supersession_schema")
+    if value != SUPERSESSION_SCHEMA_VERSION:
+        raise CampaignError("unsupported_supersession_schema")
+    return value
+
+
+def _required_supersession_text(record: Dict[str, Any], field: str, error: str) -> str:
+    value = record.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise CampaignError(error)
+    return value
+
+
+def _required_identity_text(identity: Dict[str, Any], field: str, role: str) -> str:
+    value = identity.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise CampaignError(f"{role}_{field}_missing")
+    return value
+
+
+def _validate_native_supersession_alias(record: Dict[str, Any], alias: str, expected: Any, error: str) -> None:
+    if alias in record and record.get(alias) != expected:
+        raise CampaignError(error)
+
+
 def supersession_semantic_material(record: Dict[str, Any]) -> Dict[str, Any]:
     """Return the stable native relationship material that defines identity."""
-    if int(record.get("schema_version") or 0) != SUPERSESSION_SCHEMA_VERSION:
-        raise CampaignError("unsupported_supersession_schema")
+    _supersession_schema_version(record)
     return {
         "schema_version": int(record.get("schema_version")),
         "policy_version": str(record.get("policy_version") or ""),
@@ -1989,7 +2018,6 @@ def _native_supersession_record(*, paths: CampaignPaths, source_campaign_id: str
     record["replacement_campaign_id"] = record["replacement"]["campaign_id"]
     record["replacement_run_id"] = replacement_run_id
     record["replacement_row_hash"] = replacement_hash
-    record["active"] = True
     validate_supersession_record(record, source_row=source_row, replacement_row=replacement_row)
     return record
 
@@ -1997,11 +2025,25 @@ def _native_supersession_record(*, paths: CampaignPaths, source_campaign_id: str
 def validate_supersession_record(record: Dict[str, Any], *, source_row: Optional[Dict[str, Any]] = None,
                                  replacement_row: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Validate one native or compatible legacy supersession record into an edge."""
-    if int(record.get("schema_version") or 0) == SUPERSESSION_SCHEMA_VERSION:
+    schema_version = _supersession_schema_version(record)
+    if schema_version == SUPERSESSION_SCHEMA_VERSION:
+        if "active" in record and record.get("active") is not True:
+            raise CampaignError("invalid_native_supersession_state")
         source = record.get("source")
         replacement = record.get("replacement")
         if not isinstance(source, dict) or not isinstance(replacement, dict):
             raise CampaignError("invalid_supersession_identity")
+        _required_supersession_text(record, "policy_version", "supersession_policy_version_missing")
+        declared = _required_supersession_text(record, "supersession_id", "supersession_id_missing")
+        _required_supersession_text(record, "reason", "supersession_reason_missing")
+        _required_supersession_text(record, "operator", "supersession_operator_missing")
+        _required_supersession_text(record, "tool", "supersession_tool_missing")
+        source_hash = _required_identity_text(source, "row_hash", "source")
+        replacement_hash = _required_identity_text(replacement, "row_hash", "replacement")
+        source_campaign = _required_identity_text(source, "campaign_id", "source")
+        _required_identity_text(source, "run_id", "source")
+        replacement_campaign = _required_identity_text(replacement, "campaign_id", "replacement")
+        replacement_run = _required_identity_text(replacement, "run_id", "replacement")
         embedded_replacement = record.get("replacement_row")
         if replacement_row is None and isinstance(embedded_replacement, dict):
             replacement_row = embedded_replacement
@@ -2009,9 +2051,13 @@ def validate_supersession_record(record: Dict[str, Any], *, source_row: Optional
             _validate_supersession_row_identity(source, source_row, "source")
         if replacement_row is not None:
             _validate_supersession_row_identity(replacement, replacement_row, "replacement")
-        declared = str(record.get("supersession_id") or "")
+        _validate_native_supersession_alias(record, "source_row_hash", source_hash, "source_row_hash_alias_mismatch")
+        _validate_native_supersession_alias(record, "replacement_row_hash", replacement_hash, "replacement_row_hash_alias_mismatch")
+        _validate_native_supersession_alias(record, "source_campaign_id", source_campaign, "source_campaign_id_alias_mismatch")
+        _validate_native_supersession_alias(record, "replacement_campaign_id", replacement_campaign, "replacement_campaign_id_alias_mismatch")
+        _validate_native_supersession_alias(record, "replacement_run_id", replacement_run, "replacement_run_id_alias_mismatch")
         actual = supersession_semantic_hash(record)
-        if declared and declared != actual:
+        if declared != actual:
             raise CampaignError("supersession_identity_mismatch")
         if source.get("row_hash") == replacement.get("row_hash") and _supersession_identity_key(source) == _supersession_identity_key(replacement):
             raise CampaignError("cyclic_supersession")
@@ -2098,14 +2144,15 @@ def _atomic_append_supersession(path: Path, record: Dict[str, Any]) -> None:
 def load_supersession_ledger(paths: CampaignPaths) -> List[Dict[str, Any]]:
     edges = []
     for record in _read_supersession_records(paths.supersessions):
-        if record.get("active", True):
-            edges.append(validate_supersession_record(record))
+        if "schema_version" not in record and not record.get("active", True):
+            continue
+        edges.append(validate_supersession_record(record))
     return sorted(edges, key=lambda edge: (edge["source_key"], edge["replacement_key"], edge["supersession_id"]))
 
 
 def build_supersession_graph(edges: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     edge_by_id: Dict[str, Dict[str, Any]] = {}
-    by_source: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    by_source: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
     identities: Dict[str, Dict[str, Any]] = {}
     errors: List[Dict[str, Any]] = []
     for edge in edges:
@@ -2117,7 +2164,10 @@ def build_supersession_graph(edges: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         replacement_key = str(edge["replacement_key"])
         identities[source_key] = edge["source"]
         identities[replacement_key] = edge["replacement"]
-        by_source.setdefault(source_key, {})[replacement_key] = edge
+        by_source.setdefault(source_key, {}).setdefault(replacement_key, []).append(edge)
+    for replacements in by_source.values():
+        for replacement_key, replacement_edges in list(replacements.items()):
+            replacements[replacement_key] = sorted(replacement_edges, key=lambda edge: str(edge["supersession_id"]))
     for source_key, replacements in sorted(by_source.items()):
         if len(replacements) > 1:
             errors.append({
@@ -2174,8 +2224,8 @@ def resolve_supersession_chain(graph: Dict[str, Any], source_identity: Dict[str,
         replacements = by_source[current]
         if len(replacements) != 1:
             return {"valid": False, "errors": [{"reason": "ambiguous_supersession_fork"}], "chain": chain}
-        replacement_key, edge = next(iter(replacements.items()))
-        chain.append(edge)
+        replacement_key, supporting_edges = next(iter(replacements.items()))
+        chain.extend(supporting_edges)
         current = replacement_key
     return {
         "valid": True,

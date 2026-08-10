@@ -108,3 +108,50 @@
 
 ## Safety confirmation
 - No real inference, Ollama/llama.cpp/GPU/service mutation, real recovery, real judging, Selene qualification, model pull/delete, adoption, acceptance evidence rewrite, or push performed.
+
+## Corrective work after independent Stage 3A review
+- Corrective baseline: `11d787a0eeb0dccc2a2d2cdc11cd8f7261bdc3c7`.
+- Stage 3A corrective work explicitly approved in Session 4.
+- Stage 3B remained not approved and was not started.
+
+### Corrective defects addressed
+- Unsupported or malformed present `schema_version` values no longer fall through to legacy handling. Only absent schema uses explicit legacy compatibility; current schema uses native validation; unsupported/malformed present schema raises `unsupported_supersession_schema`.
+- Native v2 records no longer emit `active`. If a native record is later edited to `active=false` or another non-true value, loading fails closed with `invalid_native_supersession_state` instead of removing the edge from the graph. Schema-less legacy records still honor historical `active=false` by skipping that legacy edge.
+- Same-successor multi-edge evidence (`A -> B` with distinct semantic records) is now preserved as sorted supporting edge records under the same successor. Exact duplicate semantic records remain idempotent, while `A -> B` plus `A -> C` remains an ambiguous fork.
+- Native persisted records now require non-empty `policy_version`, `supersession_id`, structured source/replacement row hashes, source/replacement campaign and run provenance, `reason`, `operator`, and `tool`.
+- Native compatibility aliases are validated when present and cannot contradict structured identity.
+- Second-append atomic failure now has a synthetic test proving exact prior ledger bytes are preserved and the graph remains unchanged.
+
+### Corrective design decisions
+- `_supersession_schema_version(...)` centralizes schema dispatch and treats malformed values such as strings, containers, booleans, negative integers, and future/unsupported integers as controlled `CampaignError("unsupported_supersession_schema")`.
+- Native `active=true` is tolerated only as a compatibility/display field; native `active=false` is treated as mutation/corruption.
+- `build_supersession_graph(...)` now stores `by_source[source_key][replacement_key]` as a deterministic list of supporting edge records sorted by `supersession_id`, rather than overwriting one edge by insertion order.
+- `resolve_supersession_chain(...)` returns all supporting edge records for each unambiguous successor, preserving immutable evidence while keeping the effective successor deterministic.
+
+### Corrective tests added/expanded
+- Strict schema dispatch: current native schema, schema-less sufficient legacy, unsupported numeric schema, malformed schema values.
+- Required native fields: missing `supersession_id`, source/replacement row hash, source campaign/run provenance, and alias contradictions.
+- Native `active=false` fail-closed and legacy `active=false` compatibility.
+- Same-successor multi-edge evidence ordering, exact duplicate idempotency, and fork preservation.
+- Failed second atomic append preserving existing ledger bytes, graph contents, and input rows.
+
+### Corrective commands/tests
+- Re-read required files: `AGENTS.md`, `CODEX_START.md`, `PR_RC21POST1_ACCEPTANCE_CONTROLS.md`, `codex_prompts/stage3A.md`, `codex_logs/Session 4/stage3A.md`.
+- `git rev-parse HEAD && git status -sb` -> baseline `11d787a0eeb0dccc2a2d2cdc11cd8f7261bdc3c7`.
+- `pytest -q tests/test_stage3a_supersession.py tests/test_rc21_post1_acceptance_repairs.py::test_supersession_is_immutable_traceable_and_unambiguous` -> initial corrective run failed 2 tests due validation ordering/fixture alias contradiction; fixed and reran -> 14 passed.
+- `pytest -q tests/test_stage3a_supersession.py tests/test_rc21_post1_acceptance_repairs.py tests/test_campaign.py tests/test_campaign_package_integrity.py tests/test_campaign_final_acceptance.py tests/test_campaign_recovery_matrix.py tests/test_stage2a_recovery_reconciliation.py tests/test_stage2b_recovery_post_execution.py tests/test_repair.py tests/test_rc9_context_repair.py tests/test_rc10_repair_truth.py tests/test_stage1a_judge_policy.py tests/test_stage1b_judge_qualification.py tests/test_stage1c_model_roles.py tests/test_stage1d_judge_integration.py tests/test_judge_dumps.py` -> 358 passed, 11 skipped.
+- `./.venv/bin/ruff check llm_modelbench tests/test_stage3a_supersession.py` -> initially failed on one unused local variable after corrective patch; fixed and reran -> passed.
+- `python -m compileall -q llm_modelbench tests/test_stage3a_supersession.py` -> passed.
+- `git diff --check` -> passed.
+- After the Ruff fix, reran the full required regression bundle -> 358 passed, 11 skipped.
+
+### Corrective manual inspection
+- Confirmed unsupported present schema cannot become legacy.
+- Confirmed native `active=false` cannot remove graph evidence.
+- Confirmed legacy `active=false` remains an explicit compatibility skip.
+- Confirmed same-successor semantic records are retained, sorted, and order independent.
+- Confirmed no semantic edge evidence is silently overwritten.
+- Confirmed persisted native required fields and compatibility aliases are enforced.
+- Confirmed failed second append preserves prior ledger exactly and leaves the graph at only the original edge.
+- Confirmed readiness remains direct-only through `supersession_map(...)`; no Stage 3B transitive effective-row adoption, CLI redesign, catch-up workflow, or acceptance evidence work was introduced.
+- Confirmed no real inference/recovery/judging, service mutation, model operation, adoption, push, or acceptance evidence mutation occurred.
