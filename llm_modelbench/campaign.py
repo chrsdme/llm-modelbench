@@ -1310,6 +1310,15 @@ def _source_lookup(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]
     return out
 
 
+def primary_row_by_hash(paths: CampaignPaths, row_hash: str) -> Dict[str, Any]:
+    matches = _source_lookup(_read_jsonl(paths.primary_raw_results)).get(str(row_hash), [])
+    if not matches:
+        raise CampaignError("source_row_hash_not_found")
+    if len(matches) > 1:
+        raise CampaignError("ambiguous_source_row_hash")
+    return dict(matches[0])
+
+
 def reconcile_recovery_rows(rows: List[Dict[str, Any]], *, excluded: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Make recovery eligibility a complete row-level accounting, never an allowlist.
 
@@ -2427,7 +2436,10 @@ def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_a
         if row.get("status") in {"judged", "judge_error", "awaiting_independent_judge", "judge_exhausted_unavailable"}
     }
     judge_by_source = {source: row for source, row in judge_sidecar_by_source.items() if row.get("status") == "judged"}
-    superseded = supersession_map(paths)
+    supersession_graph = load_supersession_graph(paths)
+    if not supersession_graph["valid"]:
+        reason = str((supersession_graph["errors"] or [{}])[0].get("reason") or "invalid_supersession_graph")
+        raise CampaignError(reason)
     effective: List[Dict[str, Any]] = []
     for index, row in enumerate(rows):
         raw_primary = raw_primary_rows[index] if index < len(raw_primary_rows) else row
@@ -2490,15 +2502,47 @@ def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_a
                 "judge_pool_signature": (judge_sidecar or {}).get("judge_pool_signature"),
             },
         }
-        replacement = superseded.get(primary_hash)
-        if replacement:
+        supersession_source = _supersession_identity(
+            campaign_id=paths.campaign_id,
+            run_id="primary",
+            row_hash=primary_hash,
+            row=raw_primary,
+        )
+        supersession_resolution = resolve_supersession_chain(supersession_graph, supersession_source)
+        if not supersession_resolution.get("valid", False):
+            reason = str((supersession_resolution.get("errors") or [{}])[0].get("reason") or "invalid_supersession_graph")
+            raise CampaignError(reason)
+        if supersession_resolution.get("chain"):
+            replacement = supersession_resolution["chain"][-1]["record"]
             replacement_row = dict(replacement.get("replacement_row") or {})
             if replacement_row:
                 item["effective_score"] = replacement_row.get("score")
                 item["effective_reason"] = replacement_row.get("reason")
                 item["result_origin"] = "superseded"
                 item["terminal_disposition"] = classify_recovery_row(replacement_row)["disposition"]
-            item["supersession"] = {k: replacement.get(k) for k in ("source_campaign_id", "source_row_hash", "replacement_run_id", "replacement_row_hash", "reason", "policy_version", "operator", "tool", "recorded_at")}
+            item["supersession"] = {
+                "source_campaign_id": paths.campaign_id,
+                "source_row_hash": primary_hash,
+                "terminal_replacement_row_hash": supersession_resolution["terminal"].get("row_hash"),
+                "chain_length": len(supersession_resolution["chain"]),
+                "chain": [
+                    {
+                        "supersession_id": edge.get("supersession_id"),
+                        "source_row_hash": edge["source"].get("row_hash"),
+                        "replacement_row_hash": edge["replacement"].get("row_hash"),
+                        "replacement_run_id": edge["replacement"].get("run_id"),
+                        "replacement_campaign_id": edge["replacement"].get("campaign_id"),
+                        "reason": edge["record"].get("reason"),
+                        "policy_version": edge["record"].get("policy_version"),
+                        "operator": edge["record"].get("operator"),
+                        "tool": edge["record"].get("tool"),
+                        "recorded_at": edge["record"].get("recorded_at"),
+                    }
+                    for edge in supersession_resolution["chain"]
+                ],
+            }
+            item["provenance"]["supersession_terminal_row_hash"] = supersession_resolution["terminal"].get("row_hash")
+            item["provenance"]["supersession_chain_length"] = len(supersession_resolution["chain"])
         item["correctness"] = (
             "correct" if item.get("effective_score") == 100 else
             "visible_wrong" if item.get("effective_score") is not None else

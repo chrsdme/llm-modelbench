@@ -756,14 +756,59 @@ def cmd_campaign(args, cfg):
     if args.campaign_cmd == "supersede":
         paths, _ = _campaign_paths_or_exit(args.campaign_id)
         try:
-            source = json.loads(Path(args.source_row).read_text(encoding="utf-8"))
             replacement = json.loads(Path(args.replacement_row).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise SystemExit(f"campaign supersede requires JSON row files: {exc}") from None
-        item = campaign.record_supersession(paths, source_campaign_id=args.source_campaign_id or args.campaign_id,
-                                            source_row=source, replacement_run_id=args.replacement_run_id,
-                                            replacement_row=replacement, reason=args.reason, operator=args.operator)
-        print(json.dumps(item, indent=2, sort_keys=True))
+            raise SystemExit(f"campaign supersede requires JSON replacement row file: {exc}") from None
+        try:
+            if args.source_row_hash:
+                source_hash = str(args.source_row_hash)
+            elif args.source_row:
+                source_candidate = json.loads(Path(args.source_row).read_text(encoding="utf-8"))
+                source_hash = campaign._primary_row_hash(source_candidate)
+            else:
+                raise campaign.CampaignError("source_row_hash_required")
+            source = campaign.primary_row_by_hash(paths, source_hash)
+            replacement_hash = campaign._primary_row_hash(replacement)
+            if args.replacement_row_hash and str(args.replacement_row_hash) != replacement_hash:
+                raise campaign.CampaignError("replacement_row_hash_mismatch")
+            item = campaign._native_supersession_record(
+                paths=paths,
+                source_campaign_id=args.source_campaign_id or args.campaign_id,
+                source_run_id=args.source_run_id,
+                source_row=source,
+                replacement_campaign_id=args.replacement_campaign_id or args.campaign_id,
+                replacement_run_id=args.replacement_run_id,
+                replacement_row=replacement,
+                reason=args.reason,
+                operator=args.operator,
+                tool="llmb",
+            )
+            existing_edges = campaign.load_supersession_ledger(paths)
+            candidate_edge = campaign.validate_supersession_record(item, source_row=source, replacement_row=replacement)
+            graph = campaign.build_supersession_graph(existing_edges + [candidate_edge])
+            if not graph["valid"]:
+                reason = str((graph["errors"] or [{}])[0].get("reason") or "invalid_supersession_graph")
+                raise campaign.CampaignError(reason)
+            if args.dry_run:
+                print(json.dumps({"dry_run": True, "would_record": item}, indent=2, sort_keys=True))
+            else:
+                item = campaign.record_supersession(
+                    paths,
+                    source_campaign_id=args.source_campaign_id or args.campaign_id,
+                    source_run_id=args.source_run_id,
+                    source_row=source,
+                    replacement_campaign_id=args.replacement_campaign_id or args.campaign_id,
+                    replacement_run_id=args.replacement_run_id,
+                    replacement_row=replacement,
+                    reason=args.reason,
+                    operator=args.operator,
+                    tool="llmb",
+                )
+                print(json.dumps(item, indent=2, sort_keys=True))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"campaign supersede requires JSON source row file: {exc}") from None
+        except campaign.CampaignError as exc:
+            raise SystemExit(f"campaign supersede refused: {exc}") from None
         return
     if args.campaign_cmd == "status":
         paths, manifest = _campaign_paths_or_exit(args.campaign_id)
@@ -1629,11 +1674,16 @@ def build_parser():
     camp_supersede = camp_sub.add_parser("supersede", help="append immutable corrected-evidence supersession")
     camp_supersede.add_argument("--campaign-id", required=True)
     camp_supersede.add_argument("--source-campaign-id")
-    camp_supersede.add_argument("--source-row", required=True, help="JSON file containing the immutable source row")
+    camp_supersede.add_argument("--source-run-id", default="primary")
+    camp_supersede.add_argument("--source-row", help="JSON file used only to derive/confirm the immutable source row hash")
+    camp_supersede.add_argument("--source-row-hash", help="immutable source row hash from campaign primary evidence")
+    camp_supersede.add_argument("--replacement-campaign-id")
     camp_supersede.add_argument("--replacement-run-id", required=True)
     camp_supersede.add_argument("--replacement-row", required=True, help="JSON file containing the corrected row")
+    camp_supersede.add_argument("--replacement-row-hash", help="expected corrected row hash")
     camp_supersede.add_argument("--reason", required=True)
     camp_supersede.add_argument("--operator", default="operator")
+    camp_supersede.add_argument("--dry-run", action="store_true", help="validate and preview without appending")
     camp_status = camp_sub.add_parser("status", help="show campaign lifecycle state")
     camp_status.add_argument("campaign_id")
     camp_resume = camp_sub.add_parser("resume", help="resume the exact recorded interrupted campaign phase")
