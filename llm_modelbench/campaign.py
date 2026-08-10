@@ -278,6 +278,20 @@ def validate_campaign_config(data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def campaign_config_signature(config: Dict[str, Any]) -> str:
+    validated = validate_campaign_config(config)
+    return hashlib.sha256(json.dumps(validated, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def campaign_config_plan_record(config: Dict[str, Any]) -> Dict[str, Any]:
+    validated = validate_campaign_config(config)
+    return {
+        "schema_version": CAMPAIGN_CONFIG_SCHEMA_VERSION,
+        "config_signature": campaign_config_signature(validated),
+        "config": validated,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Path resolver
 # ---------------------------------------------------------------------------

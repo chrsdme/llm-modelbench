@@ -729,6 +729,38 @@ def cmd_campaign(args, cfg):
             raise SystemExit(f"campaign execute refused: {exc}") from None
         campaign_id = str(data["campaign_id"])
         models = data["models"]
+        paths = campaign.resolve_paths(campaign_id)
+        config_record = campaign.campaign_config_plan_record(data)
+        config_plan_path = paths.plan_dir / "campaign_config.json"
+        if paths.manifest.exists():
+            manifest = campaign.load_manifest(paths)
+            if not config_plan_path.exists():
+                raise SystemExit(
+                    "campaign execute refused: existing campaign lacks immutable config plan; "
+                    f"use explicit campaign commands or inspect {paths.root}"
+                )
+            try:
+                existing_record = json.loads(config_plan_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise SystemExit(f"campaign execute refused: invalid immutable config plan: {exc}") from None
+            if existing_record.get("config_signature") != config_record["config_signature"]:
+                raise SystemExit("campaign execute refused: existing campaign was planned with different config")
+            if manifest.state == "packaged":
+                print(json.dumps({
+                    "campaign_id": campaign_id,
+                    "state": manifest.state,
+                    "result": "noop",
+                    "message": "identical config already completed; no evidence changed",
+                }, indent=2, sort_keys=True))
+                return
+            if manifest.state == "interrupted":
+                raise SystemExit(
+                    f"campaign execute paused: campaign is interrupted; valid next action is campaign resume {campaign_id}"
+                )
+            raise SystemExit(
+                f"campaign execute refused: campaign state {manifest.state!r} is not safe for config execution; "
+                f"valid next action is campaign status {campaign_id}"
+            )
         invocation = ["campaign", "run", "--campaign-id", campaign_id, "--models", ";".join(map(str, models)),
                       "--level", str(data.get("level") or "full"), "--yes", "--unattended-safe"]
         if data.get("runtime_policy", {}).get("auto", True): invocation.append("--auto")
@@ -740,6 +772,7 @@ def cmd_campaign(args, cfg):
         if args.mock: invocation.append("--mock")
         # Normal lifecycle remains campaign-owned and intentionally stops before adoption.
         main(invocation)
+        campaign._atomic_write_text(config_plan_path, json.dumps(config_record, indent=2, sort_keys=True))
         return
     if args.campaign_cmd == "supersede":
         paths, _ = _campaign_paths_or_exit(args.campaign_id)
