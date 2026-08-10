@@ -34,6 +34,7 @@ JUDGE_POLICY_VERSION = "rc21.post1"
 MODEL_ROLE_POLICY_VERSION = "rc21.post1.roles"
 SUPERSESSION_POLICY_VERSION = "rc21.post1"
 SUPERSESSION_SCHEMA_VERSION = 2
+CAMPAIGN_CONFIG_SCHEMA_VERSION = 1
 
 _CAMPAIGN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _RESUMABLE_STATES = ("generating", "recovering", "judging")
@@ -184,6 +185,97 @@ def validate_campaign_id(campaign_id: str) -> str:
     if ".." in campaign_id:
         raise CampaignError(f"invalid campaign id {campaign_id!r}: must not contain '..'")
     return campaign_id
+
+
+def campaign_config_template() -> Dict[str, Any]:
+    """Return the strict Stage 4A campaign config template."""
+    return {
+        "schema_version": CAMPAIGN_CONFIG_SCHEMA_VERSION,
+        "campaign_id": "my_campaign",
+        "models": ["model:tag"],
+        "level": "full",
+        "samples": 1,
+        "runtime_policy": {"auto": True},
+        "context_needle_policy": {"needle_max_ctx": 66560},
+        "judge_policy": {"enabled": False},
+        "executable_scorer_policy": {"allow_host_code_execution": False},
+        "stop_before_adoption": True,
+    }
+
+
+def _reject_unknown_keys(value: Dict[str, Any], allowed: set[str], context: str) -> None:
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise CampaignError(f"unknown_{context}_config_key:{unknown[0]}")
+
+
+def _optional_bool_mapping(data: Dict[str, Any], key: str, allowed: set[str]) -> Dict[str, Any]:
+    value = data.get(key) or {}
+    if not isinstance(value, dict):
+        raise CampaignError(f"{key}_must_be_object")
+    _reject_unknown_keys(value, allowed, key)
+    return value
+
+
+def validate_campaign_config(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate the Stage 4A campaign config schema without executing it."""
+    if not isinstance(data, dict):
+        raise CampaignError("campaign_config_must_be_object")
+    allowed = {
+        "schema_version", "campaign_id", "id", "models", "level", "samples",
+        "runtime_policy", "context_needle_policy", "judge_policy",
+        "executable_scorer_policy", "stop_before_adoption",
+    }
+    _reject_unknown_keys(data, allowed, "campaign")
+    if data.get("schema_version") != CAMPAIGN_CONFIG_SCHEMA_VERSION:
+        raise CampaignError("unsupported_campaign_config_schema")
+    if data.get("campaign_id") and data.get("id") and str(data["campaign_id"]) != str(data["id"]):
+        raise CampaignError("campaign_config_id_conflict")
+    campaign_id = validate_campaign_id(str(data.get("campaign_id") or data.get("id") or ""))
+    models = data.get("models")
+    if not isinstance(models, list) or not models or any(not isinstance(item, str) or not item.strip() for item in models):
+        raise CampaignError("campaign_config_models_invalid")
+    level = data.get("level", "full")
+    if level not in {"smoke", "short", "full"}:
+        raise CampaignError("campaign_config_level_invalid")
+    samples = data.get("samples", 1)
+    if not isinstance(samples, int) or isinstance(samples, bool) or samples <= 0:
+        raise CampaignError("campaign_config_samples_invalid")
+    runtime_policy = _optional_bool_mapping(data, "runtime_policy", {"auto"})
+    runtime_auto = runtime_policy.get("auto", True)
+    if not isinstance(runtime_auto, bool):
+        raise CampaignError("runtime_policy_auto_invalid")
+    context_policy = _optional_bool_mapping(data, "context_needle_policy", {"needle_max_ctx"})
+    needle_max_ctx = context_policy.get("needle_max_ctx")
+    if needle_max_ctx is not None and (
+        not isinstance(needle_max_ctx, int) or isinstance(needle_max_ctx, bool) or needle_max_ctx <= 0
+    ):
+        raise CampaignError("context_needle_policy_invalid")
+    judge_policy = _optional_bool_mapping(data, "judge_policy", {"enabled"})
+    judge_enabled = judge_policy.get("enabled", False)
+    if not isinstance(judge_enabled, bool):
+        raise CampaignError("judge_policy_enabled_invalid")
+    if judge_enabled:
+        raise CampaignError("judge_policy_enabled_requires_stage4b")
+    scorer_policy = _optional_bool_mapping(data, "executable_scorer_policy", {"allow_host_code_execution"})
+    allow_host_code = scorer_policy.get("allow_host_code_execution", False)
+    if not isinstance(allow_host_code, bool):
+        raise CampaignError("executable_scorer_policy_invalid")
+    stop_before_adoption = data.get("stop_before_adoption", True)
+    if stop_before_adoption is not True:
+        raise CampaignError("campaign_config_must_stop_before_adoption")
+    return {
+        "schema_version": CAMPAIGN_CONFIG_SCHEMA_VERSION,
+        "campaign_id": campaign_id,
+        "models": [item.strip() for item in models],
+        "level": level,
+        "samples": samples,
+        "runtime_policy": {"auto": runtime_auto},
+        "context_needle_policy": {"needle_max_ctx": needle_max_ctx},
+        "judge_policy": {"enabled": judge_enabled},
+        "executable_scorer_policy": {"allow_host_code_execution": allow_host_code},
+        "stop_before_adoption": True,
+    }
 
 
 # ---------------------------------------------------------------------------

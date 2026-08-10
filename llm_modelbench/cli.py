@@ -712,21 +712,7 @@ def cmd_campaign(args, cfg):
         destination = Path(args.path)
         if destination.exists():
             raise SystemExit(f"campaign init refused: {destination} already exists")
-        template = {
-            "campaign_id": "my_campaign", "models": ["model:tag"], "level": "full", "samples": 1,
-            "runtime_policy": {"auto": True}, "gpu_topology_policy": "auto",
-            "context_needle_policy": {"needle_max_ctx": 66560},
-            "kv_fallback_policy": {"sequence": ["current", "q8_0", "q4_0"]},
-            "recovery_policy": {"enabled": True, "bounded": True},
-            "judge_policy": {"enabled": True,
-                             "primary": getattr(cfg, "judge_model", None),
-                             "candidates": list(getattr(cfg, "judge_candidates", []) or []),
-                             "family_exclusions": list(getattr(cfg, "judge_family_exclusions", ["qwen"]) or []),
-                             "allow_excluded_primary": bool(getattr(cfg, "judge_allow_excluded_primary", False))},
-            "executable_scorer_policy": {"allow_host_code_execution": False},
-            "telemetry_policy": {"enabled": True}, "reporting_package_policy": {"package": True},
-            "deferred_models": [], "stop_before_adoption": True,
-        }
+        template = campaign.campaign_config_template()
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(json.dumps(template, indent=2) + "\n", encoding="utf-8")
         print(f"campaign template -> {destination}")
@@ -737,10 +723,12 @@ def cmd_campaign(args, cfg):
             data = json.loads(source.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise SystemExit(f"campaign execute requires JSON campaign config: {exc}") from None
-        campaign_id = str(data.get("campaign_id") or data.get("id") or "")
-        models = data.get("models") or []
-        if not campaign_id or not isinstance(models, list) or not models:
-            raise SystemExit("campaign config requires campaign_id and non-empty models")
+        try:
+            data = campaign.validate_campaign_config(data)
+        except campaign.CampaignError as exc:
+            raise SystemExit(f"campaign execute refused: {exc}") from None
+        campaign_id = str(data["campaign_id"])
+        models = data["models"]
         invocation = ["campaign", "run", "--campaign-id", campaign_id, "--models", ";".join(map(str, models)),
                       "--level", str(data.get("level") or "full"), "--yes", "--unattended-safe"]
         if data.get("runtime_policy", {}).get("auto", True): invocation.append("--auto")
