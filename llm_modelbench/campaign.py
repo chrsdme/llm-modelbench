@@ -24,12 +24,13 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from .classify import families_for
 from .capabilities import (
     CAPABILITY_SCHEMA_VERSION,
     MeasuredCapabilityState,
+    capability_identity_compatibility,
     family_applicability,
     measured_supported_families,
 )
@@ -3093,25 +3094,74 @@ def _canonical_candidate_families(item: Dict[str, Any]) -> List[str]:
     return families_for(_candidate_name(item), capabilities)
 
 
+_CAPABILITY_IDENTITY_REQUIRED_PATHS = (
+    ("schema_version",),
+    ("model", "canonical_name"),
+    ("model", "digest"),
+    ("backend", "backend"),
+    ("backend", "implementation"),
+    ("backend", "endpoint"),
+    ("runtime", "endpoint"),
+    ("runtime", "implementation"),
+    ("template_config", "hash"),
+    ("probe_protocol_version",),
+)
+
+
+def _nested_identity_value(identity: Mapping[str, Any], path: tuple[str, ...]) -> Any:
+    value: Any = identity
+    for key in path:
+        if not isinstance(value, Mapping):
+            return None
+        value = value.get(key)
+    return value
+
+
+def _capability_identity_has_required_material(identity: Any) -> bool:
+    if not isinstance(identity, Mapping):
+        return False
+    for path in _CAPABILITY_IDENTITY_REQUIRED_PATHS:
+        value = _nested_identity_value(identity, path)
+        if value in (None, ""):
+            return False
+    return True
+
+
+def _candidate_capability_identity_compatibility(item: Dict[str, Any]) -> Dict[str, Any]:
+    if item.get("capability_schema_version") != CAPABILITY_SCHEMA_VERSION:
+        return {"compatible": False, "reason": "capability_schema_version_changed"}
+    identity = item.get("capability_identity")
+    if not _capability_identity_has_required_material(identity):
+        return {"compatible": False, "reason": "legacy_or_unbound_capability_profile"}
+    current_identity = item.get("current_capability_identity")
+    if isinstance(current_identity, Mapping):
+        return capability_identity_compatibility(item, current_identity)
+    compatibility = item.get("capability_identity_compatibility")
+    if isinstance(compatibility, Mapping) and compatibility.get("compatible") is True:
+        return {"compatible": True, "reason": str(compatibility.get("reason") or "identity_match")}
+    if isinstance(compatibility, Mapping):
+        return {"compatible": False, "reason": str(compatibility.get("reason") or "capability_identity_incompatible")}
+    return {"compatible": False, "reason": "current_capability_identity_missing"}
+
+
 def _judge_measured_text_state(item: Dict[str, Any]) -> str:
     if item.get("capability_schema_version") != CAPABILITY_SCHEMA_VERSION:
         return MeasuredCapabilityState.PROBE_INCONCLUSIVE.value
-    compatibility = item.get("capability_identity_compatibility")
-    if isinstance(compatibility, dict) and not compatibility.get("compatible"):
+    state = family_applicability(item, "text")
+    if state == MeasuredCapabilityState.MEASURED_SUPPORTED.value and not _candidate_capability_identity_compatibility(item).get("compatible"):
         return MeasuredCapabilityState.PROBE_INCONCLUSIVE.value
-    return family_applicability(item, "text")
+    return state
 
 
 def _judge_capability_rejection(item: Dict[str, Any]) -> Optional[str]:
     """Fail closed unless canonical evidence confirms normal text generation."""
     if item.get("capability_schema_version") != CAPABILITY_SCHEMA_VERSION:
         return "capability_reprobe_required"
-    compatibility = item.get("capability_identity_compatibility")
-    if isinstance(compatibility, dict) and not compatibility.get("compatible"):
-        return "capability_reprobe_required"
     state = _judge_measured_text_state(item)
     families = _canonical_candidate_families(item)
     if state == MeasuredCapabilityState.MEASURED_SUPPORTED.value:
+        if not _candidate_capability_identity_compatibility(item).get("compatible"):
+            return "capability_reprobe_required"
         return None
     if state == MeasuredCapabilityState.PROBE_INCONCLUSIVE.value:
         return "capability_reprobe_required"

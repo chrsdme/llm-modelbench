@@ -2,6 +2,7 @@ import json
 import urllib.error
 
 from llm_modelbench import campaign
+from llm_modelbench.capabilities import PROBE_PROTOCOL_VERSION
 from llm_modelbench.judge_qualification import PROTOCOL_VERSION, qualify_candidate
 from llm_modelbench.ollama import OllamaClient
 
@@ -97,11 +98,21 @@ class FakeJudgeBackend:
 
 
 def _candidate(name="judge"):
+    digest = f"digest-{name}"
     return {
         "name": name,
-        "digest": f"digest-{name}",
+        "digest": digest,
         "capabilities": ["completion"],
         "capability_schema_version": campaign.CAPABILITY_SCHEMA_VERSION,
+        "capability_identity": {
+            "schema_version": campaign.CAPABILITY_SCHEMA_VERSION,
+            "model": {"canonical_name": name, "backend_model_id": name, "digest": digest, "size": 1, "details": {}},
+            "backend": {"backend": "mock", "implementation": "fixture", "endpoint": "http://fake.invalid"},
+            "runtime": {"endpoint": "http://fake.invalid", "implementation": "fixture"},
+            "template_config": {"available": True, "hash": "template-v1", "material": {"template": "template-v1"}},
+            "probe_protocol_version": PROBE_PROTOCOL_VERSION,
+        },
+        "capability_identity_compatibility": {"compatible": True, "reason": "identity_match"},
         "measured_capabilities": {"text": {"state": "measured_supported"}},
         "canonical_families": ["text"],
         "runtime_identity": {"provider": "fake", "model": name},

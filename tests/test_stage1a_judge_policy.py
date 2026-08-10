@@ -1,6 +1,23 @@
 from llm_modelbench import campaign
-from llm_modelbench.capabilities import CAPABILITY_SCHEMA_VERSION, MeasuredCapabilityState
+from llm_modelbench.capabilities import CAPABILITY_SCHEMA_VERSION, PROBE_PROTOCOL_VERSION, MeasuredCapabilityState
 from llm_modelbench.config import Config
+
+
+def _identity(name, digest, *, backend="mock", endpoint="http://fake.invalid", template_hash="template-v1"):
+    return {
+        "schema_version": CAPABILITY_SCHEMA_VERSION,
+        "model": {"canonical_name": name, "backend_model_id": name, "digest": digest, "size": 1, "details": {}},
+        "backend": {"backend": backend, "implementation": "fixture", "endpoint": endpoint},
+        "runtime": {"endpoint": endpoint, "implementation": "fixture"},
+        "template_config": {"available": True, "hash": template_hash, "material": {"template": template_hash}},
+        "probe_protocol_version": PROBE_PROTOCOL_VERSION,
+    }
+
+
+def _bind(item, *, compatible=True, reason="identity_match"):
+    item["capability_identity"] = _identity(item["name"], item["digest"])
+    item["capability_identity_compatibility"] = {"compatible": compatible, "reason": reason}
+    return item
 
 
 def _measured_text(name, digest, **extra):
@@ -13,7 +30,7 @@ def _measured_text(name, digest, **extra):
         },
     }
     item.update(extra)
-    return item
+    return _bind(item)
 
 
 def _measured_embedding(name, digest, **extra):
@@ -26,7 +43,7 @@ def _measured_embedding(name, digest, **extra):
         },
     }
     item.update(extra)
-    return item
+    return _bind(item)
 
 
 def _policy(**kwargs):

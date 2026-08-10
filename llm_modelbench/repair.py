@@ -818,24 +818,15 @@ def build_plan(
         task = _TASKS.get(task_id)
         recovery_state = classify_recovery_row(row)
         if task is None:
-            if recovery_state["retry"]:
-                disposition = str(recovery_state.get("disposition") or "")
-                if disposition in {"thinking_only_pending_retry", "empty_output_pending_retry"}:
-                    profiles = _thinking_retry_profiles(row, int(think_retry_num_predict))
-                    add_action(
-                        "retry_generation", row, [task_id],
-                        f"{recovery_state['reason']}: bounded visible-answer recovery",
-                        overrides={"retry_profiles": profiles},
-                        details={"attempt_limit": len(profiles), "unknown_task": True},
-                    )
-                else:
-                    add_action("retry_transient", row, [task_id], "transient runtime/API failure; unload and retry once")
-            else:
-                observations.append({
-                    "kind": "unknown_task_not_repairable", "model": row.get("model"),
-                    "run_id": row.get("run_id"), "task": task_id,
-                    "reason": recovery_state["reason"],
-                })
+            observations.append({
+                "kind": "unknown_task_not_repairable", "model": row.get("model"),
+                "run_id": row.get("run_id"), "task": task_id,
+                "previous_error_kind": row.get("error_kind"),
+                "reason": (
+                    "task definition is unavailable; recovery requires an authoritative "
+                    f"task family before capability applicability can be established ({recovery_state['reason']})"
+                ),
+            })
             continue
         if task.difficulty <= 0 and not recovery_state["retry"]:
             continue

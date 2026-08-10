@@ -129,6 +129,7 @@ def _profile(model, states, *, digest="digest-1", backend="mock", endpoint="http
         "measured_supported_families": supported,
         "measured_capabilities": measured,
         "functional_probes_enabled": True,
+        "capability_identity_compatibility": {"compatible": True, "reason": "identity_match"},
     }
 
 
@@ -162,6 +163,31 @@ def _write_repair_run(root: Path, model: str, profile, task_id: str, error_kind:
     return run
 
 
+def _write_unknown_repair_run(root: Path, model: str, profile, task_id: str, error_kind: str, *, source_digest="digest-1"):
+    run = root / "fleet"
+    run.mkdir(parents=True)
+    row = {
+        "model": model,
+        "task": task_id,
+        "task_hash": "unknown-task-hash",
+        "score": None,
+        "error_kind": error_kind,
+        "reason": error_kind,
+        "timestamp": "2026-08-10T00:00:00Z",
+    }
+    if source_digest:
+        row["model_digest_resolved"] = source_digest
+    (run / "raw_results.jsonl").write_text(json.dumps(row) + "\n")
+    (run / "summary_meta.json").write_text(json.dumps({"level": "full"}))
+    (run / "filters.json").write_text(json.dumps({"level": "full", "think": "auto"}))
+    identity = {"size": 1}
+    if source_digest:
+        identity["digest"] = source_digest
+    (run / "model_identities.json").write_text(json.dumps({model: identity}))
+    (run / "capability_report.json").write_text(json.dumps({model: profile}))
+    return run
+
+
 def test_qwen3_embedding_metadata_tools_plans_embedding_only_and_not_judge_or_recovery(tmp_path):
     model = "qwen3-embedding:latest"
     client = CapabilityClient(name=model, capabilities=["embedding", "tools"], embedding_ok=True, text_ok=False)
@@ -175,6 +201,8 @@ def test_qwen3_embedding_metadata_tools_plans_embedding_only_and_not_judge_or_re
         "name": model,
         "digest": "digest-1",
         "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
+        "capability_identity": profile["capability_identity"],
+        "capability_identity_compatibility": {"compatible": True, "reason": "identity_match"},
         "measured_capabilities": profile["measured_capabilities"],
     }], [], campaign.JudgePolicy(excluded_families=()))
     assert selection.selected is None
@@ -195,6 +223,10 @@ def test_bge_m3_embedding_only_is_not_generation_judge():
         "name": "bge-m3:latest",
         "digest": "bge",
         "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
+        "capability_identity": _profile("bge-m3:latest", {
+            "embedding": MeasuredCapabilityState.MEASURED_SUPPORTED.value,
+        }, digest="bge")["capability_identity"],
+        "capability_identity_compatibility": {"compatible": True, "reason": "identity_match"},
         "measured_capabilities": {"embedding": {"state": MeasuredCapabilityState.MEASURED_SUPPORTED.value}},
     }], [], campaign.JudgePolicy(excluded_families=()))
     assert result.selected is None
@@ -227,13 +259,62 @@ def test_judge_eligibility_requires_schema_v2_measured_text_support():
     assert metadata.selected is None
     assert metadata.rejection_reasons[0]["reason"] == "capability_reprobe_required"
 
-    supported = campaign.build_judge_selection([{
-        "name": "measured-text",
-        "digest": "text",
+    supported_profile = _profile("measured-text", {
+        "text": MeasuredCapabilityState.MEASURED_SUPPORTED.value,
+    }, digest="text")
+    supported = campaign.build_judge_selection([{**supported_profile, "name": "measured-text", "digest": "text"}], [], policy)
+    assert supported.selected["name"] == "measured-text"
+
+    unbound = campaign.build_judge_selection([{
+        "name": "unbound-v2-text",
+        "digest": "unbound",
         "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
         "measured_capabilities": {"text": {"state": MeasuredCapabilityState.MEASURED_SUPPORTED.value}},
     }], [], policy)
-    assert supported.selected["name"] == "measured-text"
+    assert unbound.selected is None
+    assert unbound.rejection_reasons[0]["reason"] == "capability_reprobe_required"
+
+    incomplete_profile = _profile("incomplete-text", {
+        "text": MeasuredCapabilityState.MEASURED_SUPPORTED.value,
+    }, digest="incomplete")
+    incomplete_profile["capability_identity"] = {"model": {"digest": "incomplete"}}
+    incomplete = campaign.build_judge_selection([{**incomplete_profile, "name": "incomplete-text", "digest": "incomplete"}], [], policy)
+    assert incomplete.selected is None
+    assert incomplete.rejection_reasons[0]["reason"] == "capability_reprobe_required"
+
+    mismatch_profile = _profile("mismatch-text", {
+        "text": MeasuredCapabilityState.MEASURED_SUPPORTED.value,
+    }, digest="DIGEST_A")
+    mismatch_profile["current_capability_identity"] = current_capability_identity(CapabilityClient(name="mismatch-text", digest="DIGEST_B"), "mismatch-text")
+    mismatch = campaign.build_judge_selection([{**mismatch_profile, "name": "mismatch-text", "digest": "DIGEST_A"}], [], policy)
+    assert mismatch.selected is None
+    assert mismatch.rejection_reasons[0]["reason"] == "capability_reprobe_required"
+
+    backend_mismatch = _profile("backend-mismatch", {
+        "text": MeasuredCapabilityState.MEASURED_SUPPORTED.value,
+    }, digest="same")
+    backend_mismatch["current_capability_identity"] = current_capability_identity(CapabilityClient(name="backend-mismatch", digest="same", backend="other"), "backend-mismatch")
+    backend_result = campaign.build_judge_selection([{**backend_mismatch, "name": "backend-mismatch", "digest": "same"}], [], policy)
+    assert backend_result.selected is None
+    assert backend_result.rejection_reasons[0]["reason"] == "capability_reprobe_required"
+
+    template_mismatch = _profile("template-mismatch", {
+        "text": MeasuredCapabilityState.MEASURED_SUPPORTED.value,
+    }, digest="same")
+    template_mismatch["current_capability_identity"] = current_capability_identity(CapabilityClient(name="template-mismatch", digest="same", template="template-v2"), "template-mismatch")
+    template_result = campaign.build_judge_selection([{**template_mismatch, "name": "template-mismatch", "digest": "same"}], [], policy)
+    assert template_result.selected is None
+    assert template_result.rejection_reasons[0]["reason"] == "capability_reprobe_required"
+
+    protocol_mismatch = _profile("protocol-mismatch", {
+        "text": MeasuredCapabilityState.MEASURED_SUPPORTED.value,
+    }, digest="same")
+    protocol_mismatch["capability_identity"] = dict(protocol_mismatch["capability_identity"])
+    protocol_mismatch["capability_identity"]["probe_protocol_version"] = "old"
+    protocol_mismatch["current_capability_identity"] = current_capability_identity(CapabilityClient(name="protocol-mismatch", digest="same"), "protocol-mismatch")
+    protocol_result = campaign.build_judge_selection([{**protocol_mismatch, "name": "protocol-mismatch", "digest": "same"}], [], policy)
+    assert protocol_result.selected is None
+    assert protocol_result.rejection_reasons[0]["reason"] == "capability_reprobe_required"
 
     unsupported = campaign.build_judge_selection([{
         "name": "measured-unsupported",
@@ -320,6 +401,41 @@ def test_recovery_requires_positive_text_and_tool_applicability(tmp_path):
     assert [action.kind for action in supported.actions] == ["retry_generation"]
 
 
+def test_unknown_task_never_enters_generation_recovery(tmp_path):
+    model = "fixture:latest"
+    profile = _profile(model, {
+        "text": MeasuredCapabilityState.MEASURED_SUPPORTED.value,
+        "tools": MeasuredCapabilityState.MEASURED_SUPPORTED.value,
+        "vision": MeasuredCapabilityState.MEASURED_SUPPORTED.value,
+    })
+
+    empty_runs = tmp_path / "unknown_empty"
+    empty_runs.mkdir()
+    _write_unknown_repair_run(empty_runs, model, profile, "completely_unknown_task", "empty_output")
+    empty = repair.build_plan(empty_runs, run_id="fleet", include_missing=False)
+    assert empty.actions == []
+    assert empty.observations[0]["kind"] == "unknown_task_not_repairable"
+
+    thinking_runs = tmp_path / "unknown_thinking"
+    thinking_runs.mkdir()
+    _write_unknown_repair_run(thinking_runs, model, profile, "completely_unknown_task", "thinking_only")
+    thinking = repair.build_plan(thinking_runs, run_id="fleet", include_missing=False)
+    assert thinking.actions == []
+    assert thinking.observations[0]["kind"] == "unknown_task_not_repairable"
+
+    metadata_runs = tmp_path / "unknown_metadata"
+    metadata_runs.mkdir()
+    metadata_profile = {
+        "model": model,
+        "declared_capabilities": ["completion", "tools", "vision"],
+        "supported_families": ["text", "tools", "vision"],
+    }
+    _write_unknown_repair_run(metadata_runs, model, metadata_profile, "completely_unknown_task", "empty_output")
+    metadata = repair.build_plan(metadata_runs, run_id="fleet", include_missing=False)
+    assert metadata.actions == []
+    assert metadata.observations[0]["kind"] == "unknown_task_not_repairable"
+
+
 def test_recovery_capability_profile_must_match_source_digest(tmp_path):
     model = "example:latest"
     same_runs = tmp_path / "same_digest"
@@ -375,6 +491,28 @@ def test_specialized_recovery_lanes_cannot_cross_digest_boundaries(tmp_path):
         assert plan.actions == []
         assert plan.observations[0]["kind"] == "capability_reprobe_required"
         assert plan.observations[0]["capability_identity_compatibility"]["reason"] == "model_digest_changed"
+
+
+def test_known_specialized_recovery_lanes_stay_capability_gated(tmp_path):
+    model = "native:latest"
+
+    unsupported_tools = tmp_path / "tools_unsupported"
+    unsupported_tools.mkdir()
+    _write_repair_run(unsupported_tools, model, _profile(model, {
+        "tools": MeasuredCapabilityState.MEASURED_UNSUPPORTED.value,
+    }), "agent_native_tool_call", "empty_output")
+    tools_plan = repair.build_plan(unsupported_tools, run_id="fleet", include_missing=False)
+    assert tools_plan.actions == []
+    assert tools_plan.observations[0]["kind"] == "capability_not_applicable"
+
+    supported_fim = tmp_path / "fim_supported"
+    supported_fim.mkdir()
+    _write_repair_run(supported_fim, model, _profile(model, {
+        "insert": MeasuredCapabilityState.MEASURED_SUPPORTED.value,
+    }), "fim_suffix_assertion", "empty_output")
+    fim_plan = repair.build_plan(supported_fim, run_id="fleet", include_missing=False)
+    assert [action.kind for action in fim_plan.actions] == ["capability_gate"]
+    assert fim_plan.actions[0].family == "insert"
 
 
 def test_capability_identity_rejects_digest_backend_template_and_protocol_changes():

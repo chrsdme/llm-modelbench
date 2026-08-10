@@ -985,12 +985,21 @@ def cmd_campaign(args, cfg):
                     cohort_by_key.setdefault(key, {"name": row.get("model"), "digest": row.get("model_digest_resolved")})
                 cohort = list(cohort_by_key.values())
                 judge_policy = campaign.JudgePolicy.from_config(cfg, enabled=True)
-                candidates = campaign.apply_campaign_roles_to_judge_candidates([
-                    {"name": item.get("name"), "digest": item.get("digest"),
-                     "capabilities": client.capabilities(item.get("name")), "priority": 0,
-                     "calibrated": False}
-                    for item in inventory
-                ], cohort, judge_policy)
+                plan_profiles = accepted_plan.get("capability_profiles") or {}
+                candidates = []
+                for item in inventory:
+                    name = str(item.get("name") or "")
+                    profile = dict(plan_profiles.get(name) or {})
+                    candidate = {
+                        **profile,
+                        "name": name,
+                        "digest": item.get("digest"),
+                        "capabilities": client.capabilities(name),
+                        "priority": 0,
+                        "calibrated": False,
+                    }
+                    candidates.append(candidate)
+                candidates = campaign.apply_campaign_roles_to_judge_candidates(candidates, cohort, judge_policy)
                 judge_selection = campaign.build_judge_selection(candidates, cohort, judge_policy)
                 qualified_judges, qualifications, coverage = campaign.select_qualified_campaign_judges_for_rows(client, judge_selection, eligible)
                 judge = qualified_judges[0] if qualified_judges else None

@@ -590,6 +590,15 @@ def test_judge_selection_excludes_cohort_and_prefers_calibrated_other_family():
             "name": name,
             "digest": digest,
             "capability_schema_version": campaign.CAPABILITY_SCHEMA_VERSION,
+            "capability_identity": {
+                "schema_version": campaign.CAPABILITY_SCHEMA_VERSION,
+                "model": {"canonical_name": name, "backend_model_id": name, "digest": digest, "size": 1, "details": {}},
+                "backend": {"backend": "mock", "implementation": "fixture", "endpoint": "http://fake.invalid"},
+                "runtime": {"endpoint": "http://fake.invalid", "implementation": "fixture"},
+                "template_config": {"available": True, "hash": "template-v1", "material": {"template": "template-v1"}},
+                "probe_protocol_version": "capability-smoke-v2",
+            },
+            "capability_identity_compatibility": {"compatible": True, "reason": "identity_match"},
             "measured_capabilities": {"text": {"state": "measured_supported"}},
         }
         item.update(extra)

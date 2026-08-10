@@ -2,8 +2,26 @@ import json
 from pathlib import Path
 
 from llm_modelbench import campaign, judge_dumps
+from llm_modelbench.capabilities import PROBE_PROTOCOL_VERSION
 from llm_modelbench.runner import _task_hash
 from llm_modelbench.tasks import TASKS
+
+
+def _identity(name, digest):
+    return {
+        "schema_version": campaign.CAPABILITY_SCHEMA_VERSION,
+        "model": {"canonical_name": name, "backend_model_id": name, "digest": digest, "size": 1, "details": {}},
+        "backend": {"backend": "mock", "implementation": "fixture", "endpoint": "http://fake.invalid"},
+        "runtime": {"endpoint": "http://fake.invalid", "implementation": "fixture"},
+        "template_config": {"available": True, "hash": "template-v1", "material": {"template": "template-v1"}},
+        "probe_protocol_version": PROBE_PROTOCOL_VERSION,
+    }
+
+
+def _bind(item):
+    item["capability_identity"] = _identity(item["name"], item["digest"])
+    item["capability_identity_compatibility"] = {"compatible": True, "reason": "identity_match"}
+    return item
 
 
 def _measured_text(name, digest, **extra):
@@ -14,7 +32,7 @@ def _measured_text(name, digest, **extra):
         "measured_capabilities": {"text": {"state": "measured_supported"}},
     }
     item.update(extra)
-    return item
+    return _bind(item)
 
 
 def _subjective_task():
