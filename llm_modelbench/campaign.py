@@ -2574,6 +2574,9 @@ def write_readiness(paths: CampaignPaths, rows: List[Dict[str, Any]], *, judge_a
             source = row
             origin = "judged"
             disposition = "judged"
+        elif judge_sidecar and judge_sidecar.get("status") in {"awaiting_independent_judge", "judge_exhausted_unavailable"}:
+            source = row
+            disposition = str(judge_sidecar.get("status"))
         item = {
             "model": row.get("model"),
             "model_digest_resolved": row.get("model_digest_resolved") or source.get("model_digest_resolved") or source.get("model_digest"),
