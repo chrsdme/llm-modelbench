@@ -802,8 +802,9 @@ def cmd_campaign(args, cfg):
             else:
                 raise campaign.CampaignError("source_row_hash_required")
             source = campaign.primary_row_by_hash(paths, source_hash)
-            replacement_hash = campaign._primary_row_hash(replacement)
-            if args.replacement_row_hash and str(args.replacement_row_hash) != replacement_hash:
+            replacement_preview_hash = campaign._primary_row_hash(replacement)
+            replacement_hash = str(args.replacement_row_hash or replacement_preview_hash)
+            if args.dry_run and args.replacement_row_hash and str(args.replacement_row_hash) != replacement_preview_hash:
                 raise campaign.CampaignError("replacement_row_hash_mismatch")
             item = campaign._native_supersession_record(
                 paths=paths,
@@ -826,6 +827,14 @@ def cmd_campaign(args, cfg):
             if args.dry_run:
                 print(json.dumps({"dry_run": True, "would_record": item}, indent=2, sort_keys=True))
             else:
+                stored_replacement = campaign.stored_replacement_row_by_hash(
+                    campaign_id=args.replacement_campaign_id or args.campaign_id,
+                    run_id=args.replacement_run_id,
+                    row_hash=replacement_hash,
+                )
+                if stored_replacement != replacement:
+                    raise campaign.CampaignError("replacement_preview_contradicts_stored_evidence")
+                campaign.validate_replacement_provenance_matches_source(source, stored_replacement)
                 item = campaign.record_supersession(
                     paths,
                     source_campaign_id=args.source_campaign_id or args.campaign_id,
@@ -833,7 +842,7 @@ def cmd_campaign(args, cfg):
                     source_row=source,
                     replacement_campaign_id=args.replacement_campaign_id or args.campaign_id,
                     replacement_run_id=args.replacement_run_id,
-                    replacement_row=replacement,
+                    replacement_row=stored_replacement,
                     reason=args.reason,
                     operator=args.operator,
                     tool="llmb",

@@ -1425,6 +1425,40 @@ def primary_row_by_hash(paths: CampaignPaths, row_hash: str) -> Dict[str, Any]:
     return dict(matches[0])
 
 
+def stored_replacement_row_by_hash(*, campaign_id: str, run_id: str, row_hash: str,
+                                   campaigns_root: Path = CAMPAIGNS_ROOT) -> Dict[str, Any]:
+    """Resolve one replacement row from stored campaign evidence by exact hash."""
+    replacement_paths = resolve_paths(campaign_id, campaigns_root=campaigns_root)
+    if not replacement_paths.manifest.exists():
+        raise CampaignError("replacement_campaign_not_found")
+    load_manifest(replacement_paths)
+    if run_id == "primary":
+        evidence_path = replacement_paths.primary_raw_results
+    else:
+        evidence_path = replacement_paths.evidence_dir / run_id / "raw_results.jsonl"
+    if not evidence_path.exists():
+        raise CampaignError("replacement_evidence_location_not_found")
+    matches = _source_lookup(_read_jsonl(evidence_path)).get(str(row_hash), [])
+    if not matches:
+        raise CampaignError("replacement_row_hash_not_found")
+    if len(matches) > 1:
+        raise CampaignError("ambiguous_replacement_row_hash")
+    return dict(matches[0])
+
+
+def validate_replacement_provenance_matches_source(source_row: Dict[str, Any],
+                                                   replacement_row: Dict[str, Any]) -> None:
+    checks = (
+        ("task", source_row.get("task"), replacement_row.get("task")),
+        ("model", source_row.get("model"), replacement_row.get("model")),
+        ("model_digest", source_row.get("model_digest_resolved") or source_row.get("model_digest"),
+         replacement_row.get("model_digest_resolved") or replacement_row.get("model_digest")),
+    )
+    for label, source_value, replacement_value in checks:
+        if source_value not in (None, "") and replacement_value not in (None, "") and str(source_value) != str(replacement_value):
+            raise CampaignError(f"replacement_{label}_contradicts_source")
+
+
 def reconcile_recovery_rows(rows: List[Dict[str, Any]], *, excluded: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Make recovery eligibility a complete row-level accounting, never an allowlist.
 
