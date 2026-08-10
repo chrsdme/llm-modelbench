@@ -11,6 +11,7 @@ Current user and contributor documentation is kept concise and release-neutral.
 - [CAPABILITY_ROUTING.md](CAPABILITY_ROUTING.md), model selection and capability probes
 - [RUNTIMES.md](RUNTIMES.md), runtime profiles, backend boundaries, and telemetry
 - [CAMPAIGNS.md](CAMPAIGNS.md), isolated campaign lifecycle and adoption controls
+- [ACCEPTANCE_CONTROLS.md](ACCEPTANCE_CONTROLS.md), verified judge, recovery, supersession, config, and readiness controls
 - [RANKINGS.md](RANKINGS.md), persistent rankings and model history
 - [JUDGE_DUMPS.md](JUDGE_DUMPS.md), post-hoc judging
 - [REPAIR.md](REPAIR.md), bounded recovery and provenance

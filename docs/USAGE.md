@@ -61,6 +61,22 @@ llm-modelbench run --mock --level short --allow-host-code-execution --run-id dem
 Mock mode is deterministic and useful for validating the harness, reports, and
 operator workflows without Ollama or a GPU.
 
+## Campaign acceptance controls
+
+```bash
+llm-modelbench campaign init campaign.json
+llm-modelbench campaign execute --config campaign.json --mock
+llm-modelbench campaign supersede --campaign-id CAMPAIGN_ID --source-row-hash HASH \
+  --replacement-run-id synthetic-catchup --replacement-row corrected-row.json \
+  --reason corrected_synthetic_evidence --dry-run
+```
+
+`campaign init` writes the current strict config schema. `campaign execute
+--config` validates it, records an immutable config signature, refuses changed
+config for an existing campaign, and stops before adoption. `campaign
+supersede` appends validated supersession evidence; it does not rewrite primary
+rows. See [ACCEPTANCE_CONTROLS.md](ACCEPTANCE_CONTROLS.md).
+
 ## Reporting
 
 ```bash
@@ -221,4 +237,5 @@ Use the CLI as the source of truth for supported options:
 .venv/bin/python -m llm_modelbench judge-dumps --help
 .venv/bin/python -m llm_modelbench rankings --help
 .venv/bin/python -m llm_modelbench wizard --help
+.venv/bin/python -m llm_modelbench campaign --help
 ```

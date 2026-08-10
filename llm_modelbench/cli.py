@@ -1685,14 +1685,38 @@ def build_parser():
                     help="subjective scoring mode used for sample planning; default: off")
     pl.add_argument("--json", action="store_true")
 
-    camp = sub.add_parser("campaign", help="manage isolated campaign workspaces")
+    camp = sub.add_parser(
+        "campaign",
+        help="manage isolated campaign workspaces",
+        description=(
+            "Manage isolated campaign workspaces. Config execution is strict and "
+            "records an immutable plan signature; supersession appends validated "
+            "evidence and never rewrites primary rows."
+        ),
+    )
     camp_sub = camp.add_subparsers(dest="campaign_cmd", required=True)
     camp_init = camp_sub.add_parser("init", help="write a declarative campaign JSON template")
     camp_init.add_argument("path", nargs="?", default="campaign.json")
-    camp_execute = camp_sub.add_parser("execute", help="execute the normal campaign lifecycle from one config")
-    camp_execute.add_argument("--config", dest="campaign_config", required=True, help="campaign JSON created by campaign init")
-    camp_execute.add_argument("--mock", action="store_true")
-    camp_supersede = camp_sub.add_parser("supersede", help="append immutable corrected-evidence supersession")
+    camp_execute = camp_sub.add_parser(
+        "execute",
+        help="execute strict campaign config with immutable plan signature",
+        description=(
+            "Validate a campaign JSON file, execute the normal campaign lifecycle, "
+            "and persist the immutable plan signature. Existing campaigns must "
+            "have the same signature; interrupted campaigns require campaign resume."
+        ),
+    )
+    camp_execute.add_argument("--config", dest="campaign_config", required=True, help="strict campaign JSON created by campaign init")
+    camp_execute.add_argument("--mock", action="store_true", help="use the deterministic offline mock backend")
+    camp_supersede = camp_sub.add_parser(
+        "supersede",
+        help="append immutable corrected-evidence supersession",
+        description=(
+            "Append one schema-versioned source-to-replacement evidence edge. "
+            "The source hash must identify primary evidence; forks, cycles, "
+            "unsupported schemas, and hash/provenance contradictions fail closed."
+        ),
+    )
     camp_supersede.add_argument("--campaign-id", required=True)
     camp_supersede.add_argument("--source-campaign-id")
     camp_supersede.add_argument("--source-run-id", default="primary")

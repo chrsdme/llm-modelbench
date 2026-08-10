@@ -4,6 +4,9 @@ Campaign mode is the release-quality workflow for benchmark evidence that may
 later be adopted into canonical rankings. All campaign artifacts are rooted
 under `campaigns/<campaign-id>/`; campaign commands must not write root-level
 packages, logs, recovery children, judge sidecars, or candidate ranking stores.
+For the current acceptance-control contracts, including strict config
+execution and supersession behavior, see
+[Acceptance controls](ACCEPTANCE_CONTROLS.md).
 
 ## Operator sequence
 
@@ -21,6 +24,18 @@ The normal sequence is:
 10. complete verified package creation;
 11. human adoption preview;
 12. exact typed canonical adoption decision.
+
+The declarative entry point is:
+
+```bash
+./llmb campaign init campaign.json
+./llmb campaign execute --config campaign.json --mock
+```
+
+The config schema is strict and versioned. Unknown keys, unsupported schema
+versions, changed config for an existing campaign, and interrupted-state
+execution all fail before evidence is changed. `campaign execute --config`
+records an immutable config signature and stops before adoption.
 
 `./llmb campaign run --campaign-id <id> --unattended-safe --yes ...` uses the
 same orchestration path for planning, generation, recovery, judging, readiness,
@@ -74,6 +89,11 @@ capability/environment/harness status.
 Readiness requires every applicable cell to be terminal, package verification
 to pass, and no unresolved harness, manual, or external-judge blocker. Recovered
 does not imply correct: recovered visible wrong rows remain wrong.
+
+Valid supersession chains are resolved transitively into effective rows while
+retaining the full supporting chain. Forks, cycles, unsupported supersession
+schemas, malformed ledgers, and mutable native deactivation attempts fail
+closed.
 
 ## Package
 

@@ -23,6 +23,9 @@ _EXCLUDED_DIR_NAMES = {
     "rankings-separate",
     "snapshots",
     "local_only",
+    "codex_log",
+    "codex_logs",
+    "codex_prompts",
     ".git",
 }
 
@@ -84,6 +87,8 @@ def test_known_host_hardware_identifiers_are_not_publicly_tracked():
     tracked = subprocess.check_output(["git", "ls-files"], cwd=ROOT, text=True).splitlines()
     for relative in tracked:
         path = ROOT / relative
+        if not path.exists():
+            continue
         if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".pyc", ".zip"}:
             continue
         text = path.read_text(errors="ignore")

@@ -154,7 +154,8 @@ campaign with `campaign migrate-legacy`; migration is copy-only. Cleanup
 defaults to dry-run, retains forensic evidence, and campaign-mode commands are
 tested not to leak root-level artifacts.
 
-See [campaign methodology](docs/CAMPAIGNS.md).
+See [campaign methodology](docs/CAMPAIGNS.md) and
+[acceptance controls](docs/ACCEPTANCE_CONTROLS.md).
 
 ## Validation and diagnostics
 
