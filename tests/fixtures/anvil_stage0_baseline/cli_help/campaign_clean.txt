@@ -1,0 +1,11 @@
+usage: llm-modelbench campaign clean [-h] [--all] [--apply | --dry-run]
+                                     [campaign_id]
+
+positional arguments:
+  campaign_id
+
+options:
+  -h, --help   show this help message and exit
+  --all        process all eligible campaigns and report unsafe skips
+  --apply      remove only listed disposable campaign dumps
+  --dry-run    preview only (default)

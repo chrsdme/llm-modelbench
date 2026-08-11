@@ -1,0 +1,13 @@
+usage: llm-modelbench runtime [-h] {discover,list,show,save,delete,select} ...
+
+positional arguments:
+  {discover,list,show,save,delete,select}
+    discover            bounded read-only local runtime discovery
+    list                list saved runtime profiles
+    show                show one saved runtime profile
+    save                save one external runtime profile
+    delete              delete only one saved runtime profile
+    select              select a healthy discovered runtime
+
+options:
+  -h, --help            show this help message and exit

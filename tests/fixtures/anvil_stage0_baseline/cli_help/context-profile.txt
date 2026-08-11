@@ -1,0 +1,45 @@
+usage: llm-modelbench context-profile [-h] --model MODEL
+                                      [--runtime-profile RUNTIME_PROFILE]
+                                      [--run-id RUN_ID] [--runs-dir RUNS_DIR]
+                                      [--rankings-out RANKINGS_OUT]
+                                      [--cards-out CARDS_OUT]
+                                      [--target-ctx TARGET_CTX]
+                                      [--gpu-vram-gb GPU_VRAM_GB]
+                                      [--emergency-headroom-gb EMERGENCY_HEADROOM_GB]
+                                      [--max-spill-gb MAX_SPILL_GB]
+                                      [--min-tps MIN_TPS]
+                                      [--critical-tps CRITICAL_TPS]
+                                      [--live-ui {off,compact,full,graph,log}]
+                                      [--behavior-probe] [--no-behavior-probe]
+                                      [--yes] [--mock] [--no-ranking-update]
+                                      [--separate-ranking]
+
+options:
+  -h, --help            show this help message and exit
+  --model MODEL         exact installed Ollama model name
+  --runtime-profile RUNTIME_PROFILE
+                        saved runtime profile; explicit selection takes
+                        precedence
+  --run-id RUN_ID
+  --runs-dir RUNS_DIR
+  --rankings-out RANKINGS_OUT
+                        rankings directory refreshed after the profile;
+                        default: rankings
+  --cards-out CARDS_OUT
+  --target-ctx TARGET_CTX
+  --gpu-vram-gb GPU_VRAM_GB
+  --emergency-headroom-gb EMERGENCY_HEADROOM_GB
+  --max-spill-gb MAX_SPILL_GB
+  --min-tps MIN_TPS
+  --critical-tps CRITICAL_TPS
+  --live-ui {off,compact,full,graph,log}
+  --behavior-probe      also run a synthetic 64k recall/structure/speed probe
+                        (default on)
+  --no-behavior-probe   skip the synthetic behavior probe; telemetry
+                        validation will cover needle only
+  --yes
+  --mock
+  --no-ranking-update   write the diagnostic run but skip rankings/model-card
+                        refresh
+  --separate-ranking    generate an isolated rankings-separate/<run-id> report
+                        for this diagnostic profile

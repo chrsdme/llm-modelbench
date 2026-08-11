@@ -1,0 +1,8 @@
+usage: llm-modelbench pack-subjective [-h] [--run-id RUN_ID] [--out OUT]
+                                      [--mock]
+
+options:
+  -h, --help       show this help message and exit
+  --run-id RUN_ID
+  --out OUT
+  --mock

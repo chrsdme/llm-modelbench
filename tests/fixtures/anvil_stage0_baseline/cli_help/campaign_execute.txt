@@ -1,0 +1,11 @@
+usage: llm-modelbench campaign execute [-h] --config CAMPAIGN_CONFIG [--mock]
+
+Validate a campaign JSON file, execute the normal campaign lifecycle, and
+persist the immutable plan signature. Existing campaigns must have the same
+signature; interrupted campaigns require campaign resume.
+
+options:
+  -h, --help            show this help message and exit
+  --config CAMPAIGN_CONFIG
+                        strict campaign JSON created by campaign init
+  --mock                use the deterministic offline mock backend

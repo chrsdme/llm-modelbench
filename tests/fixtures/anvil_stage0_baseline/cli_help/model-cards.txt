@@ -1,0 +1,8 @@
+usage: llm-modelbench model-cards [-h] [--rankings-dir RANKINGS_DIR]
+                                  [--runs-dir RUNS_DIR] [--out OUT]
+
+options:
+  -h, --help            show this help message and exit
+  --rankings-dir RANKINGS_DIR
+  --runs-dir RUNS_DIR
+  --out OUT

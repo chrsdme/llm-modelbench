@@ -1,0 +1,12 @@
+usage: llm-modelbench campaign migrate-legacy [-h] --run-id RUN_ID
+                                              --campaign-id CAMPAIGN_ID
+                                              [--runs-dir RUNS_DIR] [--apply |
+                                              --dry-run]
+
+options:
+  -h, --help            show this help message and exit
+  --run-id RUN_ID
+  --campaign-id CAMPAIGN_ID
+  --runs-dir RUNS_DIR
+  --apply
+  --dry-run             preview only (default)

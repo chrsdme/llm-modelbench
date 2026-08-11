@@ -1,0 +1,10 @@
+usage: llm-modelbench dossier [-h] --ledger LEDGER [--runs-dir RUNS_DIR]
+                              [--out OUT] [--weights WEIGHTS] [--json]
+
+options:
+  -h, --help           show this help message and exit
+  --ledger LEDGER
+  --runs-dir RUNS_DIR
+  --out OUT
+  --weights WEIGHTS
+  --json

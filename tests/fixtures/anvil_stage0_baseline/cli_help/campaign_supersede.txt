@@ -1,0 +1,36 @@
+usage: llm-modelbench campaign supersede [-h] --campaign-id CAMPAIGN_ID
+                                         [--source-campaign-id SOURCE_CAMPAIGN_ID]
+                                         [--source-run-id SOURCE_RUN_ID]
+                                         [--source-row SOURCE_ROW]
+                                         [--source-row-hash SOURCE_ROW_HASH]
+                                         [--replacement-campaign-id REPLACEMENT_CAMPAIGN_ID]
+                                         --replacement-run-id REPLACEMENT_RUN_ID
+                                         --replacement-row REPLACEMENT_ROW
+                                         [--replacement-row-hash REPLACEMENT_ROW_HASH]
+                                         --reason REASON [--operator OPERATOR]
+                                         [--dry-run]
+
+Append one schema-versioned source-to-replacement evidence edge. The source
+hash must identify primary evidence; forks, cycles, unsupported schemas, and
+hash/provenance contradictions fail closed.
+
+options:
+  -h, --help            show this help message and exit
+  --campaign-id CAMPAIGN_ID
+  --source-campaign-id SOURCE_CAMPAIGN_ID
+  --source-run-id SOURCE_RUN_ID
+  --source-row SOURCE_ROW
+                        JSON file used only to derive/confirm the immutable
+                        source row hash
+  --source-row-hash SOURCE_ROW_HASH
+                        immutable source row hash from campaign primary
+                        evidence
+  --replacement-campaign-id REPLACEMENT_CAMPAIGN_ID
+  --replacement-run-id REPLACEMENT_RUN_ID
+  --replacement-row REPLACEMENT_ROW
+                        JSON file containing the corrected row
+  --replacement-row-hash REPLACEMENT_ROW_HASH
+                        expected corrected row hash
+  --reason REASON
+  --operator OPERATOR
+  --dry-run             validate and preview without appending

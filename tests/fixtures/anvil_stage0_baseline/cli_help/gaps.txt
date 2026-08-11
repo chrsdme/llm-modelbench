@@ -1,0 +1,8 @@
+usage: llm-modelbench gaps [-h] --ledger LEDGER [--json] [--mock]
+
+options:
+  -h, --help       show this help message and exit
+  --ledger LEDGER
+  --json
+  --mock           check gaps against the offline stub model list, no Ollama
+                   needed

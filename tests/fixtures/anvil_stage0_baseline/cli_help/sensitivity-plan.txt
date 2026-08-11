@@ -1,0 +1,23 @@
+usage: llm-modelbench sensitivity-plan [-h] [--run-prefix RUN_PREFIX]
+                                       [--include-regex INCLUDE_REGEX]
+                                       [--tasks TASKS]
+                                       [--level {smoke,short,full}]
+                                       [--ctx-values CTX_VALUES]
+                                       [--num-predict-values NUM_PREDICT_VALUES]
+                                       [--judge {single,panel,off}]
+                                       [--fingerprint]
+                                       [--needle-max-ctx NEEDLE_MAX_CTX]
+
+options:
+  -h, --help            show this help message and exit
+  --run-prefix RUN_PREFIX
+  --include-regex INCLUDE_REGEX
+  --tasks TASKS
+  --level {smoke,short,full}
+  --ctx-values CTX_VALUES
+  --num-predict-values NUM_PREDICT_VALUES
+  --judge {single,panel,off}
+  --fingerprint
+  --needle-max-ctx NEEDLE_MAX_CTX
+                        operator cap for generated needle sensitivity runs;
+                        defaults to 40960 when tasks include needle

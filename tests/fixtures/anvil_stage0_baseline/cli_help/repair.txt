@@ -1,0 +1,93 @@
+usage: llm-modelbench repair [-h] (--run-id RUN_ID | --run-prefix RUN_PREFIX |
+                             --everything) [--runs-dir RUNS_DIR]
+                             [--rankings-out RANKINGS_OUT]
+                             [--plan-out PLAN_OUT] [--apply | --dry-run]
+                             [--yes] [--judge {off,single,panel}]
+                             [--judge-model JUDGE_MODEL]
+                             [--num-predict NUM_PREDICT]
+                             [--no-transient-retry] [--no-missing-tasks]
+                             [--emergency-headroom-gb EMERGENCY_HEADROOM_GB]
+                             [--max-spill-gb MAX_SPILL_GB]
+                             [--kv-type {current,q8_0,q4_0}]
+                             [--gpu-vram-gb GPU_VRAM_GB] [--confirm-kv-server]
+                             [--kv-cascade] [--restart-ollama]
+                             [--ollama-service OLLAMA_SERVICE]
+                             [--keep-final-kv] [--reuse-sudo-credentials]
+                             [--auto-confirm] [--force]
+                             [--live-ui {off,compact,full,log}] [--mock]
+                             [--runtime-profile RUNTIME_PROFILE]
+                             [--no-ranking-update] [--separate-ranking]
+
+options:
+  -h, --help            show this help message and exit
+  --run-id RUN_ID       repair one run under --runs-dir
+  --run-prefix RUN_PREFIX
+                        repair every run whose ID starts with this prefix
+  --everything          scan every run under --runs-dir
+  --runs-dir RUNS_DIR
+  --rankings-out RANKINGS_OUT
+                        rankings directory refreshed after --apply; default:
+                        rankings
+  --plan-out PLAN_OUT   write the repair plan JSON to this path
+  --apply               execute the printed bounded repair plan
+  --dry-run             explicitly request planning only; this is also the
+                        default when --apply is omitted
+  --yes                 approve the printed repair plan in non-interactive
+                        execution
+  --judge {off,single,panel}
+                        post-hoc judge eligible subjective dumps as part of
+                        repair
+  --judge-model JUDGE_MODEL
+                        local Ollama judge model
+  --num-predict NUM_PREDICT
+                        bounded output budget for thinking-only/empty-output
+                        recovery
+  --no-transient-retry  report HTTP 5xx/timeouts but do not schedule one retry
+  --no-missing-tasks    repair only explicit failed rows, not absent/stale
+                        applicable tasks
+  --emergency-headroom-gb EMERGENCY_HEADROOM_GB
+                        physical VRAM kept free during guarded needle planning
+  --max-spill-gb MAX_SPILL_GB
+                        maximum estimated system-RAM spill permitted for
+                        guarded needle retries
+  --kv-type {current,q8_0,q4_0}
+                        required Ollama KV-cache type for needle repair;
+                        explicit values require server setup/restart
+  --gpu-vram-gb GPU_VRAM_GB
+                        override detected physical GPU VRAM for offline
+                        planning or unusual drivers
+  --confirm-kv-server   assert that the running Ollama service was restarted
+                        with --kv-type when process environment cannot be
+                        inspected
+  --kv-cascade          current/default-KV first; use q8_0 then unresolved-
+                        only q4_0 only for remaining guarded needle work
+  --restart-ollama      allow the explicit KV cascade to install a temporary
+                        systemd drop-in and restart Ollama
+  --ollama-service OLLAMA_SERVICE
+                        deprecated display hint; the privileged broker always
+                        discovers the sole Ollama unit owning the configured
+                        port
+  --keep-final-kv       do not restore the original Ollama service drop-in
+                        after the cascade
+  --reuse-sudo-credentials
+                        do not invalidate sudo's cached timestamp before each
+                        privileged phase
+  --auto-confirm        fully unattended apply mode for --restart-ollama --kv-
+                        cascade: implies --yes, skips typed
+                        DISCOVER/VERIFY/RESTART confirmations, and uses sudo
+                        -n only. Requires a scoped NOPASSWD sudoers rule for
+                        the dedicated broker in docs/auto_confirm_sudoers.md.
+                        Does not store or read a password. Off by default.
+  --force               allow a previously recorded repair action to be
+                        planned again
+  --live-ui {off,compact,full,log}
+                        inline repair-aware dashboard for child runs; detached
+                        llmb-watch remains supported
+  --mock                offline deterministic repair pipeline test
+  --runtime-profile RUNTIME_PROFILE
+                        saved runtime profile; explicit selection takes
+                        precedence
+  --no-ranking-update   write repair evidence but skip automatic rankings
+                        refresh
+  --separate-ranking    generate an isolated rankings-separate/<plan-id>
+                        report for repair children

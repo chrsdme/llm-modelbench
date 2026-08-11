@@ -1,0 +1,85 @@
+usage: llm-modelbench campaign plan [-h] --campaign-id CAMPAIGN_ID
+                                    [--runtime-profile RUNTIME_PROFILE]
+                                    [--level {smoke,short,full}]
+                                    [--categories CATEGORIES] [--tasks TASKS]
+                                    [--task-regex TASK_REGEX]
+                                    [--family-base-only]
+                                    [--context-aliases-only] [--context-only]
+                                    [--allow-host-code-execution]
+                                    [--models MODELS | --all | --select]
+                                    [--auto | --no-auto-probe]
+                                    [--include-regex INCLUDE_REGEX]
+                                    [--exclude-regex EXCLUDE_REGEX]
+                                    [--skip-offload] [--ctx CTX]
+                                    [--num-predict NUM_PREDICT]
+                                    [--think {auto,on,off}]
+                                    [--needle-max-ctx NEEDLE_MAX_CTX]
+                                    [--judge-model JUDGE_MODEL]
+                                    [--samples SAMPLES]
+                                    [--sample-mode {smart,all}] [--mock]
+                                    [--plan-json PLAN_JSON] [--judge {off}]
+
+Create or inspect the immutable pre-generation campaign plan. This command
+does not run fingerprint probes; --no-fingerprint is available only on
+campaign run.
+
+options:
+  -h, --help            show this help message and exit
+  --campaign-id CAMPAIGN_ID
+  --runtime-profile RUNTIME_PROFILE
+                        saved runtime profile; explicit selection takes
+                        precedence
+  --level {smoke,short,full}
+  --categories CATEGORIES
+                        comma-separated category filter
+  --tasks TASKS         comma-separated task IDs to run, e.g.
+                        py_anagram,json_extract,needle
+  --task-regex TASK_REGEX
+                        regex over task id/category/scorer, e.g.
+                        needle|context
+  --family-base-only    skip obvious context aliases such as 64k/128k/ctx/exp
+                        variants
+  --context-aliases-only
+                        run only obvious context aliases such as
+                        64k/128k/ctx/exp variants
+  --context-only        run only long-context/needle tasks; combine with
+                        --context-aliases-only for alias validation
+  --allow-host-code-execution
+                        explicitly permit deterministic scorers to execute
+                        model-generated Python/JavaScript on this host; use
+                        only inside a disposable container or VM
+  --models MODELS       exact installed model names separated by semicolons
+  --all                 explicitly select every model returned by Ollama (also
+                        the default when no selector is given)
+  --select              interactive MODEL selector only; test scope still
+                        comes from --level/--categories/--tasks
+  --auto                run small functional capability probes before routing
+                        tasks
+  --no-auto-probe       route from metadata/operator profiles only; skips pre-
+                        run functional probes
+  --include-regex INCLUDE_REGEX
+  --exclude-regex EXCLUDE_REGEX
+  --skip-offload        skip models that exceed the VRAM budget
+  --ctx CTX             override Ollama num_ctx for all chat calls in this run
+  --num-predict NUM_PREDICT
+                        override Ollama num_predict for all normal task
+                        generations
+  --think {auto,on,off}
+                        control Ollama thinking where supported; auto leaves
+                        server/model default
+  --needle-max-ctx NEEDLE_MAX_CTX
+                        operator safety cap for needle probe num_ctx; larger
+                        probes are skipped and coverage drops
+  --judge-model JUDGE_MODEL
+                        local Ollama model used for subjective judging,
+                        default from config/env
+  --samples SAMPLES     requested runs per sampled task; smart mode applies
+                        this only to judged tasks
+  --sample-mode {smart,all}
+                        smart=sample only subjective/judged tasks; all=old
+                        behavior, sample every task
+  --mock                run fully offline against a deterministic stub
+  --plan-json PLAN_JSON
+                        write the computed plan JSON to this path
+  --judge {off}         campaign primary generation is planned with judge mode
+                        off

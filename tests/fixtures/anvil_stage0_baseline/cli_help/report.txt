@@ -1,0 +1,14 @@
+usage: llm-modelbench report [-h] [--run-id RUN_ID] [--out OUT]
+                             [--weights WEIGHTS] [--report-out REPORT_OUT]
+                             [--mock]
+
+options:
+  -h, --help            show this help message and exit
+  --run-id RUN_ID
+  --out OUT             run directory (if not using --run-id)
+  --weights WEIGHTS     report-time category overrides, e.g.
+                        coding_python=0.4,agentic_tool=0.3
+  --report-out REPORT_OUT
+                        separate output directory for --weights; defaults to a
+                        sibling override copy
+  --mock

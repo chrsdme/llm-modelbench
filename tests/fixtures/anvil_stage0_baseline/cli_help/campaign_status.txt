@@ -1,0 +1,7 @@
+usage: llm-modelbench campaign status [-h] campaign_id
+
+positional arguments:
+  campaign_id
+
+options:
+  -h, --help   show this help message and exit

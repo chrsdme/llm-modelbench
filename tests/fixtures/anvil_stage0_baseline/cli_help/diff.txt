@@ -1,0 +1,11 @@
+usage: llm-modelbench diff [-h] --a A --b B [--out OUT]
+                           [--noise-band NOISE_BAND]
+
+options:
+  -h, --help            show this help message and exit
+  --a A                 first run directory
+  --b B                 second run directory
+  --out OUT             output markdown path, default: <b>/diff.md
+  --noise-band NOISE_BAND
+                        label deltas within this repeatability band as
+                        tied/noise-band

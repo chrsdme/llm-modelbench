@@ -1,0 +1,43 @@
+usage: llm-modelbench rankings [-h] [--runs-dir RUNS_DIR] [--out OUT]
+                               [--rescan] [--watch] [--interval INTERVAL]
+                               [--exclude-model EXCLUDE_MODEL]
+                               [--include-model INCLUDE_MODEL]
+                               [--exclude-run EXCLUDE_RUN]
+                               [--include-run INCLUDE_RUN]
+                               [--archive-run ARCHIVE_RUN]
+                               [--unarchive-run UNARCHIVE_RUN]
+                               [--reason REASON] [--list-excluded]
+                               [--include-separate] [--adopt ADOPT_CAMPAIGN]
+                               [--dry-run]
+
+options:
+  -h, --help            show this help message and exit
+  --runs-dir RUNS_DIR   where to read runs from
+  --out OUT             generated rankings database directory
+  --rescan              force every currently present run to be reread;
+                        deleted-run history remains preserved
+  --watch               keep rescanning for run/judge sidecar changes
+  --interval INTERVAL   seconds between --watch scans
+  --exclude-model EXCLUDE_MODEL
+                        non-destructively hide one model name or digest from
+                        this rankings output
+  --include-model INCLUDE_MODEL
+                        reverse --exclude-model for one model name or digest
+  --exclude-run EXCLUDE_RUN
+                        non-destructively hide one run ID from this rankings
+                        output
+  --include-run INCLUDE_RUN
+                        reverse --exclude-run for one run ID
+  --archive-run ARCHIVE_RUN
+                        mark one run ID archived/hidden from normal rankings
+  --unarchive-run UNARCHIVE_RUN
+                        reverse --archive-run for one run ID
+  --reason REASON       generic public-safe reason saved with
+                        include/exclude/archive operations
+  --list-excluded       print rankings exclusions and exit unless combined
+                        with --rescan
+  --include-separate    include runs marked separate/diagnostic in this output
+  --adopt ADOPT_CAMPAIGN
+                        adopt one validated campaign; arbitrary source
+                        directories are refused
+  --dry-run             preview campaign adoption without canonical mutation

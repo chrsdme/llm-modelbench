@@ -1,0 +1,18 @@
+usage: llm-modelbench runtime save [-h] --name NAME
+                                   --backend {ollama,llama_cpp}
+                                   --endpoint ENDPOINT [--gpu-uuid GPU_UUID]
+                                   [--description DESCRIPTION]
+                                   [--provenance {configured,discovered,legacy-default}]
+                                   [--set-default] [--replace] [--yes]
+
+options:
+  -h, --help            show this help message and exit
+  --name NAME
+  --backend {ollama,llama_cpp}
+  --endpoint ENDPOINT
+  --gpu-uuid GPU_UUID
+  --description DESCRIPTION
+  --provenance {configured,discovered,legacy-default}
+  --set-default
+  --replace
+  --yes

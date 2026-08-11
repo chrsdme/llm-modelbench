@@ -1,0 +1,16 @@
+usage: llm-modelbench simulate [-h] [--run-dir RUN_DIR]
+                               [--simulate-vram SIMULATE_VRAM] [--json]
+                               {repair-watch} ...
+
+positional arguments:
+  {repair-watch}
+    repair-watch        replay deterministic repair status transitions without
+                        Ollama or GPU work
+
+options:
+  -h, --help            show this help message and exit
+  --run-dir RUN_DIR     legacy: finished run directory containing
+                        raw_results.jsonl
+  --simulate-vram SIMULATE_VRAM
+                        legacy: hypothetical VRAM budget in GB
+  --json

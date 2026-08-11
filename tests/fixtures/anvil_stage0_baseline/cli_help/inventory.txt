@@ -1,0 +1,11 @@
+usage: llm-modelbench inventory [-h] [--json] [--mock] [--auto]
+                                [--runtime-profile RUNTIME_PROFILE]
+
+options:
+  -h, --help            show this help message and exit
+  --json
+  --mock                use offline stub model list
+  --auto                also run functional capability probes
+  --runtime-profile RUNTIME_PROFILE
+                        saved runtime profile; explicit selection takes
+                        precedence

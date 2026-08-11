@@ -1,0 +1,11 @@
+usage: llm-modelbench runtime select [-h] [--runtime-profile RUNTIME_PROFILE]
+                                     [--save-name SAVE_NAME] [--set-default]
+                                     [--replace] [--yes]
+
+options:
+  -h, --help            show this help message and exit
+  --runtime-profile RUNTIME_PROFILE
+  --save-name SAVE_NAME
+  --set-default
+  --replace
+  --yes

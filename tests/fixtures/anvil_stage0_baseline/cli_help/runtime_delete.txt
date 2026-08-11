@@ -1,0 +1,8 @@
+usage: llm-modelbench runtime delete [-h] [--yes] name
+
+positional arguments:
+  name
+
+options:
+  -h, --help  show this help message and exit
+  --yes

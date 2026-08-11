@@ -1,0 +1,12 @@
+usage: llm-modelbench serve [-h] --runs-dir RUNS_DIR [--port PORT]
+                            [--host HOST] [--allow-remote] [--allow-empty]
+
+options:
+  -h, --help           show this help message and exit
+  --runs-dir RUNS_DIR  repeatable finished run directory
+  --port PORT
+  --host HOST
+  --allow-remote       permit binding outside loopback; exposes model/routing
+                       metadata on the network
+  --allow-empty        start even when no valid summary.json artifacts were
+                       loaded

@@ -1,0 +1,21 @@
+usage: llm-modelbench simulate repair-watch [-h]
+                                            [--scenario {capability-repair,needle-current,kv-cascade,interrupted-child,failed-child}]
+                                            [--speed SPEED]
+                                            [--runs-dir RUNS_DIR]
+                                            [--run-id RUN_ID] [--write-only]
+                                            [--cleanup]
+                                            [--screen {auto,normal,scroll}]
+                                            [--json]
+
+options:
+  -h, --help            show this help message and exit
+  --scenario {capability-repair,needle-current,kv-cascade,interrupted-child,failed-child}
+  --speed SPEED         seconds between deterministic status transitions; 0
+                        runs immediately
+  --runs-dir RUNS_DIR
+  --run-id RUN_ID       stable fixture campaign directory name
+  --write-only          write fixture files without rendering; attach llmb-
+                        watch separately
+  --cleanup             remove fixture directories after replay
+  --screen {auto,normal,scroll}
+  --json

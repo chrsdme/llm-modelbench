@@ -1,0 +1,36 @@
+usage: llm-modelbench judge-dumps [-h] (--run-id RUN_ID | --out OUT |
+                                  --everything) [--runs-dir RUNS_DIR]
+                                  [--rankings-out RANKINGS_OUT]
+                                  [--judge {single,panel}]
+                                  [--judge-model JUDGE_MODEL] [--ctx CTX]
+                                  [--think {auto,on,off}] [--dry-run]
+                                  [--force] [--yes] [--mock]
+                                  [--runtime-profile RUNTIME_PROFILE]
+                                  [--no-ranking-update] [--separate-ranking]
+
+options:
+  -h, --help            show this help message and exit
+  --run-id RUN_ID       one run under --runs-dir
+  --out OUT             one explicit run directory
+  --everything          scan every run under --runs-dir and process eligible
+                        subjective dumps sequentially
+  --runs-dir RUNS_DIR   run root for --run-id or --everything
+  --rankings-out RANKINGS_OUT
+                        rankings database to refresh after judging; default:
+                        rankings
+  --judge {single,panel}
+  --judge-model JUDGE_MODEL
+                        local Ollama judge model
+  --ctx CTX             judge context override
+  --think {auto,on,off}
+  --dry-run             scan and print eligibility without calling the judge
+  --force               rejudge rows already judged by the same model/mode
+  --yes                 approve the printed judge batch without an interactive
+                        prompt
+  --mock                offline deterministic judge for pipeline testing
+  --runtime-profile RUNTIME_PROFILE
+                        saved runtime profile; explicit selection takes
+                        precedence
+  --no-ranking-update   write judgements but skip automatic rankings refresh
+  --separate-ranking    generate an isolated rankings-separate/<run-id> report
+                        after judging

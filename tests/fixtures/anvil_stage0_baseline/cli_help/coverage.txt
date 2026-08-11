@@ -1,0 +1,10 @@
+usage: llm-modelbench coverage [-h] --ledger LEDGER [--run-dir RUN_DIR]
+                               {update,show}
+
+positional arguments:
+  {update,show}
+
+options:
+  -h, --help         show this help message and exit
+  --ledger LEDGER
+  --run-dir RUN_DIR

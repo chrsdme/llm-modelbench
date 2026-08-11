@@ -1,0 +1,8 @@
+usage: llm-modelbench sensitivity-report [-h] [--out OUT] runs [runs ...]
+
+positional arguments:
+  runs        run directories to read
+
+options:
+  -h, --help  show this help message and exit
+  --out OUT   write markdown report path

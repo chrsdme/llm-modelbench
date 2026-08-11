@@ -1,0 +1,39 @@
+usage: llm-modelbench watch [-h] [--run-id RUN_ID] [--out OUT]
+                            [--runs-dir RUNS_DIR]
+                            [--layout {full,compact,bars,failures,hardware,repair,context,interactive}]
+                            [--refresh REFRESH] [--no-clear] [--follow-queue]
+                            [--no-follow-queue] [--idle-grace IDLE_GRACE]
+                            [--screen {auto,alternate,normal,scroll}] [--once]
+                            [--exit-when-done] [--mock]
+
+options:
+  -h, --help            show this help message and exit
+  --run-id RUN_ID       which run to watch; if omitted, auto-detects from
+                        --runs-dir (auto-picks if unambiguous, otherwise
+                        prompts)
+  --out OUT             run directory or base output directory (default: runs
+                        when --run-id is used)
+  --runs-dir RUNS_DIR   where to look for runs when --run-id/--out are omitted
+  --layout {full,compact,bars,failures,hardware,repair,context,interactive}
+  --refresh REFRESH
+  --no-clear            append frames instead of redrawing the terminal
+  --follow-queue        follow the whole queue: auto-advance to whatever run
+                        starts next once the current one finishes, until
+                        nothing new appears, then print a summary and exit.
+                        This is the default when no --run-id/--out/--once is
+                        given.
+  --no-follow-queue     opt out of queue-following; watch whatever's auto-
+                        picked (or --run-id/--out) once, the old single-run
+                        behavior
+  --idle-grace IDLE_GRACE
+                        with queue-following, seconds with no new run
+                        appearing before concluding the queue is finished
+                        (default 180)
+  --screen {auto,alternate,normal,scroll}
+                        rendering mode: auto/alternate keeps a single
+                        dashboard window; normal redraws current screen;
+                        scroll appends
+  --once                render one dashboard frame and exit
+  --exit-when-done      exit when a repair campaign reaches
+                        complete/partial/failed
+  --mock

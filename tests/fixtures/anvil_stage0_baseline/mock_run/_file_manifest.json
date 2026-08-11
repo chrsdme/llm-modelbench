@@ -1,0 +1,22 @@
+[
+  "capability_report.json",
+  "clones.md",
+  "config.json",
+  "filters.json",
+  "fingerprints.json",
+  "model_identities.json",
+  "prune.md",
+  "ranking_scope.json",
+  "raw_results.jsonl",
+  "regression.md",
+  "report.html",
+  "routing.md",
+  "run_validity.json",
+  "runtime_identity.json",
+  "scorecard.csv",
+  "scorecard.md",
+  "skipped_models.json",
+  "status.json",
+  "summary.json",
+  "summary_meta.json"
+]

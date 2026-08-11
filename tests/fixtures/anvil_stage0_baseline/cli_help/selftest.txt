@@ -1,0 +1,4 @@
+usage: llm-modelbench selftest [-h]
+
+options:
+  -h, --help  show this help message and exit

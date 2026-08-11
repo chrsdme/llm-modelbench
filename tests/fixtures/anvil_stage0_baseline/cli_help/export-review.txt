@@ -1,0 +1,8 @@
+usage: llm-modelbench export-review [-h] [--out OUT] runs [runs ...]
+
+positional arguments:
+  runs        run directories to include
+
+options:
+  -h, --help  show this help message and exit
+  --out OUT   zip output path

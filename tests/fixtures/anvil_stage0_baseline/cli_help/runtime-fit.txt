@@ -1,0 +1,27 @@
+usage: llm-modelbench runtime-fit [-h] --model MODEL
+                                  [--runtime-profile RUNTIME_PROFILE]
+                                  [--context CONTEXT]
+                                  [--reserve-mib RESERVE_MIB]
+                                  [--strategy {layer_split,tensor_split}]
+                                  [--allocation-weights ALLOCATION_WEIGHTS]
+                                  [--allow-cpu-spill] [--json] [--out OUT]
+                                  [--mock]
+
+options:
+  -h, --help            show this help message and exit
+  --model MODEL         exact model name already known to the selected runtime
+  --runtime-profile RUNTIME_PROFILE
+                        saved runtime profile; explicit selection takes
+                        precedence
+  --context CONTEXT     requested context; never silently clamped
+  --reserve-mib RESERVE_MIB
+                        per-device safety reserve in MiB
+  --strategy {layer_split,tensor_split}
+                        explicit multi-GPU strategy declaration
+  --allocation-weights ALLOCATION_WEIGHTS
+                        comma-separated GPU-UUID=weight layer allocations;
+                        never positional
+  --allow-cpu-spill     record CPU/RAM spill as an explicit conditional policy
+  --json                write deterministic JSON to stdout
+  --out OUT             optional JSON output path
+  --mock                use the offline deterministic model client

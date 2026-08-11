@@ -1,0 +1,51 @@
+usage: llm-modelbench [-h] [--version] [--config CONFIG] [--selftest]
+                      {inventory,runtime-fit,doctor,runtime,plan,campaign,run,watch,report,simulate,context-profile,model-cards,freeze,serve,pack-subjective,grade,judge-dumps,repair,wizard,diff,export-review,repeat-report,sensitivity-plan,sensitivity-report,coverage,gaps,dossier,rankings,selftest} ...
+
+Hardware-adaptive benchmark suite for local Ollama models.
+
+positional arguments:
+  {inventory,runtime-fit,doctor,runtime,plan,campaign,run,watch,report,simulate,context-profile,model-cards,freeze,serve,pack-subjective,grade,judge-dumps,repair,wizard,diff,export-review,repeat-report,sensitivity-plan,sensitivity-report,coverage,gaps,dossier,rankings,selftest}
+    inventory           list local models
+    runtime-fit         read-only conservative model-to-runtime GPU capacity
+                        assessment
+    doctor              preflight environment, import path, Ollama, GPU, disk
+    runtime             discover and manage external local runtime profiles
+    plan                show active models, skipped models, tasks, samples,
+                        and rough ETA without running
+    campaign            manage isolated campaign workspaces
+    run                 run the benchmark
+    watch               live terminal dashboard for a run
+    report              rebuild reports for a run
+    simulate            offline VRAM and watcher simulations
+    context-profile     run one controlled 64k-class needle telemetry profile
+    model-cards         generate standalone operating cards from master
+                        rankings
+    freeze              create a pre-release source/task/rankings regression
+                        snapshot
+    serve               serve read-only routing data from summary.json
+                        artifacts
+    pack-subjective     collate subjective outputs for grading
+    grade               blind human grading workflow for subjective outputs
+    judge-dumps         judge existing subjective dumps without rerunning
+                        tested models
+    repair              scan incomplete run evidence and apply bounded
+                        targeted recovery
+    wizard              interactive model + test-scope planner, capability
+                        probe, review, and run
+    diff                compare two run directories
+    export-review       zip useful run artefacts for GPT/Claude review
+    repeat-report       compare repeated runs at per-model/per-task level
+    sensitivity-plan    print a diagnostic config-sensitivity sweep script
+    sensitivity-report  summarise completed config-sensitivity runs
+    coverage            read or update the digest-keyed coverage ledger
+    gaps                advisory coverage gaps; never schedules runs
+    dossier             read-only composite over covered non-stale categories
+    rankings            merge every run into a persistent master database and
+                        HTML model-card report
+    selftest            verify scoring logic offline
+
+options:
+  -h, --help            show this help message and exit
+  --version             show program's version number and exit
+  --config CONFIG       path to a JSON or YAML config file
+  --selftest            run offline scorer tests and exit

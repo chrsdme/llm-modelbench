@@ -1,0 +1,9 @@
+usage: llm-modelbench grade [-h] [--run-id RUN_ID] [--out OUT]
+                            [--export-blind] [--mock]
+
+options:
+  -h, --help       show this help message and exit
+  --run-id RUN_ID
+  --out OUT
+  --export-blind   write a blind grading pack without prompting
+  --mock

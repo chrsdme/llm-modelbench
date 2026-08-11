@@ -1,0 +1,11 @@
+usage: llm-modelbench campaign resume [-h] [--runtime-profile RUNTIME_PROFILE]
+                                      campaign_id
+
+positional arguments:
+  campaign_id
+
+options:
+  -h, --help            show this help message and exit
+  --runtime-profile RUNTIME_PROFILE
+                        saved runtime profile; explicit selection takes
+                        precedence

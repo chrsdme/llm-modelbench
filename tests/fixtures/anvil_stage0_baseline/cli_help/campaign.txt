@@ -1,0 +1,24 @@
+usage: llm-modelbench campaign [-h]
+                               {init,execute,supersede,status,resume,package,clean,migrate-legacy,plan,run} ...
+
+Manage isolated campaign workspaces. Config execution is strict and records an
+immutable plan signature; supersession appends validated evidence and never
+rewrites primary rows.
+
+positional arguments:
+  {init,execute,supersede,status,resume,package,clean,migrate-legacy,plan,run}
+    init                write a declarative campaign JSON template
+    execute             execute strict campaign config with immutable plan
+                        signature
+    supersede           append immutable corrected-evidence supersession
+    status              show campaign lifecycle state
+    resume              resume the exact recorded interrupted campaign phase
+    package             write one campaign review package
+    clean               preview or apply conservative retained-evidence
+                        cleanup
+    migrate-legacy      copy a legacy run into a campaign
+    plan                create an isolated campaign plan
+    run                 run a primary benchmark inside a campaign
+
+options:
+  -h, --help            show this help message and exit

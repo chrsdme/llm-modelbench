@@ -1,0 +1,15 @@
+usage: llm-modelbench freeze [-h] [--repo-root REPO_ROOT]
+                             [--runs-dir RUNS_DIR]
+                             [--rankings-dir RANKINGS_DIR] --out OUT
+                             [--label LABEL] [--no-rankings-copy] [--verify]
+
+options:
+  -h, --help            show this help message and exit
+  --repo-root REPO_ROOT
+  --runs-dir RUNS_DIR
+  --rankings-dir RANKINGS_DIR
+  --out OUT
+  --label LABEL
+  --no-rankings-copy
+  --verify              verify an existing snapshot at --out without
+                        rebuilding it
