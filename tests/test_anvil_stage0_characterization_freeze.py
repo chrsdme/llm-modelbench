@@ -94,6 +94,16 @@ def _normalize(value: Any) -> Any:
                 # under --mock. Not a canned constant like tok/s or
                 # ttft_ms; expected to vary run to run.
                 out[key] = "<TELEMETRY>"
+            elif key in ("identity_hash", "runtime_identity_hash", "runtime_variant_id"):
+                # Real finding, caught by test_docs_hygiene.py's own
+                # known-host-hardware-identifier check on first fixture
+                # generation attempt: these hashes are derived from real
+                # physical GPU UUIDs/PCI bus IDs on whatever host generates
+                # them (see the GPU-UUID/PCI-bus-ID scrub below) -- so they
+                # are host-identifying, not just run-to-run volatile.
+                # Portable fixtures must not bake in a contributor's actual
+                # hardware identity.
+                out[key] = "<HOST_DERIVED_HASH>"
             else:
                 out[key] = _normalize(val)
         return out
@@ -118,14 +128,44 @@ def _normalize(value: Any) -> Any:
     return value
 
 
+# Real finding (not anticipated when this module was first written): GPU
+# UUIDs and PCI bus IDs from the *actual host running fixture generation*
+# leak into runtime-identity evidence even under --mock, because hardware
+# topology detection reflects real host capacity regardless of mock mode --
+# only the model-inference client is faked. Caught by this repo's own
+# test_docs_hygiene.py::test_known_host_hardware_identifiers_are_not_publicly_tracked
+# on the first fixture-generation attempt (it already guards against exactly
+# this class of leak, precedent from the RC15 public-readiness audit). These
+# appear as both dict *values* and dict *keys* (e.g. `pci_bus_ids: {"GPU-
+# xxx...": "0000:05:00.0"}`), so a value-only walk over the parsed structure
+# can't catch the key form -- scrub the serialized text directly instead,
+# with a stable per-fixture positional remap so structure (how many GPUs,
+# whether a UUID recurs across fields) stays checkable without the real
+# identifiers.
+_GPU_UUID_RE = re.compile(r"GPU-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_PCI_BUS_ID_RE = re.compile(r"\b[0-9a-fA-F]{8}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]\b")
+
+
+def _scrub_host_hardware_identifiers(text: str) -> str:
+    gpu_uuids = sorted(set(_GPU_UUID_RE.findall(text)))
+    for index, uuid in enumerate(gpu_uuids):
+        text = text.replace(uuid, f"<GPU_UUID_{index}>")
+    pci_ids = sorted(set(_PCI_BUS_ID_RE.findall(text)))
+    for index, pci_id in enumerate(pci_ids):
+        text = text.replace(pci_id, f"<PCI_BUS_ID_{index}>")
+    return text
+
+
 def _normalize_jsonl_text(text: str) -> str:
     lines = [line for line in text.splitlines() if line.strip()]
     normalized = [json.dumps(_normalize(json.loads(line)), sort_keys=True) for line in lines]
-    return "\n".join(normalized) + "\n"
+    return _scrub_host_hardware_identifiers("\n".join(normalized) + "\n")
 
 
 def _normalize_json_text(text: str) -> str:
-    return json.dumps(_normalize(json.loads(text)), sort_keys=True, indent=2) + "\n"
+    return _scrub_host_hardware_identifiers(
+        json.dumps(_normalize(json.loads(text)), sort_keys=True, indent=2) + "\n"
+    )
 
 
 def _run_mock_benchmark(out_dir: Path, run_id: str) -> Path:

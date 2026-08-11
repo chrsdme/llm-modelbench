@@ -54,8 +54,8 @@
           "backend": "ollama",
           "completeness": "complete",
           "declared_device_order": [
-            "GPU-5b99bce2-35ab-f6db-857b-72162069fa72",
-            "GPU-78077308-f4b2-3330-6d4e-19581d7b1511"
+            "<GPU_UUID_0>",
+            "<GPU_UUID_1>"
           ],
           "endpoint": "http://127.0.0.1:11434",
           "evidence_provenance": "selected_profile_and_backend_metadata",
@@ -70,7 +70,7 @@
             "parallel_sequences": null,
             "strategy": null
           },
-          "identity_hash": "33295bfd981199449beabc4721a5ba8206a8dff47c970f99e4a0c35ea2a97771",
+          "identity_hash": "<HOST_DERIVED_HASH>",
           "model": {
             "artifact_digest": "mock-llama318b",
             "artifact_path": null,
@@ -79,12 +79,12 @@
             "provenance": "backend_declared_model_metadata"
           },
           "pci_bus_ids": {
-            "GPU-5b99bce2-35ab-f6db-857b-72162069fa72": "00000000:05:00.0",
-            "GPU-78077308-f4b2-3330-6d4e-19581d7b1511": "00000000:01:00.0"
+            "<GPU_UUID_0>": "<PCI_BUS_ID_1>",
+            "<GPU_UUID_1>": "<PCI_BUS_ID_0>"
           },
           "physical_gpu_uuids": [
-            "GPU-5b99bce2-35ab-f6db-857b-72162069fa72",
-            "GPU-78077308-f4b2-3330-6d4e-19581d7b1511"
+            "<GPU_UUID_0>",
+            "<GPU_UUID_1>"
           ],
           "profile_name": "legacy-ollama",
           "profile_provenance": "legacy-default",
@@ -97,8 +97,8 @@
           "backend": "ollama",
           "completeness": "complete",
           "declared_device_order": [
-            "GPU-5b99bce2-35ab-f6db-857b-72162069fa72",
-            "GPU-78077308-f4b2-3330-6d4e-19581d7b1511"
+            "<GPU_UUID_0>",
+            "<GPU_UUID_1>"
           ],
           "endpoint": "http://127.0.0.1:11434",
           "evidence_provenance": "selected_profile_and_backend_metadata",
@@ -113,7 +113,7 @@
             "parallel_sequences": null,
             "strategy": null
           },
-          "identity_hash": "fe8a1fbe37136f5da6eee13e77dcc05edf71acc53ad3d0a4a21bb01ead5c2135",
+          "identity_hash": "<HOST_DERIVED_HASH>",
           "model": {
             "artifact_digest": "mock-qwen25coder14b",
             "artifact_path": null,
@@ -122,12 +122,12 @@
             "provenance": "backend_declared_model_metadata"
           },
           "pci_bus_ids": {
-            "GPU-5b99bce2-35ab-f6db-857b-72162069fa72": "00000000:05:00.0",
-            "GPU-78077308-f4b2-3330-6d4e-19581d7b1511": "00000000:01:00.0"
+            "<GPU_UUID_0>": "<PCI_BUS_ID_1>",
+            "<GPU_UUID_1>": "<PCI_BUS_ID_0>"
           },
           "physical_gpu_uuids": [
-            "GPU-5b99bce2-35ab-f6db-857b-72162069fa72",
-            "GPU-78077308-f4b2-3330-6d4e-19581d7b1511"
+            "<GPU_UUID_0>",
+            "<GPU_UUID_1>"
           ],
           "profile_name": "legacy-ollama",
           "profile_provenance": "legacy-default",
@@ -158,10 +158,10 @@
         "offload_layers": null,
         "parallel_sequences": null,
         "physical_gpu_uuids": null,
-        "runtime_identity_hash": "fe8a1fbe37136f5da6eee13e77dcc05edf71acc53ad3d0a4a21bb01ead5c2135",
+        "runtime_identity_hash": "<HOST_DERIVED_HASH>",
         "runtime_identity_schema_version": 1,
         "runtime_profile": "legacy-ollama",
-        "runtime_variant_id": "fe8a1fbe37136f5da6eee13e77dcc05edf71acc53ad3d0a4a21bb01ead5c2135"
+        "runtime_variant_id": "<HOST_DERIVED_HASH>"
       }
     ],
     "score_blended": 96.47,
@@ -227,8 +227,8 @@
           "backend": "ollama",
           "completeness": "complete",
           "declared_device_order": [
-            "GPU-5b99bce2-35ab-f6db-857b-72162069fa72",
-            "GPU-78077308-f4b2-3330-6d4e-19581d7b1511"
+            "<GPU_UUID_0>",
+            "<GPU_UUID_1>"
           ],
           "endpoint": "http://127.0.0.1:11434",
           "evidence_provenance": "selected_profile_and_backend_metadata",
@@ -243,7 +243,7 @@
             "parallel_sequences": null,
             "strategy": null
           },
-          "identity_hash": "33295bfd981199449beabc4721a5ba8206a8dff47c970f99e4a0c35ea2a97771",
+          "identity_hash": "<HOST_DERIVED_HASH>",
           "model": {
             "artifact_digest": "mock-llama318b",
             "artifact_path": null,
@@ -252,12 +252,12 @@
             "provenance": "backend_declared_model_metadata"
           },
           "pci_bus_ids": {
-            "GPU-5b99bce2-35ab-f6db-857b-72162069fa72": "00000000:05:00.0",
-            "GPU-78077308-f4b2-3330-6d4e-19581d7b1511": "00000000:01:00.0"
+            "<GPU_UUID_0>": "<PCI_BUS_ID_1>",
+            "<GPU_UUID_1>": "<PCI_BUS_ID_0>"
           },
           "physical_gpu_uuids": [
-            "GPU-5b99bce2-35ab-f6db-857b-72162069fa72",
-            "GPU-78077308-f4b2-3330-6d4e-19581d7b1511"
+            "<GPU_UUID_0>",
+            "<GPU_UUID_1>"
           ],
           "profile_name": "legacy-ollama",
           "profile_provenance": "legacy-default",
@@ -270,8 +270,8 @@
           "backend": "ollama",
           "completeness": "complete",
           "declared_device_order": [
-            "GPU-5b99bce2-35ab-f6db-857b-72162069fa72",
-            "GPU-78077308-f4b2-3330-6d4e-19581d7b1511"
+            "<GPU_UUID_0>",
+            "<GPU_UUID_1>"
           ],
           "endpoint": "http://127.0.0.1:11434",
           "evidence_provenance": "selected_profile_and_backend_metadata",
@@ -286,7 +286,7 @@
             "parallel_sequences": null,
             "strategy": null
           },
-          "identity_hash": "fe8a1fbe37136f5da6eee13e77dcc05edf71acc53ad3d0a4a21bb01ead5c2135",
+          "identity_hash": "<HOST_DERIVED_HASH>",
           "model": {
             "artifact_digest": "mock-qwen25coder14b",
             "artifact_path": null,
@@ -295,12 +295,12 @@
             "provenance": "backend_declared_model_metadata"
           },
           "pci_bus_ids": {
-            "GPU-5b99bce2-35ab-f6db-857b-72162069fa72": "00000000:05:00.0",
-            "GPU-78077308-f4b2-3330-6d4e-19581d7b1511": "00000000:01:00.0"
+            "<GPU_UUID_0>": "<PCI_BUS_ID_1>",
+            "<GPU_UUID_1>": "<PCI_BUS_ID_0>"
           },
           "physical_gpu_uuids": [
-            "GPU-5b99bce2-35ab-f6db-857b-72162069fa72",
-            "GPU-78077308-f4b2-3330-6d4e-19581d7b1511"
+            "<GPU_UUID_0>",
+            "<GPU_UUID_1>"
           ],
           "profile_name": "legacy-ollama",
           "profile_provenance": "legacy-default",
@@ -331,10 +331,10 @@
         "offload_layers": null,
         "parallel_sequences": null,
         "physical_gpu_uuids": null,
-        "runtime_identity_hash": "33295bfd981199449beabc4721a5ba8206a8dff47c970f99e4a0c35ea2a97771",
+        "runtime_identity_hash": "<HOST_DERIVED_HASH>",
         "runtime_identity_schema_version": 1,
         "runtime_profile": "legacy-ollama",
-        "runtime_variant_id": "33295bfd981199449beabc4721a5ba8206a8dff47c970f99e4a0c35ea2a97771"
+        "runtime_variant_id": "<HOST_DERIVED_HASH>"
       }
     ],
     "score_blended": 96.47,
