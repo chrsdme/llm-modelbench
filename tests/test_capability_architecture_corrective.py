@@ -586,6 +586,66 @@ def test_planner_recovery_readiness_consistency_for_unsupported_family(tmp_path)
     assert summary["capability_unavailable"] == 1
 
 
+def test_recovery_blocks_known_task_on_legacy_profile_present_but_unbound(tmp_path):
+    """Anvil Stage 2.0: closes a confirmed regression-matrix gap. The
+    2026-08-10 closure audit's 20-case matrix (cases 13/15) claims a known
+    task with a legacy or schema-v2-but-unbound capability profile (present,
+    but no `capability_identity` key) fails closed -- but no test in this
+    file or anywhere else in the suite exercised that exact code path
+    (`repair._profile_source_compatibility`'s `legacy_or_unbound_capability_profile`
+    branch) before this test. Verified empirically before writing this
+    assertion, not just by reading the source.
+    """
+    model = "legacy-unbound:latest"
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    legacy_profile = {"model": model, "declared_capabilities": ["completion"], "supported_families": ["text"]}
+    _write_repair_run(runs, model, legacy_profile, "txt_sort", "empty_output", source_digest="digest-1")
+    plan = repair.build_plan(runs, run_id="fleet", include_missing=False)
+    assert plan.actions == []
+    assert plan.observations[0]["kind"] == "capability_reprobe_required"
+    assert plan.observations[0]["capability_identity_compatibility"] == {
+        "compatible": False,
+        "reason": "legacy_or_unbound_capability_profile",
+    }
+
+
+def test_recovery_blocks_known_task_on_capability_profile_missing_entirely(tmp_path):
+    """Anvil Stage 2.0: closes the second half of the same confirmed gap
+    (case 14) -- a *missing* capability profile (no entry at all for the
+    model in `capability_report.json`) takes a different code path than a
+    present-but-unbound one: `repair._best_profile()`'s empty-profiles
+    early return (repair.py's fallback dict) never reaches
+    `_profile_source_compatibility`, so it carries no
+    `capability_identity_compatibility` reason string at all. Still
+    verified (empirically, not just by trace) to fail closed via the same
+    `error_kind and not compatible` gate, just with an empty-dict shape
+    instead of a labelled reason -- asserting that exact shape here so a
+    future change that silently starts treating a missing profile as
+    vacuously compatible cannot pass unnoticed.
+    """
+    model = "no-profile-at-all:latest"
+    runs = tmp_path / "runs"
+    run = runs / "fleet"
+    run.mkdir(parents=True)
+    task = _task("txt_sort")
+    row = {
+        "model": model, "task": task.id, "category": task.category, "family": task.family,
+        "task_hash": _task_hash(task), "score": None, "error_kind": "empty_output",
+        "reason": "empty_output", "timestamp": "2026-08-10T00:00:00Z",
+        "model_digest_resolved": "digest-1",
+    }
+    (run / "raw_results.jsonl").write_text(json.dumps(row) + "\n")
+    (run / "summary_meta.json").write_text(json.dumps({"level": "full"}))
+    (run / "filters.json").write_text(json.dumps({"level": "full", "think": "auto"}))
+    (run / "model_identities.json").write_text(json.dumps({model: {"digest": "digest-1", "size": 1}}))
+    (run / "capability_report.json").write_text(json.dumps({}))  # no entry for `model` at all
+    plan = repair.build_plan(runs, run_id="fleet", include_missing=False)
+    assert plan.actions == []
+    assert plan.observations[0]["kind"] == "capability_reprobe_required"
+    assert plan.observations[0]["capability_identity_compatibility"] == {}
+
+
 def test_positive_multicapability_model_keeps_all_lanes():
     model = "future-coder-vlm:latest"
     client = CapabilityClient(
