@@ -15,15 +15,18 @@ chain (``telemetry`` <- ``process_telemetry`` <- ``runtime_telemetry``):
   no dependency on runner, reports, or lifecycle code.
 
 The merge is additive-only: every public name each former module exported
-is preserved under this one module. The two nearly-identical bounded
-subprocess runners the split had accumulated (one per former module) are
-consolidated into a single ``_bounded_subprocess``; the process-attribution
-section's command-error classifier keeps its own name
-(``_process_command_error``) since its bounded-stdout/stderr check is
-inlined differently than the GPU-sample section's (which relies on
-``_invoke_runner`` pre-correcting overflow flags) -- forcing those two into
-one function would risk quietly changing behavior neither call site asked
-for.
+is preserved under this one module, with one exception -- ``ProcessRunner``
+(a type alias structurally identical to ``CommandRunner``) was dropped after
+confirming no call site outside the trio referenced it; the process-GPU
+collector now types its ``runner`` parameter as ``CommandRunner`` like the
+GPU-sample collector. The two nearly-identical bounded subprocess runners
+the split had accumulated (one per former module) are consolidated into a
+single ``_bounded_subprocess``; the process-attribution section's
+command-error classifier keeps its own name (``_process_command_error``)
+since its bounded-stdout/stderr check is inlined differently than the
+GPU-sample section's (which relies on ``_invoke_runner`` pre-correcting
+overflow flags) -- forcing those two into one function would risk quietly
+changing behavior neither call site asked for.
 """
 from __future__ import annotations
 
