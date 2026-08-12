@@ -21,6 +21,7 @@ usage: llm-modelbench run [-h] [--runtime-profile RUNTIME_PROFILE]
                           [--live-ui {off,compact,full,graph,log}]
                           [--rankings-out RANKINGS_OUT] [--no-ranking-update]
                           [--strict-harness] [--separate-ranking]
+                          [--unattended]
 
 options:
   -h, --help            show this help message and exit
@@ -110,3 +111,9 @@ options:
   --separate-ranking    write evidence and generate an isolated rankings-
                         separate/<run-id> report instead of touching canonical
                         rankings
+  --unattended          use the unattended decision policy: complete without
+                        interactive stdin where a decision is explicitly safe
+                        to make automatically (e.g. a decisive backend
+                        recommendation), otherwise fail closed with a typed
+                        reason. Independent of --yes, which keeps its existing
+                        meaning and is not implied by this flag.

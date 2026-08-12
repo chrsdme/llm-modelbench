@@ -26,6 +26,7 @@ usage: llm-modelbench campaign run [-h] --campaign-id CAMPAIGN_ID
                                    [--status-interval STATUS_INTERVAL]
                                    [--live-ui {off,compact,full,graph,log}]
                                    [--strict-harness] [--unattended-safe]
+                                   [--unattended]
 
 options:
   -h, --help            show this help message and exit
@@ -100,3 +101,10 @@ options:
   --strict-harness
   --unattended-safe     write terminal readiness and review package without
                         host mutation
+  --unattended          use the unattended decision policy: complete without
+                        interactive stdin where a decision is explicitly safe
+                        to make automatically (e.g. a decisive backend
+                        recommendation), otherwise fail closed with a typed
+                        reason. Independent of --yes/--unattended-safe/--auto-
+                        confirm, which keep their existing meanings and are
+                        not implied by this flag.

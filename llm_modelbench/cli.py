@@ -37,6 +37,7 @@ from .backend import (
     OllamaBackendAdapter,
     require_capability,
 )
+from .decision_policy import DecisionPolicy
 from .runtime_profiles import (
     RuntimeProfile,
     RuntimeProfileError,
@@ -63,6 +64,13 @@ def _client(args, cfg: Config) -> InferenceClient:
     if getattr(args, "mock", False):
         from .ollama import MockClient
         return MockBackendAdapter(MockClient(cfg.ollama_url, cfg.seed, cfg.temperature, cfg.request_timeout))
+    unattended = bool(getattr(args, "unattended", False))
+    # --unattended is a decision policy, not a synonym for --yes: it only ever
+    # authorizes a *decisive* backend auto-select (select_runtime's own
+    # _decisive_winner() gate still fails closed on genuine ties/ambiguity),
+    # and it never implies --auto-confirm/--force/privileged authority --
+    # those remain their own explicit flags, untouched here.
+    policy = DecisionPolicy(unattended=unattended, allow_backend_auto_selection=unattended)
     try:
         profiles, default = load_profiles(_runtime_store(args))
         candidates = discover_runtimes(cfg, store_path=_runtime_store(args))
@@ -70,7 +78,8 @@ def _client(args, cfg: Config) -> InferenceClient:
         try:
             selected = select_runtime(
                 candidates, explicit_profile=explicit, default_profile=default,
-                interactive=bool(sys.stdin.isatty()),
+                interactive=bool(sys.stdin.isatty()) and not unattended,
+                policy=policy,
             )
         except RuntimeSelectionError as exc:
             # Preserve the established no-profile Ollama behavior when the local
@@ -1816,6 +1825,11 @@ def build_parser():
     camp_run.add_argument("--live-ui", choices=["off", "compact", "full", "graph", "log"], default="compact")
     camp_run.add_argument("--strict-harness", action="store_true")
     camp_run.add_argument("--unattended-safe", action="store_true", help="write terminal readiness and review package without host mutation")
+    camp_run.add_argument("--unattended", action="store_true",
+                          help="use the unattended decision policy: complete without interactive stdin where a decision "
+                               "is explicitly safe to make automatically (e.g. a decisive backend recommendation), "
+                               "otherwise fail closed with a typed reason. Independent of --yes/--unattended-safe/"
+                               "--auto-confirm, which keep their existing meanings and are not implied by this flag.")
 
     r = sub.add_parser("run", help="run the benchmark")
     # Actual scored runs probe capability lanes by default. Planning remains
@@ -1846,6 +1860,11 @@ def build_parser():
     r.add_argument("--strict-harness", action="store_true",
                    help="exit nonzero if any selected task ends in a harness/resource/configuration error")
     r.add_argument("--separate-ranking", action="store_true", help="write evidence and generate an isolated rankings-separate/<run-id> report instead of touching canonical rankings")
+    r.add_argument("--unattended", action="store_true",
+                   help="use the unattended decision policy: complete without interactive stdin where a decision "
+                        "is explicitly safe to make automatically (e.g. a decisive backend recommendation), "
+                        "otherwise fail closed with a typed reason. Independent of --yes, which keeps its "
+                        "existing meaning and is not implied by this flag.")
 
     w = sub.add_parser("watch", help="live terminal dashboard for a run")
     w.add_argument("--run-id", help="which run to watch; if omitted, auto-detects "

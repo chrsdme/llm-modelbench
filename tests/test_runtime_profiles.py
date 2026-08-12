@@ -344,3 +344,71 @@ def test_client_explicit_or_default_unhealthy_profile_remains_fail_closed(monkey
 
     with pytest.raises(SystemExit, match="is unhealthy"):
         cli._client(SimpleNamespace(mock=False, runtime_profile=explicit, runtime_profiles_file=None), _cfg())
+
+
+def test_client_without_unattended_flag_is_unaffected_by_stage_1_5(monkeypatch):
+    # Absent --unattended entirely (every pre-Stage-1.5 SimpleNamespace/args
+    # shape used elsewhere in this file omits it) must behave identically to
+    # before: ambiguous multi-candidate selection still fails closed.
+    candidates = [_candidate("ollama", "ollama", "http://127.0.0.1:11434"),
+                  _candidate("llama", "llama_cpp", "http://127.0.0.1:8081", recommended=True)]
+    monkeypatch.setattr(cli, "load_profiles", lambda path: ([], None))
+    monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path: candidates)
+    args = SimpleNamespace(mock=False, runtime_profile=None, runtime_profiles_file=None)
+
+    with pytest.raises(SystemExit, match="--runtime-profile"):
+        cli._client(args, _cfg())
+
+
+def test_client_unattended_auto_selects_decisive_winner_without_prompting(monkeypatch):
+    candidates = [_candidate("ollama", "ollama", "http://127.0.0.1:11434"),
+                  _candidate("llama", "llama_cpp", "http://127.0.0.1:8081", recommended=True)]
+    monkeypatch.setattr(cli, "load_profiles", lambda path: ([], None))
+    monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path: candidates)
+    monkeypatch.setattr("builtins.input", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not prompt")))
+    args = SimpleNamespace(mock=False, runtime_profile=None, runtime_profiles_file=None, unattended=True)
+
+    from llm_modelbench.llama_cpp import LlamaCppBackendAdapter
+    assert isinstance(cli._client(args, _cfg()), LlamaCppBackendAdapter)
+
+
+def test_client_unattended_stays_ambiguous_without_decisive_winner_and_does_not_prompt(monkeypatch):
+    candidates = [_candidate("ollama", "ollama", "http://127.0.0.1:11434"),
+                  _candidate("llama", "llama_cpp", "http://127.0.0.1:8081")]
+    monkeypatch.setattr(cli, "load_profiles", lambda path: ([], None))
+    monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path: candidates)
+    monkeypatch.setattr("builtins.input", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not prompt")))
+    args = SimpleNamespace(mock=False, runtime_profile=None, runtime_profiles_file=None, unattended=True)
+
+    with pytest.raises(SystemExit, match="--runtime-profile"):
+        cli._client(args, _cfg())
+
+
+def test_client_unattended_pinned_unhealthy_still_fails_never_falls_back(monkeypatch):
+    profile = RuntimeProfile("saved", "ollama", "http://127.0.0.1:11434")
+    candidate = RuntimeCandidate(profile, "unhealthy", ("fixture",), "fixture")
+    monkeypatch.setattr(cli, "load_profiles", lambda path: ([profile], None))
+    monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path: [candidate])
+    args = SimpleNamespace(mock=False, runtime_profile="saved", runtime_profiles_file=None, unattended=True)
+
+    with pytest.raises(SystemExit, match="is unhealthy"):
+        cli._client(args, _cfg())
+
+
+def test_run_and_campaign_run_accept_unattended_flag_defaulting_false():
+    parser = cli.build_parser()
+    run_args = parser.parse_args(["run", "--mock"])
+    assert run_args.unattended is False
+    run_args = parser.parse_args(["run", "--mock", "--unattended"])
+    assert run_args.unattended is True
+    campaign_args = parser.parse_args(["campaign", "run", "--campaign-id", "c1", "--unattended"])
+    assert campaign_args.unattended is True
+
+
+def test_unattended_does_not_imply_yes_or_auto_confirm():
+    parser = cli.build_parser()
+    run_args = parser.parse_args(["run", "--mock", "--unattended"])
+    assert run_args.yes is False
+    repair_args = parser.parse_args(["repair", "--everything"])
+    assert not hasattr(repair_args, "unattended")
+    assert repair_args.auto_confirm is False
