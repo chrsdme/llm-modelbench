@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from llm_modelbench import cli
+from llm_modelbench.decision_policy import DecisionPolicy
 from llm_modelbench.runtime_profiles import (
     RuntimeCandidate,
     RuntimeProfile,
@@ -81,11 +82,77 @@ def test_exactly_one_and_interactive_multiple_selection():
 def test_unattended_ambiguity_and_unhealthy_saved_default_fail_closed():
     candidates = [_candidate("ollama", "ollama", "http://127.0.0.1:11434"),
                   _candidate("llama", "llama_cpp", "http://127.0.0.1:8081")]
-    with pytest.raises(RuntimeSelectionError, match="--runtime-profile"):
+    with pytest.raises(RuntimeSelectionError, match="--runtime-profile") as excinfo:
         select_runtime(candidates)
+    assert excinfo.value.reason == "runtime_selection_ambiguous"
     unhealthy = [_candidate("saved", "ollama", "http://127.0.0.1:11434", health="unhealthy")]
     with pytest.raises(RuntimeSelectionError, match="unhealthy"):
         select_runtime(unhealthy, default_profile="saved")
+
+
+def test_ambiguous_selection_without_policy_still_fails_closed():
+    # No policy passed at all (the pre-Stage-1.5 call shape): must behave
+    # exactly as before, even when one candidate happens to be recommended.
+    candidates = [_candidate("ollama", "ollama", "http://127.0.0.1:11434"),
+                  _candidate("llama", "llama_cpp", "http://127.0.0.1:8081", recommended=True)]
+    with pytest.raises(RuntimeSelectionError, match="--runtime-profile") as excinfo:
+        select_runtime(candidates)
+    assert excinfo.value.reason == "runtime_selection_ambiguous"
+
+
+def test_unattended_auto_select_requires_explicit_policy_grant():
+    candidates = [_candidate("ollama", "ollama", "http://127.0.0.1:11434"),
+                  _candidate("llama", "llama_cpp", "http://127.0.0.1:8081", recommended=True)]
+    # unattended=True alone does not grant backend auto-selection.
+    with pytest.raises(RuntimeSelectionError):
+        select_runtime(candidates, policy=DecisionPolicy(unattended=True))
+
+
+def test_unattended_auto_select_with_decisive_winner_and_explicit_grant():
+    candidates = [_candidate("ollama", "ollama", "http://127.0.0.1:11434"),
+                  _candidate("llama", "llama_cpp", "http://127.0.0.1:8081", recommended=True)]
+    policy = DecisionPolicy(unattended=True, allow_backend_auto_selection=True)
+    assert select_runtime(candidates, policy=policy).profile.name == "llama"
+
+
+def test_unattended_auto_select_stays_ambiguous_when_no_decisive_winner():
+    policy = DecisionPolicy(unattended=True, allow_backend_auto_selection=True)
+    # No candidate recommended: no decisive winner.
+    none_recommended = [_candidate("ollama", "ollama", "http://127.0.0.1:11434"),
+                        _candidate("llama", "llama_cpp", "http://127.0.0.1:8081")]
+    with pytest.raises(RuntimeSelectionError) as excinfo:
+        select_runtime(none_recommended, policy=policy)
+    assert excinfo.value.reason == "runtime_selection_ambiguous"
+    # Two candidates recommended: a tie is not decisive, even though it is
+    # deterministic under a lexical sort -- decisiveness requires a unique
+    # recommendation, not just a stable ordering.
+    both_recommended = [_candidate("llama-a", "llama_cpp", "http://127.0.0.1:8081", recommended=True),
+                        _candidate("llama-b", "llama_cpp", "http://127.0.0.1:8082", recommended=True)]
+    with pytest.raises(RuntimeSelectionError) as excinfo:
+        select_runtime(both_recommended, policy=policy)
+    assert excinfo.value.reason == "runtime_selection_ambiguous"
+
+
+def test_pinned_unhealthy_never_falls_back_even_under_permissive_policy():
+    # Requesting a specific profile that is dead must fail, never silently
+    # substitute a different healthy backend -- that would change the
+    # experiment without the operator asking for it.
+    candidates = [_candidate("saved", "ollama", "http://127.0.0.1:11434", health="unhealthy"),
+                  _candidate("llama", "llama_cpp", "http://127.0.0.1:8081", health="healthy")]
+    policy = DecisionPolicy(unattended=True, allow_backend_auto_selection=True)
+    with pytest.raises(RuntimeSelectionError, match="unhealthy") as excinfo:
+        select_runtime(candidates, default_profile="saved", policy=policy)
+    assert excinfo.value.reason == "unhealthy_profile"
+
+
+def test_interactive_mode_ignores_policy_and_still_prompts():
+    candidates = [_candidate("ollama", "ollama", "http://127.0.0.1:11434"),
+                  _candidate("llama", "llama_cpp", "http://127.0.0.1:8081", recommended=True)]
+    policy = DecisionPolicy(unattended=True, allow_backend_auto_selection=True)
+    output = []
+    selected = select_runtime(candidates, interactive=True, policy=policy,
+                              input_fn=lambda _: "1", output_fn=output.append)
+    assert selected.profile.name == "ollama"
 
 
 def test_recommendation_uses_real_inventory_count_and_deduplicates_candidates(tmp_path):

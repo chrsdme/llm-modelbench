@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+from .decision_policy import Action, DecisionPolicy
 from .hardware import detect_gpus
 
 PROFILE_SCHEMA_VERSION = 1
@@ -296,8 +297,21 @@ def discover_runtimes(cfg: Any, *, store_path: Optional[Path] = None,
     return sorted(candidates, key=lambda item: (item.profile.backend, item.profile.endpoint, item.profile.name))
 
 
+def _decisive_winner(viable: List[RuntimeCandidate]) -> Optional[RuntimeCandidate]:
+    """A winner only exists when recommendation picks out exactly one candidate.
+
+    A lexical or positional tie-break (e.g. ``sorted(viable)[0]``) would be
+    technically deterministic but not methodologically decisive -- if two
+    or more healthy candidates are equally recommended (or none are), that
+    is genuine ambiguity, not a winner.
+    """
+    recommended = [item for item in viable if item.recommended]
+    return recommended[0] if len(recommended) == 1 else None
+
+
 def select_runtime(candidates: Iterable[RuntimeCandidate], *, explicit_profile: Optional[str] = None,
                    default_profile: Optional[str] = None, interactive: bool = False,
+                   policy: Optional[DecisionPolicy] = None,
                    input_fn: Callable[[str], str] = input, output_fn: Callable[[str], None] = print) -> RuntimeCandidate:
     values = list(candidates)
     by_name = {item.profile.name: item for item in values}
@@ -318,10 +332,13 @@ def select_runtime(candidates: Iterable[RuntimeCandidate], *, explicit_profile: 
     if not viable:
         raise RuntimeSelectionError("no healthy local runtime candidates", reason="no_healthy_candidates")
     if not interactive:
+        winner = _decisive_winner(viable)
+        if winner is not None and policy is not None and policy.permits(Action.BACKEND_AUTO_SELECT):
+            return winner
         choices = ", ".join(item.profile.name for item in viable)
         raise RuntimeSelectionError(
             "multiple healthy runtime profiles require --runtime-profile <name>: " + choices,
-            reason="ambiguous_candidates",
+            reason="runtime_selection_ambiguous",
         )
     for index, candidate in enumerate(viable, 1):
         suffix = " (recommended)" if candidate.recommended else ""
