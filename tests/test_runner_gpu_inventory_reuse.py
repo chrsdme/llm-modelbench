@@ -31,7 +31,7 @@ def _profile(client, model=MODEL):
 
 def _run_needle(tmp_path, *, gpu_inventory=None):
     client = MockClient()
-    return runner.run(client, Config(fingerprint=False), level="smoke", out_dir=tmp_path,
+    return runner.run(client, Config(fingerprint=False), level="full", out_dir=tmp_path,
                       include=None, exclude=None, skip_offload=False, categories=None,
                       task_ids=["needle"], resume=False, live_ui="off", fingerprint_enabled=False,
                       selected_models=[MODEL], capability_profiles=_profile(client), auto_probe=False,
@@ -49,9 +49,10 @@ def test_unsupplied_gpu_inventory_is_detected_at_most_once_across_many_needle_pr
     monkeypatch.setattr(runner, "detect_gpus", lambda: calls.append(1) or ())
     _run_needle(tmp_path, gpu_inventory=None)
     # A needle task probes multiple context depths internally (multiple
-    # _needle_kv_estimate calls within one _run_once), so more than one
-    # call here would mean the per-run cache isn't working.
-    assert len(calls) <= 1
+    # _needle_kv_estimate calls within one _run_once), so the count must be
+    # exactly one: zero would mean detection silently stopped happening,
+    # and more than one would mean the per-run cache isn't working.
+    assert len(calls) == 1
 
 
 def test_no_needle_tasks_means_detect_gpus_is_never_called(tmp_path, monkeypatch):

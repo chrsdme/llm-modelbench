@@ -25,7 +25,7 @@ def test_inventory_detects_gpus_at_most_once_across_multiple_models(monkeypatch,
     cli.cmd_inventory(_args(), Config())
     captured = json.loads(capsys.readouterr().out)
     assert len(captured) > 1  # multiple mock models, proving the loop actually ran multiple times
-    assert len(calls) <= 1
+    assert len(calls) == 1
 
 
 def test_inventory_subcommand_never_defines_unattended():
