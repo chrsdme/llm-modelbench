@@ -43,7 +43,7 @@ def collect(cfg: Any) -> Dict[str, Any]:
     # One bounded, observational Stage 6D capability probe.  It never starts
     # or reconfigures a runtime; failures remain diagnostics.
     try:
-        from .runtime_telemetry import collect_runtime_telemetry
+        from .telemetry import collect_runtime_telemetry
         runtime_telemetry = collect_runtime_telemetry(backend="ollama", endpoint=base).to_dict()
     except Exception as exc:
         runtime_telemetry = {"status": "unavailable", "errors": [{"detail": str(exc)[:512]}]}

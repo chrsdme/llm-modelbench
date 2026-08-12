@@ -2,7 +2,7 @@ import os
 
 import pytest
 
-from llm_modelbench import process_telemetry as pt
+from llm_modelbench import telemetry as pt
 from llm_modelbench.telemetry import CommandResult, TelemetryFieldState
 
 

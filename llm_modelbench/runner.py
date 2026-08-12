@@ -1395,7 +1395,7 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
     telemetry_ref = None
     if capture_runtime_telemetry:
         if runtime_telemetry_factory is None:
-            from .runtime_telemetry import collect_runtime_telemetry
+            from .telemetry import collect_runtime_telemetry
             runtime_telemetry_factory = collect_runtime_telemetry
         telemetry_ref = _capture_runtime_telemetry(out_dir, client, runtime_telemetry_factory,
                                                    runtime_profile=runtime_profile)
