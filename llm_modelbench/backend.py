@@ -10,14 +10,14 @@ Stage 1 additions are deliberately additive, matching Stage 0's discipline:
 ``InferenceClient`` is used throughout the codebase only as a type
 annotation (confirmed by inspection -- no ``isinstance(..., InferenceClient)``
 runtime check exists anywhere), so new Protocol methods cannot break an
-existing caller even before every implementer grows them. The genuinely
-higher-risk change the plan also calls for here -- renaming the per-model
-metadata method from ``capabilities()`` to ``capability_hints()`` throughout
-the codebase, to close off a "someone writes `if 'vision' in
-backend.capabilities(model)` and treats declared metadata as execution
-authority" regression risk -- is tracked separately and requires updating
-real existing call sites, not just adding new ones; see Stage 1's progress
-log for that piece.
+existing caller even before every implementer grows them. The per-model
+metadata method was renamed from ``capabilities()`` to
+``capability_hints()`` throughout the codebase (Stage 1.2), to close off a
+"someone writes `if 'vision' in backend.capability_hints(model)` and treats
+declared metadata as execution authority" regression risk. The name change
+is metadata-only: the underlying Ollama/llama.cpp JSON payload field is
+still literally ``"capabilities"`` on the wire and is left alone -- only the
+Python method that surfaces it was renamed.
 
 Scope note (Stage 1.6): this contract is NVIDIA-only in practice today
 (nothing here is NVIDIA-specific by construction, but no other backend is
@@ -109,7 +109,7 @@ class InferenceClient(Protocol):
     def tags(self) -> List[Dict[str, Any]]: ...
     def version(self) -> Optional[str]: ...
     def show(self, model: str) -> Dict[str, Any]: ...
-    def capabilities(self, model: str) -> List[str]: ...
+    def capability_hints(self, model: str) -> List[str]: ...
     def supports_thinking(self, model: str) -> bool: ...
     def model_info(self, model: str) -> Dict[str, Any]: ...
     def model_size_bytes(self, model: str) -> Optional[int]: ...
@@ -210,8 +210,8 @@ class OllamaBackendAdapter:
     def show(self, model: str) -> Dict[str, Any]:
         return self.client.show(model)
 
-    def capabilities(self, model: str) -> List[str]:
-        return self.client.capabilities(model)
+    def capability_hints(self, model: str) -> List[str]:
+        return self.client.capability_hints(model)
 
     def supports_thinking(self, model: str) -> bool:
         return self.client.supports_thinking(model)

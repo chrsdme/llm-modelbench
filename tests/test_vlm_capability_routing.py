@@ -51,7 +51,7 @@ def test_planner_uses_measured_capabilities_for_ocr_pdf_routing(monkeypatch):
         def tags(self):
             return [{"name": text_only, "size": 1}, {"name": vision, "size": 1}]
 
-        def capabilities(self, model):
+        def capability_hints(self, model):
             return ["completion", "vision"] if model == vision else ["tools", "completion"]
 
         def chat(self, model, prompt, **kwargs):

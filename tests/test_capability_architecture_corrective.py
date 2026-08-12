@@ -72,7 +72,7 @@ class CapabilityClient:
             "model_info": {"general.architecture": "fixture", "general.context_length": 4096},
         }
 
-    def capabilities(self, model):
+    def capability_hints(self, model):
         return list(self._capabilities)
 
     def chat(self, model, prompt, **kwargs):

@@ -994,7 +994,7 @@ def cmd_campaign(args, cfg):
                         **profile,
                         "name": name,
                         "digest": item.get("digest"),
-                        "capabilities": client.capabilities(name),
+                        "capabilities": client.capability_hints(name),
                         "priority": 0,
                         "calibrated": False,
                     }

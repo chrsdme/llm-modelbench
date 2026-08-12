@@ -245,7 +245,7 @@ class LlamaCppClient:
     def show(self, model: str) -> Dict[str, Any]:
         row = self._model(model)
         active, training = self._contexts(row)
-        caps = self.capabilities(model)
+        caps = self.capability_hints(model)
         info = {key: value for key, value in {
             "general.context_length": active,
             "general.training_context_length": training,
@@ -265,7 +265,7 @@ class LlamaCppClient:
     def context_length(self, model: str) -> Optional[int]:
         return self._contexts(self._model(model))[0]
 
-    def capabilities(self, model: str) -> List[str]:
+    def capability_hints(self, model: str) -> List[str]:
         self._model(model)
         props = self.props()
         caps = ["completion"]
@@ -435,7 +435,7 @@ class LlamaCppClient:
                    num_predict: int = 512, num_ctx: Optional[int] = None, think: str = "auto",
                    messages: Optional[List[Dict[str, Any]]] = None, **kwargs: Any) -> Dict[str, Any]:
         try:
-            if "tools" not in self.capabilities(model):
+            if "tools" not in self.capability_hints(model):
                 return {"ok": False, "error": "llama.cpp tool calls are unsupported by this endpoint template",
                         "text": "", "tool_calls": [], "num_predict": num_predict, "num_ctx": num_ctx}
             if not isinstance(tools, list) or not all(isinstance(item, dict) for item in tools):
@@ -562,7 +562,7 @@ class LlamaCppBackendAdapter:
         states = dict(_CAPABILITIES.states)
         try:
             states[BackendCapability.NATIVE_TOOLS] = (
-                CapabilityStatus.SUPPORTED if "tools" in self.client.capabilities(self.client.tags()[0]["name"])
+                CapabilityStatus.SUPPORTED if "tools" in self.client.capability_hints(self.client.tags()[0]["name"])
                 else CapabilityStatus.UNSUPPORTED
             )
         except LlamaCppError:
@@ -571,7 +571,7 @@ class LlamaCppBackendAdapter:
     def tags(self) -> List[Dict[str, Any]]: return self.client.tags()
     def version(self) -> Optional[str]: return self.client.version()
     def show(self, model: str) -> Dict[str, Any]: return self.client.show(model)
-    def capabilities(self, model: str) -> List[str]: return self.client.capabilities(model)
+    def capability_hints(self, model: str) -> List[str]: return self.client.capability_hints(model)
     def supports_thinking(self, model: str) -> bool: return self.client.supports_thinking(model)
     def model_info(self, model: str) -> Dict[str, Any]: return self.client.model_info(model)
     def model_size_bytes(self, model: str) -> Optional[int]: return self.client.model_size_bytes(model)

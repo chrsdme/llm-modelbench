@@ -31,7 +31,7 @@ def test_vision_probe_does_not_leak_expected_token_into_prompt(monkeypatch):
     seen = {}
 
     class C:
-        def capabilities(self, model):
+        def capability_hints(self, model):
             return ["completion", "vision"]
 
         def chat(self, model, prompt, **kwargs):
@@ -51,7 +51,7 @@ def test_vision_probe_does_not_leak_expected_token_into_prompt(monkeypatch):
 
 def test_insert_probe_requires_suffix_conditioning_not_generic_completion():
     class C:
-        def capabilities(self, model):
+        def capability_hints(self, model):
             return ["completion", "insert"]
 
         def chat(self, *args, **kwargs):
@@ -154,7 +154,7 @@ def test_auto_vision_probe_uses_name_hint_despite_partial_metadata(monkeypatch):
     seen = {"vision_calls": 0}
 
     class C:
-        def capabilities(self, model):
+        def capability_hints(self, model):
             return ["completion"]
 
         def chat(self, model, prompt, **kwargs):
@@ -183,7 +183,7 @@ def test_planner_routes_known_vlm_with_measured_vision(monkeypatch):
         def tags(self):
             return [{"name": model, "size": 5_000_000_000}]
 
-        def capabilities(self, name):
+        def capability_hints(self, name):
             assert name == model
             return ["completion"]
 
@@ -203,7 +203,7 @@ def test_planner_routes_known_vlm_with_measured_vision(monkeypatch):
 
 def test_transient_capability_probe_is_withheld_not_marked_unavailable(monkeypatch):
     class C:
-        def capabilities(self, model):
+        def capability_hints(self, model):
             return ["completion", "vision"]
         def chat(self, model, prompt, **kwargs):
             if kwargs.get("images"):

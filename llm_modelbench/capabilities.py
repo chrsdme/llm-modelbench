@@ -453,7 +453,7 @@ def interrogate_model(
     real benchmark task records the failure instead of silently hiding it.
     """
     capability_identity = current_capability_identity(client, model)
-    declared = client.capabilities(model) if hasattr(client, "capabilities") else []
+    declared = client.capability_hints(model) if hasattr(client, "capability_hints") else []
     declared = [str(c).lower() for c in declared or []]
     profile = profile_for(model)
     declared_families = families_from_capabilities(declared)

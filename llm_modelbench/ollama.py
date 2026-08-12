@@ -92,13 +92,13 @@ class OllamaClient:
         self._show_cache[model] = info
         return info
 
-    def capabilities(self, model: str) -> List[str]:
+    def capability_hints(self, model: str) -> List[str]:
         info = self.show(model)
         caps = info.get("capabilities") or []
         return [str(c).lower() for c in caps if c is not None]
 
     def supports_thinking(self, model: str) -> bool:
-        caps = self.capabilities(model)
+        caps = self.capability_hints(model)
         return any(c in {"thinking", "think"} or "thinking" in c for c in caps)
 
     def model_info(self, model: str) -> Dict[str, Any]:
@@ -480,7 +480,7 @@ class MockClient(OllamaClient):
     def version(self):
         return "mock"
 
-    def capabilities(self, model):
+    def capability_hints(self, model):
         n = str(model).lower()
         if "nomic-embed" in n:
             return ["embedding"]

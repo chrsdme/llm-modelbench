@@ -1,7 +1,7 @@
 """Gap scheduling. Prototype for v9.6.4.
 
 Deliberately does NOT touch planner.build_plan(). It's a read-only companion:
-given a live model roster (same client.tags()/client.capabilities() shape
+given a live model roster (same client.tags()/client.capability_hints() shape
 build_plan already uses) and the coverage ledger, it reports which models are
 missing which categories. Nothing here runs inference or writes results --
 same operator-in-the-loop posture as prune.md: advisory, reviewed, then acted
@@ -22,7 +22,7 @@ def gap_report(client: Any, ledger: Dict[str, Any], tasks, classify_model, famil
         model = row.get("name")
         if not model:
             continue
-        caps = client.capabilities(model) if hasattr(client, "capabilities") else None
+        caps = client.capability_hints(model) if hasattr(client, "capability_hints") else None
         fams = families_for(model, caps)
         digest = row.get("digest")
         pending = pending_categories_for_model(ledger, digest, fams, tasks)
@@ -51,7 +51,7 @@ if __name__ == "__main__":
     class FakeClient:
         def tags(self):
             return [{"name": "gemma3:12b"}, {"name": "qwen2.5-coder:7b"}]
-        def capabilities(self, m):
+        def capability_hints(self, m):
             return ["completion", "vision"] if m == "gemma3:12b" else ["completion"]
         def show(self, m):
             return {"digest": "digestA"} if m == "gemma3:12b" else {"digest": "digestC"}

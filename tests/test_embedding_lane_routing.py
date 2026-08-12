@@ -54,7 +54,7 @@ def test_planner_schedules_only_retrieval_for_live_embed_model():
         def tags(self):
             return [{"name": model, "size": 1}]
 
-        def capabilities(self, _model):
+        def capability_hints(self, _model):
             return ["embedding"]
 
         def embed(self, _model, texts):

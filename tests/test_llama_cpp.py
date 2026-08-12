@@ -65,7 +65,7 @@ def test_protocol_identity_inventory_and_observed_metadata():
     assert adapter.context_length(MODEL) == 65536
     assert adapter.show(MODEL)["model_info"]["general.training_context_length"] == 262144
     assert adapter.model_size_bytes(MODEL) == 16799719424
-    assert "tools" in adapter.capabilities(MODEL)
+    assert "tools" in adapter.capability_hints(MODEL)
     assert adapter.backend_capabilities().supports(BackendCapability.CHAT)
     assert not adapter.backend_capabilities().supports(BackendCapability.EMBEDDINGS)
 
@@ -164,7 +164,7 @@ def test_tags_do_not_invent_format_or_vision_capability():
     item = client.tags()[0]
     assert "details" not in item
     assert "digest" not in item
-    assert "vision" not in client.capabilities("plain")
+    assert "vision" not in client.capability_hints("plain")
 
 
 def test_model_alias_validation_context_limit_slots_and_tokenization():
