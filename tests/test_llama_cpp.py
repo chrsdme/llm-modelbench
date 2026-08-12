@@ -3,6 +3,7 @@ import urllib.error
 import pytest
 
 from llm_modelbench.backend import BackendCapability, BackendCapabilityError, InferenceClient
+from llm_modelbench.identity import RuntimeProfileIdentity
 from llm_modelbench.llama_cpp import LlamaCppBackendAdapter, LlamaCppClient, LlamaCppError, _default_transport
 from llm_modelbench.runtime_profiles import RuntimeCandidate, RuntimeProfile
 
@@ -67,6 +68,60 @@ def test_protocol_identity_inventory_and_observed_metadata():
     assert "tools" in adapter.capabilities(MODEL)
     assert adapter.backend_capabilities().supports(BackendCapability.CHAT)
     assert not adapter.backend_capabilities().supports(BackendCapability.EMBEDDINGS)
+
+
+# ---------------------------------------------------------------------------
+# Anvil Stage 1.2 additions -- these regressed once already (isinstance()
+# against the extended InferenceClient Protocol failed until this adapter
+# grew the new methods too), so cover them explicitly rather than relying
+# on the isinstance check in test_protocol_identity_inventory_and_observed_metadata
+# alone to catch a future regression of the same kind.
+# ---------------------------------------------------------------------------
+
+
+def test_health_uses_the_real_health_endpoint_not_version(monkeypatch):
+    client, transport = _client()
+    adapter = LlamaCppBackendAdapter(client)
+    assert adapter.health() is True
+    assert ("GET", "/health", None) in transport.calls
+
+
+def test_health_false_when_health_endpoint_reports_unhealthy():
+    client, _ = _client({"/health": {"status": "loading"}, "/props": _props(), "/v1/models": _models(),
+                          "/slots": [], "/tokenize": {"tokens": []}})
+    adapter = LlamaCppBackendAdapter(client)
+    assert adapter.health() is False
+
+
+def test_runtime_profile_identity_reflects_llama_cpp_backend_and_version():
+    client, _ = _client()
+    adapter = LlamaCppBackendAdapter(client)
+    identity = adapter.runtime_profile_identity()
+    assert isinstance(identity, RuntimeProfileIdentity)
+    assert identity.backend == "llama_cpp"
+    assert identity.backend_version == "b10086-66e4bf7e5"
+
+
+@pytest.mark.parametrize(
+    "method_name,args",
+    [
+        ("start_model", (MODEL,)),
+        ("stop_model", (MODEL,)),
+        ("load_model", (MODEL,)),
+        ("launch_managed_runtime", ()),
+        ("stop_managed_runtime", ()),
+        ("switch_model", (MODEL,)),
+    ],
+)
+def test_managed_lifecycle_methods_fail_closed(method_name, args):
+    """This module's own docstring says it "deliberately contains no server
+    lifecycle, model switching, or mutable-property operations" -- these
+    must refuse clearly, matching that design, not silently no-op."""
+    client, _ = _client()
+    adapter = LlamaCppBackendAdapter(client)
+    method = getattr(adapter, method_name)
+    with pytest.raises(BackendCapabilityError):
+        method(*args)
 
 
 def test_inventory_deduplicates_dual_arrays_and_rejects_zero_or_router_mode():

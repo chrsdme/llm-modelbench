@@ -14,8 +14,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .backend import (
     BackendCapabilities, BackendCapability, BackendCapabilityError,
-    BackendIdentity, CapabilityStatus,
+    BackendIdentity, CapabilityStatus, require_capability,
 )
+from .identity import RuntimeProfileIdentity
 
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_ERROR_BYTES = 8192
@@ -536,6 +537,20 @@ _CAPABILITIES = BackendCapabilities({
     BackendCapability.OFFLOAD_FRACTION: CapabilityStatus.UNAVAILABLE, BackendCapability.MODEL_UNLOAD: CapabilityStatus.UNSUPPORTED,
     BackendCapability.FLUSH_ALL: CapabilityStatus.UNSUPPORTED, BackendCapability.OLLAMA_SERVICE_REPAIR: CapabilityStatus.UNSUPPORTED,
     BackendCapability.OLLAMA_KV_REPAIR: CapabilityStatus.UNSUPPORTED,
+    # Anvil Stage 1.2. HEALTH_CHECK is genuinely supported (a read against
+    # a running endpoint). The managed-lifecycle group is UNSUPPORTED by
+    # explicit design, not oversight -- this module's own docstring already
+    # says "deliberately contains no server lifecycle, model switching, or
+    # mutable-property operations. It speaks only to an already-running
+    # endpoint," which is exactly what Stage 3B.4/3B.5 would need to change
+    # (and is explicitly future/gated scope per ANVIL_MASTER_PLAN.md).
+    BackendCapability.HEALTH_CHECK: CapabilityStatus.SUPPORTED,
+    BackendCapability.START_MODEL: CapabilityStatus.UNSUPPORTED,
+    BackendCapability.STOP_MODEL: CapabilityStatus.UNSUPPORTED,
+    BackendCapability.LOAD_MODEL: CapabilityStatus.UNSUPPORTED,
+    BackendCapability.MANAGED_RUNTIME_LAUNCH: CapabilityStatus.UNSUPPORTED,
+    BackendCapability.MANAGED_RUNTIME_STOP: CapabilityStatus.UNSUPPORTED,
+    BackendCapability.MODEL_SWITCH: CapabilityStatus.UNSUPPORTED,
 })
 
 
@@ -572,3 +587,41 @@ class LlamaCppBackendAdapter:
     def tokenize(self, content: str, **kwargs: Any) -> Dict[str, Any]: return self.client.tokenize(content, **kwargs)
     def slots(self) -> List[Dict[str, Any]]: return self.client.slots()
     def metrics(self) -> Dict[str, Any]: return self.client.metrics()
+
+    # -- Anvil Stage 1 additions (ANVIL_MASTER_PLAN.md v2.2, Stage 1.2) --
+    def health(self) -> bool:
+        # LlamaCppClient already has a purpose-built health() hitting the
+        # real /health endpoint (raises LlamaCppError on an unhealthy
+        # response) -- use it rather than falling back to "did version()
+        # not blow up," which is what the Ollama/Mock adapters do in the
+        # absence of a dedicated health endpoint there.
+        try:
+            self.client.health()
+            return True
+        except Exception:
+            return False
+
+    def runtime_profile_identity(self) -> RuntimeProfileIdentity:
+        try:
+            backend_version = self.client.version()
+        except Exception:
+            backend_version = None
+        return RuntimeProfileIdentity(backend="llama_cpp", backend_version=backend_version)
+
+    def start_model(self, model: str, **kwargs: Any) -> None:
+        require_capability(self, BackendCapability.START_MODEL)
+
+    def stop_model(self, model: str) -> None:
+        require_capability(self, BackendCapability.STOP_MODEL)
+
+    def load_model(self, model: str, **kwargs: Any) -> None:
+        require_capability(self, BackendCapability.LOAD_MODEL)
+
+    def launch_managed_runtime(self, **kwargs: Any) -> None:
+        require_capability(self, BackendCapability.MANAGED_RUNTIME_LAUNCH)
+
+    def stop_managed_runtime(self) -> None:
+        require_capability(self, BackendCapability.MANAGED_RUNTIME_STOP)
+
+    def switch_model(self, model: str, **kwargs: Any) -> None:
+        require_capability(self, BackendCapability.MODEL_SWITCH)

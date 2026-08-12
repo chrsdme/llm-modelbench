@@ -1,14 +1,40 @@
-"""Backend-neutral inference-client contract for the RC21 migration.
+"""Backend-neutral inference-client contract for the RC21 migration, extended
+in Anvil Stage 1 toward the plan's ``RuntimeBackend`` contract
+(ANVIL_MASTER_PLAN.md v2.2, Stage 1.2).
 
 The protocol intentionally mirrors only ModelBench's existing client surface.
 Ollama HTTP behavior remains in :mod:`llm_modelbench.ollama`; adapters here
 delegate to it unchanged while making backend-level support explicit.
+
+Stage 1 additions are deliberately additive, matching Stage 0's discipline:
+``InferenceClient`` is used throughout the codebase only as a type
+annotation (confirmed by inspection -- no ``isinstance(..., InferenceClient)``
+runtime check exists anywhere), so new Protocol methods cannot break an
+existing caller even before every implementer grows them. The genuinely
+higher-risk change the plan also calls for here -- renaming the per-model
+metadata method from ``capabilities()`` to ``capability_hints()`` throughout
+the codebase, to close off a "someone writes `if 'vision' in
+backend.capabilities(model)` and treats declared metadata as execution
+authority" regression risk -- is tracked separately and requires updating
+real existing call sites, not just adding new ones; see Stage 1's progress
+log for that piece.
+
+Scope note (Stage 1.6): this contract is NVIDIA-only in practice today
+(nothing here is NVIDIA-specific by construction, but no other backend is
+implemented) and Ollama/llama.cpp-only by backend. It is the actual
+extension point non-goals like "leave room for other backends/GPU vendors
+later" depend on -- see ``hardware.py``'s own scope documentation
+(``detect_gpu()``'s docstring already frames the scalar path as a
+"compatibility projection" for exactly this reason) for the hardware side
+of the same story.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Mapping, Optional, Protocol, runtime_checkable
+
+from .identity import RuntimeProfileIdentity
 
 
 class CapabilityStatus(str, Enum):
@@ -32,6 +58,20 @@ class BackendCapability(str, Enum):
     FLUSH_ALL = "flush_all"
     OLLAMA_SERVICE_REPAIR = "ollama_service_repair"
     OLLAMA_KV_REPAIR = "ollama_kv_repair"
+    HEALTH_CHECK = "health_check"
+    # Stage 3B-dependent (ANVIL_MASTER_PLAN.md v2.2): managed process
+    # lifecycle for a backend ModelBench itself starts/stops/switches, as
+    # opposed to inspecting an externally-managed one. Deliberately
+    # UNSUPPORTED for every adapter until Stage 3B actually builds this --
+    # declared now so callers get a clear, typed refusal instead of an
+    # AttributeError, per Guiding Principle "unsupported operations return
+    # a typed capability state, not a silent no-op."
+    START_MODEL = "start_model"
+    STOP_MODEL = "stop_model"
+    LOAD_MODEL = "load_model"
+    MANAGED_RUNTIME_LAUNCH = "managed_runtime_launch"
+    MANAGED_RUNTIME_STOP = "managed_runtime_stop"
+    MODEL_SWITCH = "model_switch"
 
 
 @dataclass(frozen=True)
@@ -83,6 +123,22 @@ class InferenceClient(Protocol):
     def unload(self, model: str) -> None: ...
     def flush_all(self) -> None: ...
 
+    # -- Anvil Stage 1 additions (ANVIL_MASTER_PLAN.md v2.2, Stage 1.2) --
+    def health(self) -> bool: ...
+    def runtime_profile_identity(self) -> RuntimeProfileIdentity: ...
+
+    # Stage 3B-dependent: managed process lifecycle. Every current adapter
+    # declares these UNSUPPORTED (see _OLLAMA_CAPABILITIES/_MOCK_CAPABILITIES
+    # below) and self-guards with require_capability() -- calling one today
+    # raises BackendCapabilityError with a clear message, not an
+    # AttributeError or a silent no-op.
+    def start_model(self, model: str, **kwargs: Any) -> None: ...
+    def stop_model(self, model: str) -> None: ...
+    def load_model(self, model: str, **kwargs: Any) -> None: ...
+    def launch_managed_runtime(self, **kwargs: Any) -> None: ...
+    def stop_managed_runtime(self) -> None: ...
+    def switch_model(self, model: str, **kwargs: Any) -> None: ...
+
 
 def require_capability(client: InferenceClient, capability: BackendCapability) -> None:
     """Fail closed before an adapter-declared unsupported operation."""
@@ -117,6 +173,13 @@ _OLLAMA_CAPABILITIES = BackendCapabilities({
     BackendCapability.FLUSH_ALL: CapabilityStatus.SUPPORTED,
     BackendCapability.OLLAMA_SERVICE_REPAIR: CapabilityStatus.SUPPORTED,
     BackendCapability.OLLAMA_KV_REPAIR: CapabilityStatus.SUPPORTED,
+    BackendCapability.HEALTH_CHECK: CapabilityStatus.SUPPORTED,
+    BackendCapability.START_MODEL: CapabilityStatus.UNSUPPORTED,
+    BackendCapability.STOP_MODEL: CapabilityStatus.UNSUPPORTED,
+    BackendCapability.LOAD_MODEL: CapabilityStatus.UNSUPPORTED,
+    BackendCapability.MANAGED_RUNTIME_LAUNCH: CapabilityStatus.UNSUPPORTED,
+    BackendCapability.MANAGED_RUNTIME_STOP: CapabilityStatus.UNSUPPORTED,
+    BackendCapability.MODEL_SWITCH: CapabilityStatus.UNSUPPORTED,
 })
 
 _MOCK_CAPABILITIES = BackendCapabilities({
@@ -185,6 +248,41 @@ class OllamaBackendAdapter:
 
     def flush_all(self) -> None:
         self.client.flush_all()
+
+    def health(self) -> bool:
+        try:
+            return self.client.version() is not None
+        except Exception:
+            return False
+
+    def runtime_profile_identity(self) -> RuntimeProfileIdentity:
+        """Best-effort today: only backend + version are actually known at
+        this layer. template_hash/protocol_version/gpu_policy population is
+        real Stage 2+ work (capability probing needs to happen first to
+        derive a template hash), not invented here."""
+        try:
+            backend_version = self.client.version()
+        except Exception:
+            backend_version = None
+        return RuntimeProfileIdentity(backend=self.backend_identity().backend, backend_version=backend_version)
+
+    def start_model(self, model: str, **kwargs: Any) -> None:
+        require_capability(self, BackendCapability.START_MODEL)
+
+    def stop_model(self, model: str) -> None:
+        require_capability(self, BackendCapability.STOP_MODEL)
+
+    def load_model(self, model: str, **kwargs: Any) -> None:
+        require_capability(self, BackendCapability.LOAD_MODEL)
+
+    def launch_managed_runtime(self, **kwargs: Any) -> None:
+        require_capability(self, BackendCapability.MANAGED_RUNTIME_LAUNCH)
+
+    def stop_managed_runtime(self) -> None:
+        require_capability(self, BackendCapability.MANAGED_RUNTIME_STOP)
+
+    def switch_model(self, model: str, **kwargs: Any) -> None:
+        require_capability(self, BackendCapability.MODEL_SWITCH)
 
 
 class MockBackendAdapter(OllamaBackendAdapter):
