@@ -200,7 +200,7 @@ def test_selected_llama_cpp_creates_stage_five_client(monkeypatch):
     profile = RuntimeProfile("llama", "llama_cpp", "http://127.0.0.1:8081")
     candidate = RuntimeCandidate(profile, "healthy", ("fixture",), "fixture")
     monkeypatch.setattr(cli, "load_profiles", lambda path: ([profile], None))
-    monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path: [candidate])
+    monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path, gpu_devices=None: [candidate])
     args = SimpleNamespace(mock=False, runtime_profile="llama", runtime_profiles_file=None)
 
     from llm_modelbench.llama_cpp import LlamaCppBackendAdapter
@@ -300,7 +300,7 @@ def test_runtime_cli_profile_errors_exit_cleanly(tmp_path, monkeypatch):
     with pytest.raises(SystemExit, match="unknown runtime profile: missing"):
         cli.cmd_runtime(show_args, _cfg())
 
-    monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path: [_candidate("only", "ollama", "http://127.0.0.1:11434")])
+    monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path, gpu_devices=None: [_candidate("only", "ollama", "http://127.0.0.1:11434")])
     select_args = SimpleNamespace(
         runtime_cmd="select", runtime_profile="missing", save_name=None, set_default=False,
         replace=False, yes=True, runtime_profiles_file=store,
@@ -315,7 +315,7 @@ def test_client_ambiguity_does_not_fall_back_to_ollama(monkeypatch):
         _candidate("llama", "llama_cpp", "http://127.0.0.1:8081"),
     ]
     monkeypatch.setattr(cli, "load_profiles", lambda path: ([], None))
-    monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path: candidates)
+    monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path, gpu_devices=None: candidates)
     args = SimpleNamespace(mock=False, runtime_profile=None, runtime_profiles_file=None)
 
     with pytest.raises(SystemExit, match="--runtime-profile"):
@@ -326,7 +326,7 @@ def test_client_legacy_fallback_only_applies_with_no_healthy_candidates(monkeypa
     monkeypatch.setattr(cli, "load_profiles", lambda path: ([], None))
     monkeypatch.setattr(
         cli, "discover_runtimes",
-        lambda cfg, store_path: [_candidate("legacy-ollama", "ollama", cfg.ollama_url, health="unreachable")],
+        lambda cfg, store_path, gpu_devices=None: [_candidate("legacy-ollama", "ollama", cfg.ollama_url, health="unreachable")],
     )
     cfg = _cfg()
     client = cli._client(SimpleNamespace(mock=False, runtime_profile=None, runtime_profiles_file=None), cfg)
@@ -340,7 +340,7 @@ def test_client_explicit_or_default_unhealthy_profile_remains_fail_closed(monkey
     profile = RuntimeProfile("saved", "ollama", "http://127.0.0.1:11434")
     candidate = RuntimeCandidate(profile, "unhealthy", ("fixture",), "fixture")
     monkeypatch.setattr(cli, "load_profiles", lambda path: ([profile], default))
-    monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path: [candidate])
+    monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path, gpu_devices=None: [candidate])
 
     with pytest.raises(SystemExit, match="is unhealthy"):
         cli._client(SimpleNamespace(mock=False, runtime_profile=explicit, runtime_profiles_file=None), _cfg())
@@ -353,7 +353,7 @@ def test_client_without_unattended_flag_is_unaffected_by_stage_1_5(monkeypatch):
     candidates = [_candidate("ollama", "ollama", "http://127.0.0.1:11434"),
                   _candidate("llama", "llama_cpp", "http://127.0.0.1:8081", recommended=True)]
     monkeypatch.setattr(cli, "load_profiles", lambda path: ([], None))
-    monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path: candidates)
+    monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path, gpu_devices=None: candidates)
     args = SimpleNamespace(mock=False, runtime_profile=None, runtime_profiles_file=None)
 
     with pytest.raises(SystemExit, match="--runtime-profile"):
@@ -364,7 +364,7 @@ def test_client_unattended_auto_selects_decisive_winner_without_prompting(monkey
     candidates = [_candidate("ollama", "ollama", "http://127.0.0.1:11434"),
                   _candidate("llama", "llama_cpp", "http://127.0.0.1:8081", recommended=True)]
     monkeypatch.setattr(cli, "load_profiles", lambda path: ([], None))
-    monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path: candidates)
+    monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path, gpu_devices=None: candidates)
     monkeypatch.setattr("builtins.input", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not prompt")))
     args = SimpleNamespace(mock=False, runtime_profile=None, runtime_profiles_file=None, unattended=True)
 
@@ -376,7 +376,7 @@ def test_client_unattended_stays_ambiguous_without_decisive_winner_and_does_not_
     candidates = [_candidate("ollama", "ollama", "http://127.0.0.1:11434"),
                   _candidate("llama", "llama_cpp", "http://127.0.0.1:8081")]
     monkeypatch.setattr(cli, "load_profiles", lambda path: ([], None))
-    monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path: candidates)
+    monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path, gpu_devices=None: candidates)
     monkeypatch.setattr("builtins.input", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not prompt")))
     args = SimpleNamespace(mock=False, runtime_profile=None, runtime_profiles_file=None, unattended=True)
 
@@ -388,7 +388,7 @@ def test_client_unattended_pinned_unhealthy_still_fails_never_falls_back(monkeyp
     profile = RuntimeProfile("saved", "ollama", "http://127.0.0.1:11434")
     candidate = RuntimeCandidate(profile, "unhealthy", ("fixture",), "fixture")
     monkeypatch.setattr(cli, "load_profiles", lambda path: ([profile], None))
-    monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path: [candidate])
+    monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path, gpu_devices=None: [candidate])
     args = SimpleNamespace(mock=False, runtime_profile="saved", runtime_profiles_file=None, unattended=True)
 
     with pytest.raises(SystemExit, match="is unhealthy"):

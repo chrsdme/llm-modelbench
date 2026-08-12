@@ -98,7 +98,7 @@ def test_cli_client_construction_uses_neutral_adapters(monkeypatch):
     monkeypatch.setattr(
         cli,
         "discover_runtimes",
-        lambda received_cfg, store_path: discovery_calls.append((received_cfg, store_path)) or [candidate],
+        lambda received_cfg, store_path, gpu_devices=None: discovery_calls.append((received_cfg, store_path)) or [candidate],
     )
 
     mock = cli._client(SimpleNamespace(mock=True), cfg)

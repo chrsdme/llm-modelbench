@@ -38,6 +38,7 @@ from .backend import (
     require_capability,
 )
 from .decision_policy import DecisionPolicy
+from .preflight import resolve_operational_preflight
 from .runtime_profiles import (
     RuntimeProfile,
     RuntimeProfileError,
@@ -60,7 +61,10 @@ def _ollama_port(url: str) -> int:
         raise SystemExit(f"invalid Ollama URL port in {url!r}") from exc
 
 
-def _client(args, cfg: Config) -> InferenceClient:
+def _client(args, cfg: Config, *, gpu_inventory=None) -> InferenceClient:
+    """``gpu_inventory``, when supplied, is a caller's already-resolved GPU
+    detection (Anvil Stage 1.3's composed preflight) reused here instead of
+    triggering a second ``detect_gpus()`` call for the same invocation."""
     if getattr(args, "mock", False):
         from .ollama import MockClient
         return MockBackendAdapter(MockClient(cfg.ollama_url, cfg.seed, cfg.temperature, cfg.request_timeout))
@@ -71,23 +75,25 @@ def _client(args, cfg: Config) -> InferenceClient:
     # and it never implies --auto-confirm/--force/privileged authority --
     # those remain their own explicit flags, untouched here.
     policy = DecisionPolicy(unattended=unattended, allow_backend_auto_selection=unattended)
+    explicit = getattr(args, "runtime_profile", None)
     try:
         profiles, default = load_profiles(_runtime_store(args))
-        candidates = discover_runtimes(cfg, store_path=_runtime_store(args))
-        explicit = getattr(args, "runtime_profile", None)
-        try:
-            selected = select_runtime(
-                candidates, explicit_profile=explicit, default_profile=default,
-                interactive=bool(sys.stdin.isatty()) and not unattended,
-                policy=policy,
-            )
-        except RuntimeSelectionError as exc:
+        preflight = resolve_operational_preflight(
+            cfg, explicit_profile=explicit, default_profile=default,
+            interactive=bool(sys.stdin.isatty()) and not unattended,
+            policy=policy, store_path=_runtime_store(args), gpu_inventory=gpu_inventory,
+            discover_fn=discover_runtimes, select_fn=select_runtime,
+        )
+        if preflight.blocked:
+            blocker = preflight.blocker
             # Preserve the established no-profile Ollama behavior when the local
             # service is down. Any explicit, saved, or ambiguous selection is
             # fail-closed and must not silently choose Ollama.
-            if (exc.reason != "no_healthy_candidates" or explicit or default or profiles):
-                raise
+            if (blocker.reason != "no_healthy_candidates" or explicit or default or profiles):
+                raise RuntimeSelectionError(blocker.detail, reason=blocker.reason)
             selected = type("LegacySelection", (), {"profile": implicit_ollama_profile(cfg)})()
+        else:
+            selected = preflight.selected_candidate
     except RuntimeProfileError as exc:
         raise SystemExit(f"runtime selection failed: {exc}") from exc
     profile = selected.profile
@@ -429,7 +435,11 @@ def cmd_run(args, cfg):
         cfg.fingerprint = bool(args.fingerprint)
     if getattr(args, "judge_model", None):
         cfg.judge_model = args.judge_model
-    client = _client(args, cfg)
+    # Anvil Stage 1.3: detect GPU inventory exactly once for this invocation
+    # and thread it through both backend selection and runtime-identity
+    # collection below, rather than letting each independently re-detect.
+    inventory = detect_gpus()
+    client = _client(args, cfg, gpu_inventory=inventory)
     out_dir = _run_dir(args)
     rankings_dir = _ranking_dir_for(args, run_id=out_dir.name)
     task_ids = _task_ids(args)
@@ -441,7 +451,6 @@ def cmd_run(args, cfg):
     profile = getattr(args, "_runtime_profile", None) or implicit_ollama_profile(cfg)
     try:
         tag_rows = {str(row.get("name")): row for row in client.tags()}
-        inventory = detect_gpus()
         current_runtime_identities = {
             model: collect_runtime_identity(client=client, profile=profile, model_name=model,
                                             model_row=tag_rows.get(model), config=cfg, inventory=inventory)

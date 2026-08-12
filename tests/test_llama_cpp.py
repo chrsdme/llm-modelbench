@@ -425,7 +425,7 @@ def test_selected_llama_cpp_inventory_error_is_clean_and_never_constructs_ollama
     from llm_modelbench import cli, llama_cpp, ollama
     profile = RuntimeProfile("llama", "llama_cpp", "http://127.0.0.1:8081")
     monkeypatch.setattr(cli, "load_profiles", lambda path: ([profile], None))
-    monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path: [RuntimeCandidate(profile, "healthy", ("fixture",), "fixture")])
+    monkeypatch.setattr(cli, "discover_runtimes", lambda cfg, store_path, gpu_devices=None: [RuntimeCandidate(profile, "healthy", ("fixture",), "fixture")])
 
     class FailingClient:
         def __init__(self, base, *args): self.base = base
