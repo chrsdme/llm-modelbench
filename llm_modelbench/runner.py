@@ -18,7 +18,7 @@ import statistics
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from . import scoring, judge as judge_mod, media, fingerprint, progress, sandbox, __version__
 from .filters import (
@@ -29,7 +29,7 @@ from .filters import (
 )
 from .classify import classify_model, size_gb
 from .config import Config
-from .hardware import Telemetry, ProbeTelemetry, detect_gpu, nvidia_live, host_memory_snapshot
+from .hardware import GPUDevice, Telemetry, ProbeTelemetry, detect_gpu, detect_gpus, nvidia_live, host_memory_snapshot
 from .placement import model_placement_fit
 from .backend import BackendCapability, InferenceClient, supports_capability
 from .tasks import Task, tasks_for, make_needle_prompt, TASKS
@@ -259,6 +259,7 @@ def _needle_kv_estimate(
     model: str,
     wanted_ctx: int,
     measured: Optional[Dict[str, Any]] = None,
+    gpu_inventory: Optional[Iterable[GPUDevice]] = None,
 ) -> Dict[str, Any]:
     """Estimate memory for a needle depth without confusing VRAM with total memory.
 
@@ -266,6 +267,12 @@ def _needle_kv_estimate(
     ``valid_for_skip``.  Once dynamic offload begins, GPU-VRAM slope alone is
     not a total-memory slope and therefore cannot justify pre-emptively skipping
     a larger context.  Metadata remains available as a low-confidence reference.
+
+    ``gpu_inventory``, when supplied by ``run()`` (Anvil Stage 1.3), is the
+    already-detected GPU inventory for this invocation, reused here instead
+    of triggering a fresh ``detect_gpus()`` subprocess call -- this function
+    is called once per needle probe per model, so leaving it unset would
+    otherwise shell out to ``nvidia-smi`` many times over a single run.
     """
     budget_gb = float(getattr(cfg, "vram_budget_gb", 0.0) or 0.0)
     model_size = None
@@ -376,14 +383,14 @@ def _needle_kv_estimate(
     # scalar remains in the evidence for backward-compatible reports only.
     from .placement import model_placement_fit, topology_for_config
     row = {"size": model_size} if model_size is not None else {"size": None}
-    fit = model_placement_fit(row, cfg)
+    fit = model_placement_fit(row, cfg, inventory=gpu_inventory)
     if metadata_bpt:
         from .topology_budget import evaluate_workload_fit
-        fit = evaluate_workload_fit(topology_for_config(cfg), weight_bytes=model_size,
+        fit = evaluate_workload_fit(topology_for_config(cfg, inventory=gpu_inventory), weight_bytes=model_size,
                                     kv_cache_bytes=int(metadata_bpt * int(wanted_ctx)))
     out["topology_fit_classification"] = fit.classification
     out["topology_fit_selected_gpu_uuids"] = list(fit.selected_gpu_uuids)
-    if fit.classification == "unknown" and budget_gb > 0 and not topology_for_config(cfg).devices:
+    if fit.classification == "unknown" and budget_gb > 0 and not topology_for_config(cfg, inventory=gpu_inventory).devices:
         # Preserve the old single-GPU/manual-cap behavior where physical
         # inventory is unavailable; never use this scalar fallback on a
         # topology-bearing multi-GPU host.
@@ -820,6 +827,7 @@ def _fim_score(prefix: str, text: str, meta: Dict[str, Any]) -> tuple[float, str
 def _run_once(
     client, cfg: Config, model: str, task: Task,
     progress_callback: Optional[Any] = None,
+    gpu_inventory: Optional[Iterable[GPUDevice]] = None,
 ) -> Dict[str, Any]:
     """Run a single task once and return score + latency metrics."""
     # Vision image
@@ -958,7 +966,7 @@ def _run_once(
                 if progress_callback:
                     progress_callback({"probe_event": "needle_probe_skipped", "probe_index": probe_index, "probe_total": len(context_sizes), "probe_size": int(size), "probe_num_ctx": int(wanted_ctx), "probe_state": "skipped", "probe_reason": "exceeds_context_length_max"})
                 continue
-            kv = _needle_kv_estimate(client, cfg, model, wanted_ctx, measured_estimate)
+            kv = _needle_kv_estimate(client, cfg, model, wanted_ctx, measured_estimate, gpu_inventory=gpu_inventory)
             env_skip = _needle_environment_skip(kv, wanted_ctx)
             preflight_mode = str(getattr(cfg, "needle_preflight_mode", "enforce") or "enforce").lower()
             preflight_warning = None
@@ -1030,7 +1038,7 @@ def _run_once(
             actual_prompt_tokens = res.get("prompt_eval_count")
             if isinstance(actual_prompt_tokens, (int, float)) and actual_prompt_tokens:
                 wanted_ctx = int(actual_prompt_tokens) + needle_num_predict + 64
-                kv = _needle_kv_estimate(client, cfg, model, wanted_ctx, measured_estimate)
+                kv = _needle_kv_estimate(client, cfg, model, wanted_ctx, measured_estimate, gpu_inventory=gpu_inventory)
             err = _model_output_error(res) if res.get("ok") else _harness_error(res.get("error", "failed"), res)
             loaded_stats = (
                 client.loaded_model_stats(model)
@@ -1343,9 +1351,25 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
         row_metadata_by_task: Optional[Dict[str, Dict[str, Any]]] = None,
         capture_runtime_telemetry: bool = False,
         runtime_telemetry_factory=None,
-        runtime_profile=None, runtime_identity=None) -> Path:
+        runtime_profile=None, runtime_identity=None,
+        gpu_inventory: Optional[Iterable[GPUDevice]] = None) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     raw = out_dir / "raw_results.jsonl"
+    # Anvil Stage 1.3: a caller (cmd_run) that already resolved GPU inventory
+    # for this invocation passes it here so the needle KV estimate and
+    # skip-offload fit checks below reuse it instead of each independently
+    # shelling out to nvidia-smi -- once per needle probe, over a whole run,
+    # without this. A direct caller that supplies nothing still detects at
+    # most once per run() call, lazily, only if a needle/skip-offload path
+    # actually needs it -- not unconditionally for every run.
+    _gpu_inventory_cache: List[Optional[Tuple[GPUDevice, ...]]] = [
+        tuple(gpu_inventory) if gpu_inventory is not None else None
+    ]
+
+    def _resolved_gpu_inventory() -> Tuple[GPUDevice, ...]:
+        if _gpu_inventory_cache[0] is None:
+            _gpu_inventory_cache[0] = tuple(detect_gpus())
+        return _gpu_inventory_cache[0]
     # Identity must be checked before telemetry, status, reports, or reusable rows.
     # A mapping is required for multi-model runs; a single identity remains readable.
     runtime_identity_values = {}
@@ -1401,7 +1425,7 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
                                                    runtime_profile=runtime_profile)
     if skip_offload:
         before = list(models)
-        fits = {m: model_placement_fit(models_rows[m], cfg) for m in before}
+        fits = {m: model_placement_fit(models_rows[m], cfg, inventory=_resolved_gpu_inventory()) for m in before}
         models = [m for m in models if fits[m].classification != "confirmed_no_fit"]
         skipped_models.extend({"model": m, "reason": "topology_confirmed_no_fit", "fit_classification": fits[m].classification}
                               for m in before if m not in models)
@@ -1589,6 +1613,7 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
                             (lambda detail: status.update_task_detail(**detail))
                             if task.scorer == "needle" else None
                         ),
+                        gpu_inventory=_resolved_gpu_inventory() if task.scorer == "needle" else None,
                     )
                     for _ in range(samples_for_task)
                 ]

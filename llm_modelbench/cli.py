@@ -244,14 +244,21 @@ def cmd_inventory(args, cfg):
         print("No models found (is Ollama running?). Try: llm-modelbench inventory --mock")
         return
     from .capabilities import interrogate_model
+    from .hardware import detect_gpus
     from .placement import model_placement_fit, topology_for_config
-    topology = topology_for_config(cfg)
+    # Anvil Stage 1.3: detect once and reuse for every model below, instead
+    # of each model's fit check independently re-detecting. This is a pure
+    # detection-reuse fix -- inventory remains read-only and does not go
+    # through the composed operational preflight (which would additionally
+    # perform backend *selection*, out of place for an inspection command).
+    inventory = detect_gpus()
+    topology = topology_for_config(cfg, inventory=inventory)
     items = []
     for model_row in rows:
         name = model_row.get("name", "")
         profile = interrogate_model(client, name, functional=bool(getattr(args, "auto", False)))
         families = profile.get("supported_families") or []
-        fit = model_placement_fit(model_row, cfg)
+        fit = model_placement_fit(model_row, cfg, inventory=inventory)
         items.append({"name": name,
                       "class": classify_model(name, profile.get("declared_capabilities"), families),
                       "size_gb": size_gb(model_row), "families": families,
@@ -488,7 +495,8 @@ def cmd_run(args, cfg):
                    auto_probe=bool(getattr(args, "auto", False)),
                    capture_runtime_telemetry=True,
                    runtime_profile=getattr(args, "_runtime_profile", None),
-                   runtime_identity=current_runtime_identities)
+                   runtime_identity=current_runtime_identities,
+                   gpu_inventory=inventory)
     except ValueError as exc:
         raise SystemExit(f"run refused: {exc}")
     except KeyboardInterrupt:
@@ -698,13 +706,17 @@ def _campaign_paths_or_exit(campaign_id: str):
         raise SystemExit(f"unknown campaign {campaign_id!r}")
     return paths, campaign.load_manifest(paths)
 
-def _campaign_runtime_identities(args, cfg, selected, client):
-    """Bounded metadata only; never probes or generates."""
+def _campaign_runtime_identities(args, cfg, selected, client, *, gpu_inventory=None):
+    """Bounded metadata only; never probes or generates.
+
+    ``gpu_inventory``, when supplied by a caller that already detected GPUs
+    for this invocation (Anvil Stage 1.3), is reused here instead of a
+    second ``detect_gpus()`` call."""
     from .hardware import detect_gpus
     from .runtime_identity import collect_runtime_identity
     profile=getattr(args,"_runtime_profile",None) or implicit_ollama_profile(cfg)
     rows={str(x.get("name")):x for x in client.tags()}
-    inventory=detect_gpus()
+    inventory=tuple(gpu_inventory) if gpu_inventory is not None else detect_gpus()
     return {model:collect_runtime_identity(client=client,profile=profile,model_name=model,model_row=rows.get(model),inventory=inventory,config=cfg) for model in selected}
 
 def _validate_campaign_generation_identities(paths, args, cfg, manifest):
@@ -717,8 +729,10 @@ def _validate_campaign_generation_identities(paths, args, cfg, manifest):
         if not isinstance(judge,dict) or judge.get("state") in {None,"judge_not_required"}: raise SystemExit("campaign resume refused: judge_runtime_identity_missing")
     frozen=plan.get("runtime_identities")
     if frozen is None: raise SystemExit("campaign resume refused: runtime identity mismatch: legacy_runtime_identity_missing")
-    client=_client(args,cfg); selected=[str(x) for x in frozen]
-    try: validate_frozen_runtime_identity_map(frozen,_campaign_runtime_identities(args,cfg,selected,client),selected)
+    from .hardware import detect_gpus
+    inventory=detect_gpus()
+    client=_client(args,cfg,gpu_inventory=inventory); selected=[str(x) for x in frozen]
+    try: validate_frozen_runtime_identity_map(frozen,_campaign_runtime_identities(args,cfg,selected,client,gpu_inventory=inventory),selected)
     except ValueError as exc: raise SystemExit("campaign resume refused: "+str(exc)) from None
     return client, selected
 
@@ -922,9 +936,11 @@ def cmd_campaign(args, cfg):
         else:
             models = [value.strip() for value in (args.models or "").split(";") if value.strip()]
             paths, manifest = campaign.create_campaign(args.campaign_id, models=models, level=args.level, version=__version__)
-        client = _client(args, cfg)
+        from .hardware import detect_gpus
+        inventory = detect_gpus()
+        client = _client(args, cfg, gpu_inventory=inventory)
         selected = _resolve_model_selection(args, client) or []
-        identities=_campaign_runtime_identities(args,cfg,selected,client)
+        identities=_campaign_runtime_identities(args,cfg,selected,client,gpu_inventory=inventory)
         plan = _plan_for_args(args, cfg, client, selected_models=selected)
         configuration = {"level": args.level, "models": args.models, "judge_policy": getattr(args, "judge", "off"), "samples": args.samples, "think": args.think, "ctx": args.ctx, "num_predict": args.num_predict}
         if manifest.state == "planned":
