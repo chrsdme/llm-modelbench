@@ -16,8 +16,10 @@ from .capabilities import (
     current_capability_identity,
     interrogate_models,
 )
-from .capability_evidence_adapter import new_measured_supported_families
+from .capability_evidence_adapter import effective_measured_supported_families
+from .capability_reprobe_execute import default_ledger_path
 from .classify import classify_model, size_gb
+from .evidence import EvidenceLedger
 from .filters import describe_filters, filter_models, filter_tasks, validate_task_ids
 from .runner import _samples_for_task
 from .tasks import TASKS, tasks_for
@@ -51,8 +53,15 @@ def build_plan(
     selected_models: Optional[List[str]] = None,
     auto_probe: bool = False,
     capability_profiles: Optional[Dict[str, Dict[str, Any]]] = None,
+    runs_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     import re
+
+    # Stage 2.9: prefer a current, identity-compatible native EvidenceLedger
+    # observation over the legacy adapter path (never the reverse). The
+    # ledger already exists (or is empty, in which case every family falls
+    # back to the unchanged legacy path) -- never created/written here.
+    ledger = EvidenceLedger(default_ledger_path(Path(runs_dir) if runs_dir is not None else Path("runs")))
 
     rows = client.tags()
     models_rows = {m.get("name"): m for m in rows if m.get("name")}
@@ -119,7 +128,8 @@ def build_plan(
         profile = profiles[model]
         compatibility = capability_identity_compatibility(profile, current_identities.get(model))
         profile["capability_identity_compatibility"] = compatibility
-        fams = new_measured_supported_families(profile, current_identities.get(model))
+        effective = effective_measured_supported_families(profile, current_identities.get(model), ledger=ledger)
+        fams = list(effective.families)
         if not fams:
             skipped.append({"model": model, "reason": "no_measured_supported_capabilities"})
             continue
@@ -141,6 +151,14 @@ def build_plan(
             "declared_capabilities": profile.get("declared_capabilities") or [],
             "capability_warnings": profile.get("warnings") or [],
             "capability_evidence_hash": profile.get("evidence_hash"),
+            "native_legacy_capability_evidence_disagreements": [
+                {
+                    "family": d.family, "native_applicable": d.native_applicable,
+                    "native_reason": d.native_reason, "legacy_applicable": d.legacy_applicable,
+                    "legacy_reason": d.legacy_reason,
+                }
+                for d in effective.disagreements
+            ],
             "tasks_total": len(ts),
             "samples_total": samples_total,
             "tasks": [t.id for t in ts],

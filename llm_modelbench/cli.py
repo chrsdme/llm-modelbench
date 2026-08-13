@@ -515,6 +515,7 @@ def _plan_for_args(args, cfg, client, *, selected_models=None, capability_profil
         selected_models=selected_models,
         auto_probe=bool(getattr(args, "auto", False)),
         capability_profiles=capability_profiles,
+        runs_dir=Path(getattr(args, "runs_dir", None) or getattr(args, "out", None) or "runs"),
     )
 
 

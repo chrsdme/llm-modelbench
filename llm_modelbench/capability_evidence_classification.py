@@ -108,9 +108,15 @@ from .capability_projection import (
     CapabilityDecisionReason,
     CapabilityProjectionStatus,
     decide_capability_from_projection,
+    project_capability_from_ledger,
     project_capability_observation,
 )
 from .classify import FAMILY_ORDER
+from .evidence import EvidenceLedger
+
+# `capability_reprobe_execute` imports from this module at top level, so
+# `default_ledger_path` is imported lazily inside `classify_fleet()` below
+# rather than at module scope, to avoid a circular import.
 
 __all__ = [
     "EvidenceCellStatus",
@@ -328,11 +334,31 @@ def classify_model_capability(
     capability: str,
     stored_profiles: List[Tuple[Path, Dict[str, Any]]],
     current_identity: Optional[Mapping[str, Any]],
+    *,
+    ledger: Optional[EvidenceLedger] = None,
 ) -> EvidenceCell:
     """Classify one (model alias, capability) cell from every stored
     profile found for ``model`` across the fleet, against ``current_identity``
     (``capabilities.current_capability_identity()``'s dict shape, or
-    ``None`` if the model is not currently reachable)."""
+    ``None`` if the model is not currently reachable).
+
+    Anvil Stage 2.9: when ``ledger`` yields a current, identity-compatible
+    native observation for this cell (``CapabilityProjectionStatus.SELECTED``),
+    that native evidence is authoritative -- the status is derived from it
+    directly, regardless of what the legacy ``capability_report.json``-derived
+    evidence below would otherwise say (never the reverse; a stale legacy
+    positive never overrides a genuine native measurement). If native
+    evidence for this cell is itself ambiguous or conflicted
+    (``AMBIGUOUS_COMPATIBLE_OBSERVATIONS`` / ``SUPERSESSION_CONFLICT``), that
+    status is reported directly -- fails closed rather than falling back to
+    a convenient legacy answer. Only when no usable native evidence exists
+    for this cell (``NO_OBSERVATIONS`` / ``NO_COMPATIBLE_OBSERVATION``, or no
+    ``ledger`` was given at all) does the unchanged legacy-only classification
+    below apply, as the Stage 2.6 compatibility fallback for fleet cells not
+    yet reprobed under Stage 2.7C. This is what lets the full evidence
+    lifecycle close: MISSING -> reprobe planned -> reprobe executed -> native
+    observation appended -> next classification reports CURRENT_VALID (or a
+    valid terminal negative), not MISSING again."""
     source_paths = tuple(str(path) for path, _ in stored_profiles)
 
     current_typed = (
@@ -345,6 +371,51 @@ def classify_model_capability(
         current_runtime_profile_stable_key=current_typed.runtime_profile_identity.stable_key() if current_typed else None,
         current_backend=current_typed.runtime_profile_identity.backend if current_typed else None,
     )
+
+    native_projection = None
+    if ledger is not None and current_typed is not None:
+        native_projection = project_capability_from_ledger(
+            ledger,
+            capability=capability,
+            current_model_identity=current_typed.model_identity,
+            current_runtime_profile_identity=current_typed.runtime_profile_identity,
+            current_probe_protocol_version=PROBE_PROTOCOL_VERSION,
+            current_capability_schema_version=CAPABILITY_SCHEMA_VERSION,
+            current_template_config_hash=current_typed.template_hash,
+            current_endpoint_identity=current_typed.endpoint_identity,
+        )
+
+    if native_projection is not None and native_projection.status == CapabilityProjectionStatus.SELECTED:
+        native_decision = decide_capability_from_projection(native_projection)
+        return EvidenceCell(
+            model=model, capability=capability,
+            status=_DECISION_REASON_TO_STATUS[native_decision.reason],
+            reason=f"selected native EvidenceLedger observation: {native_decision.reason.value}",
+            typed_decision_reason=native_decision.reason.value,
+            selected_evidence_hash=native_projection.selected_observation.evidence_hash,
+            stored_profile_count=len(stored_profiles),
+            structurally_adaptable_profile_count=0,
+            considered_source_paths=source_paths, current_identity_available=current_identity is not None,
+            **identity_fields,
+        )
+
+    if native_projection is not None and native_projection.status in (
+        CapabilityProjectionStatus.AMBIGUOUS_COMPATIBLE_OBSERVATIONS,
+        CapabilityProjectionStatus.SUPERSESSION_CONFLICT,
+    ):
+        status = (
+            EvidenceCellStatus.AMBIGUOUS_COMPATIBLE_OBSERVATIONS
+            if native_projection.status == CapabilityProjectionStatus.AMBIGUOUS_COMPATIBLE_OBSERVATIONS
+            else EvidenceCellStatus.SUPERSESSION_CONFLICT
+        )
+        return EvidenceCell(
+            model=model, capability=capability, status=status,
+            reason=f"native EvidenceLedger evidence for this cell is itself {native_projection.status.value}; failing closed",
+            stored_profile_count=len(stored_profiles),
+            structurally_adaptable_profile_count=0,
+            considered_source_paths=source_paths, current_identity_available=current_identity is not None,
+            **identity_fields,
+        )
 
     if not stored_profiles:
         return EvidenceCell(
@@ -462,6 +533,7 @@ def classify_fleet(
     runs_dir: Path = Path("runs"),
     campaigns_root: Path = Path("campaigns"),
     models: Optional[List[str]] = None,
+    ledger: Optional[EvidenceLedger] = None,
 ) -> FleetEvidenceReport:
     """Classify every (model, capability) cell across the fleet's stored
     evidence. ``models`` overrides live discovery (``client.tags()``) for
@@ -469,7 +541,18 @@ def classify_fleet(
     plus every model with historical evidence but no longer installed is
     considered, so the report stays exhaustive over "the entire current
     capability evidence population" per the advice, not just what's live
-    right now."""
+    right now.
+
+    Anvil Stage 2.9: ``ledger`` defaults to the same
+    ``<runs_dir>/capability_evidence_ledger.jsonl`` convention
+    ``reprobe-execute`` writes to (never created/written here) -- pass an
+    explicit ``ledger`` to point at a different one. See
+    ``classify_model_capability()`` for the native-preferred policy this
+    enables."""
+    if ledger is None:
+        from .capability_reprobe_execute import default_ledger_path  # local: avoid an import cycle
+
+        ledger = EvidenceLedger(default_ledger_path(runs_dir))
     source_files = discover_capability_report_files(runs_dir, campaigns_root)
     evidence_by_model = load_fleet_evidence(source_files)
 
@@ -499,7 +582,7 @@ def classify_fleet(
         stored = evidence_by_model.get(model, [])
         current_identity = current_identities.get(model)
         for capability in FAMILY_ORDER:
-            cells.append(classify_model_capability(model, capability, stored, current_identity))
+            cells.append(classify_model_capability(model, capability, stored, current_identity, ledger=ledger))
 
     return FleetEvidenceReport(
         cells=tuple(cells),

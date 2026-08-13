@@ -21,7 +21,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from . import scoring, judge as judge_mod, media, fingerprint, progress, sandbox, __version__
-from .capability_evidence_adapter import new_measured_supported_families
+from .capability_evidence_adapter import effective_measured_supported_families
+from .capability_reprobe_execute import default_ledger_path
+from .evidence import EvidenceLedger
 from .filters import (
     describe_filters,
     filter_models,
@@ -1484,6 +1486,12 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
     from .capabilities import capability_identity_compatibility, current_capability_identity
     profiles = dict(capability_profiles or {})
     current_capability_identities = {model: current_capability_identity(client, model) for model in models}
+    # Stage 2.9: prefer a current, identity-compatible native EvidenceLedger
+    # observation over the legacy adapter path (never the reverse). out_dir
+    # is always "<runs_dir>/<run_id>" (see cli._run_dir()), so its parent is
+    # the base runs directory the ledger already lives under (or would, once
+    # written) -- never created/written here.
+    ledger = EvidenceLedger(default_ledger_path(Path(out_dir).parent))
     if any(model not in profiles for model in models):
         from .capabilities import interrogate_models
         missing_profiles = [model for model in models if model not in profiles]
@@ -1502,7 +1510,8 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
         capabilities = profile.get("declared_capabilities") or []
         compatibility = capability_identity_compatibility(profile, current_capability_identities.get(model))
         profile["capability_identity_compatibility"] = compatibility
-        fams = new_measured_supported_families(profile, current_capability_identities.get(model))
+        effective = effective_measured_supported_families(profile, current_capability_identities.get(model), ledger=ledger)
+        fams = list(effective.families)
         if not fams:
             skipped_models.append({"model": model, "reason": "no_measured_supported_capabilities"})
             continue
@@ -1519,6 +1528,14 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
             "families": fams,
             "declared_capabilities": capabilities,
             "capability_evidence_hash": profile.get("evidence_hash"),
+            "native_legacy_capability_evidence_disagreements": [
+                {
+                    "family": d.family, "native_applicable": d.native_applicable,
+                    "native_reason": d.native_reason, "legacy_applicable": d.legacy_applicable,
+                    "legacy_reason": d.legacy_reason,
+                }
+                for d in effective.disagreements
+            ],
             "tasks_total": len(all_tasks),
             "samples_total": sum(_samples_for_task(t, cfg, sample_mode, judge_mode) for t in all_tasks),
         })

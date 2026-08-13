@@ -62,6 +62,7 @@ from llm_modelbench.capabilities import (
     MeasuredCapabilityState,
     current_capability_identity,
 )
+from llm_modelbench.capability_evidence_adapter import EffectiveSupportedFamiliesResult
 from llm_modelbench.runner import _task_hash
 from llm_modelbench.tasks import TASKS
 
@@ -191,16 +192,19 @@ def test_message_never_claims_applicable_on_a_row_the_new_stack_blocks(monkeypat
     # Force the disagreement case directly: legacy family_applicability()
     # says measured_supported (a real, positive state on the stored
     # profile) but the new stack blocks anyway (patched
-    # new_measured_supported_families() to authorize nothing). Before the
-    # fix, this row's observation would have been labelled
-    # "capability_applicable" -- self-contradictory, since build_plan()
-    # is in fact refusing to retry it.
+    # effective_measured_supported_families() to authorize nothing, with no
+    # native/legacy disagreement of its own). Before the fix, this row's
+    # observation would have been labelled "capability_applicable" --
+    # self-contradictory, since build_plan() is in fact refusing to retry it.
     model = "disagreement:latest"
     runs = tmp_path / "runs"
     profile = _profile(model, {"text": MeasuredCapabilityState.MEASURED_SUPPORTED.value}, digest="digest-1")
     _write_repair_run(runs, model, profile, "txt_sort", "empty_output", source_digest="digest-1")
 
-    monkeypatch.setattr(repair_module, "new_measured_supported_families", lambda profile, current_identity: [])
+    monkeypatch.setattr(
+        repair_module, "effective_measured_supported_families",
+        lambda profile, current_identity, ledger=None: EffectiveSupportedFamiliesResult(families=()),
+    )
 
     plan = repair.build_plan(runs, run_id="fleet", include_missing=False)
     assert plan.actions == []

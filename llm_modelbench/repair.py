@@ -39,7 +39,9 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .capabilities import capability_identity_compatibility, interrogate_model
 from .capabilities import MeasuredCapabilityState, family_applicability
-from .capability_evidence_adapter import new_measured_supported_families
+from .capability_evidence_adapter import effective_measured_supported_families
+from .capability_reprobe_execute import default_ledger_path
+from .evidence import EvidenceLedger
 from .hardware import detect_gpu
 from .judge_dumps import apply_judgements, judge_run
 from .rankings import _CURRENT_HASHES, rank_for_output
@@ -733,6 +735,7 @@ def build_plan(
     kv_server_confirmed: bool = False,
     gpu_total_gb: Optional[float] = None,
     force: bool = False,
+    ledger_path: Optional[Path] = None,
 ) -> RepairPlan:
     from .campaign import classify_recovery_row
 
@@ -748,6 +751,11 @@ def build_plan(
     run_dirs = discover_runs(runs_dir, run_id=run_id, run_prefix=run_prefix, everything=everything)
     if not run_dirs:
         raise ValueError("no matching run directories with raw_results.jsonl")
+    # Stage 2.9: prefer a current, identity-compatible native EvidenceLedger
+    # observation over the legacy adapter path (never the reverse); the
+    # ledger already exists (or is empty, in which case every family falls
+    # back to the unchanged legacy path) -- never created/written here.
+    ledger = EvidenceLedger(Path(ledger_path) if ledger_path is not None else default_ledger_path(runs_dir))
     all_rows, contexts = _load_selected_rows(run_dirs)
     current = rank_for_output(all_rows)
     gpu = detect_gpu()
@@ -844,10 +852,27 @@ def build_plan(
         )
         capability_compatibility = profile.get("capability_identity_compatibility") or {}
         current_identity = _profile_source_identity(profile, model=model_name, digest=str(row.get("model_digest_resolved") or ""))
-        capability_authorized = task.family in new_measured_supported_families(profile, current_identity)
+        effective_families = effective_measured_supported_families(profile, current_identity, ledger=ledger)
+        capability_authorized = task.family in effective_families.families
+        if any(d.family == task.family for d in effective_families.disagreements):
+            observations.append({
+                "kind": "native_legacy_capability_evidence_disagreement",
+                "model": row.get("model"), "run_id": row.get("run_id"), "task": task_id,
+                "family": task.family,
+                "reason": "native EvidenceLedger evidence and legacy-adapter-derived evidence disagree for this family; native evidence is authoritative",
+                "disagreements": [
+                    {
+                        "family": d.family, "native_applicable": d.native_applicable,
+                        "native_reason": d.native_reason, "legacy_applicable": d.legacy_applicable,
+                        "legacy_reason": d.legacy_reason,
+                    }
+                    for d in effective_families.disagreements if d.family == task.family
+                ],
+            })
         # Authority (whether this family may be retried) is decided solely by
-        # new_measured_supported_families() -- the typed Stage 2 pipeline,
-        # identical to planner.py/runner.py's migrated gates. The legacy
+        # effective_measured_supported_families() -- the typed Stage 2
+        # pipeline, native-ledger-preferred, identical policy to
+        # planner.py/runner.py's migrated gates. The legacy
         # capability_identity_compatibility()/family_applicability() calls
         # above/below are kept only to choose *which* of the two existing
         # observation messages to emit and to populate their reason text
@@ -985,7 +1010,20 @@ def build_plan(
                 source_digest_available=bool(context.get("digest")),
             )
             current_identity = _profile_source_identity(profile, model=str(context.get("model") or ""), digest=str(context.get("digest") or ""))
-            families = set(new_measured_supported_families(profile, current_identity))
+            effective_missing = effective_measured_supported_families(profile, current_identity, ledger=ledger)
+            families = set(effective_missing.families)
+            for d in effective_missing.disagreements:
+                observations.append({
+                    "kind": "native_legacy_capability_evidence_disagreement",
+                    "model": context.get("model"), "run_id": None, "task": None,
+                    "family": d.family,
+                    "reason": "native EvidenceLedger evidence and legacy-adapter-derived evidence disagree for this family (missing-task synthesis path); native evidence is authoritative",
+                    "disagreements": [{
+                        "family": d.family, "native_applicable": d.native_applicable,
+                        "native_reason": d.native_reason, "legacy_applicable": d.legacy_applicable,
+                        "legacy_reason": d.legacy_reason,
+                    }],
+                })
             model_name = str(context.get("model") or "")
             known_unavailable = unavailable_families_by_model.get(model_name, set())
             for task in TASKS:

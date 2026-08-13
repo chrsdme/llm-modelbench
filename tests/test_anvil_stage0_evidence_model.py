@@ -6,6 +6,7 @@ Fully offline: no GPU, no live Ollama/llama.cpp endpoint, filesystem only.
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -269,6 +270,63 @@ def test_ledger_persists_across_instances(tmp_path: Path):
     record = ledger1.append("primary_row", {"task": "x", "score": 1})
     ledger2 = EvidenceLedger(path)
     assert ledger2.get(record.record_id) is not None
+
+
+def test_ledger_malformed_json_line_is_skipped_not_fatal(tmp_path: Path):
+    path = tmp_path / "ledger.jsonl"
+    ledger = EvidenceLedger(path)
+    good = ledger.append("primary_row", {"task": "a"})
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("{not valid json\n")
+    fresh = EvidenceLedger(path)
+    assert fresh.get(good.record_id) is not None
+    assert list(fresh.all()) == [good]
+    reasons = fresh.malformed_lines()
+    assert len(reasons) == 1
+    line_number, reason = reasons[0]
+    assert line_number == 2
+    assert "JSONDecodeError" in reason
+
+
+def test_ledger_malformed_missing_required_key_is_skipped_not_fatal(tmp_path: Path):
+    path = tmp_path / "ledger.jsonl"
+    ledger = EvidenceLedger(path)
+    good = ledger.append("primary_row", {"task": "a"})
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"record_id": "x", "record_type": "primary_row"}) + "\n")
+    fresh = EvidenceLedger(path)
+    assert [r.record_id for r in fresh.all()] == [good.record_id]
+    reasons = fresh.malformed_lines()
+    assert len(reasons) == 1
+    assert "KeyError" in reasons[0][1]
+
+
+def test_ledger_malformed_invalid_enum_value_is_skipped_not_fatal(tmp_path: Path):
+    path = tmp_path / "ledger.jsonl"
+    ledger = EvidenceLedger(path)
+    good = ledger.append("primary_row", {"task": "a"})
+    bad_line = json.dumps(
+        {
+            "record_id": "y",
+            "record_type": "primary_row",
+            "payload": {},
+            "provenance": [],
+            "trust_class": "not_a_real_trust_class",
+        }
+    )
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(bad_line + "\n")
+    fresh = EvidenceLedger(path)
+    assert [r.record_id for r in fresh.all()] == [good.record_id]
+    reasons = fresh.malformed_lines()
+    assert len(reasons) == 1
+    assert "ValueError" in reasons[0][1]
+
+
+def test_ledger_no_malformed_lines_on_a_clean_ledger(tmp_path: Path):
+    ledger = EvidenceLedger(tmp_path / "ledger.jsonl")
+    ledger.append("primary_row", {"task": "a"})
+    assert ledger.malformed_lines() == ()
 
 
 def test_ledger_find_by_record_type(tmp_path: Path):

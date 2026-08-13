@@ -271,17 +271,27 @@ def run_reprobe_execution(
     actions: Optional[Tuple[ReprobeAction, ...]] = None,
 ) -> ReprobeExecutionReport:
     """Execute (a possibly pre-filtered subset of) ``plan``'s actions and
-    produce a before/after report. ``fleet_before`` is the legacy-evidence
-    -axis snapshot (:func:`classify_fleet`, unmodified, run once before any
-    probe fires) -- it is expected, by construction, to equal a fresh
-    ``classify_fleet()`` call made *after* execution too, since this module
-    never rewrites ``capability_report.json``; that equality is asserted in
-    tests, not repeated here as a second, redundant "after" computation.
-    ``native_evidence_after`` is the genuinely new signal: per-capability
-    coverage of the ledger evidence this run actually wrote. See
-    ``local_only/anvil/stage-2.7C-execution.md`` decision 1 for why these
-    stay two separate axes rather than one blended number."""
-    fleet_before: FleetEvidenceReport = classify_fleet(client, runs_dir=runs_dir, campaigns_root=campaigns_root)
+    produce a before/after report. ``fleet_before`` is a :func:`classify_fleet`
+    snapshot taken once before any probe in *this* run fires, using this same
+    ``ledger`` -- so it already reflects any native evidence accumulated by
+    earlier ``reprobe-execute`` runs (Stage 2.9: ``classify_fleet()`` is
+    native-ledger-aware, preferring a current compatible native observation
+    over the legacy-adapter-derived classification; see
+    ``classify_model_capability()``'s docstring for the exact policy). It is
+    no longer guaranteed to equal a fresh ``classify_fleet()`` call made
+    *after* this run's own execution below, precisely because that execution
+    appends new native evidence to this same ledger -- newly-reprobed cells
+    are expected to flip from e.g. MISSING to CURRENT_VALID between before
+    and after now, which is the Stage 2.9 lifecycle-closure property, not a
+    regression of Stage 2.7C's original "legacy axis unchanged" observation
+    (that observation is still true of the *legacy* capability_report.json
+    axis alone, which this module still never rewrites -- it just is no
+    longer the only axis classify_fleet() reports on).
+    ``native_evidence_after`` is the genuinely new signal from *this run*
+    specifically: per-capability coverage of the ledger evidence this run
+    actually wrote. See ``local_only/anvil/stage-2.7C-execution.md`` decision
+    1 for why these stay two separate axes rather than one blended number."""
+    fleet_before: FleetEvidenceReport = classify_fleet(client, runs_dir=runs_dir, campaigns_root=campaigns_root, ledger=ledger)
     selected_actions = actions if actions is not None else plan.actions
     outcomes = execute_reprobe_actions(selected_actions, client, ledger)
     return ReprobeExecutionReport(

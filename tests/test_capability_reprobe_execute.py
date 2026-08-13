@@ -251,6 +251,137 @@ def test_preexisting_supersession_conflict_is_skipped_not_repaired(tmp_path, mon
 
 
 # ---------------------------------------------------------------------------
+# Anvil Stage 2.9: full lifecycle closure. MISSING -> REPROBE planned -> real
+# probe executed -> native CapabilityObservation appended -> next
+# classification reports CURRENT_VALID (or a valid terminal negative), not
+# MISSING again -> next reprobe-plan reports NO_ACTION. Exercises the real
+# end-to-end pipeline (classify_fleet -> plan_fleet_reprobes ->
+# run_reprobe_execution -> classify_fleet -> plan_fleet_reprobes again), not
+# a patched fixed observation -- this is the exact property advice item 4
+# requires proven, not merely asserted.
+# ---------------------------------------------------------------------------
+
+def test_full_lifecycle_positive_missing_to_current_valid_to_no_action(tmp_path):
+    runs_dir = tmp_path / "runs"
+    campaigns_dir = tmp_path / "campaigns"
+    runs_dir.mkdir()
+    campaigns_dir.mkdir()
+    client = _FakeClient()  # chat() -> {"ok": True, ...}: a genuine measured positive for "text"
+
+    before = classify_fleet(client, runs_dir=runs_dir, campaigns_root=campaigns_dir)
+    before_cell = next(c for c in before.cells if c.model == "probe-model" and c.capability == "text")
+    assert before_cell.status == EvidenceCellStatus.MISSING
+
+    plan = plan_fleet_reprobes(client, runs_dir=runs_dir, campaigns_root=campaigns_dir)
+    actions = plan.filtered(model="probe-model", capability="text", only_required=True)
+    assert len(actions) == 1
+    assert actions[0].action == ReprobeActionKind.REPROBE
+
+    ledger = EvidenceLedger(default_ledger_path(runs_dir))
+    report = run_reprobe_execution(
+        plan, client, ledger, runs_dir=runs_dir, campaigns_root=campaigns_dir, actions=actions,
+    )
+    assert report.native_evidence_after["appended"] == 1
+
+    after = classify_fleet(client, runs_dir=runs_dir, campaigns_root=campaigns_dir)
+    after_cell = next(c for c in after.cells if c.model == "probe-model" and c.capability == "text")
+    assert after_cell.status == EvidenceCellStatus.CURRENT_VALID
+    assert after_cell.typed_decision_reason == "measured_supported"
+    assert after_cell.reason.startswith("selected native EvidenceLedger observation")
+
+    plan2 = plan_fleet_reprobes(client, runs_dir=runs_dir, campaigns_root=campaigns_dir)
+    actions2 = plan2.filtered(model="probe-model", capability="text", only_required=True)
+    assert actions2 == ()
+
+
+def test_full_lifecycle_negative_missing_to_terminal_negative_to_no_action(tmp_path):
+    runs_dir = tmp_path / "runs"
+    campaigns_dir = tmp_path / "campaigns"
+    runs_dir.mkdir()
+    campaigns_dir.mkdir()
+    client = _FakeClient()  # chat_tools() -> {"ok": False, ...} by default: a genuine measured negative for "tools"
+
+    before = classify_fleet(client, runs_dir=runs_dir, campaigns_root=campaigns_dir)
+    before_cell = next(c for c in before.cells if c.model == "probe-model" and c.capability == "tools")
+    assert before_cell.status == EvidenceCellStatus.MISSING
+
+    plan = plan_fleet_reprobes(client, runs_dir=runs_dir, campaigns_root=campaigns_dir)
+    actions = plan.filtered(model="probe-model", capability="tools", only_required=True)
+    assert len(actions) == 1
+
+    ledger = EvidenceLedger(default_ledger_path(runs_dir))
+    report = run_reprobe_execution(
+        plan, client, ledger, runs_dir=runs_dir, campaigns_root=campaigns_dir, actions=actions,
+    )
+    assert report.native_evidence_after["appended"] == 1
+
+    after = classify_fleet(client, runs_dir=runs_dir, campaigns_root=campaigns_dir)
+    after_cell = next(c for c in after.cells if c.model == "probe-model" and c.capability == "tools")
+    # A valid terminal negative -- not MISSING, not PROBE_INCONCLUSIVE (which
+    # would still be reprobe-worthy, per advice item 5).
+    assert after_cell.status in (EvidenceCellStatus.MEASURED_UNSUPPORTED, EvidenceCellStatus.BACKEND_UNSUPPORTED)
+
+    plan2 = plan_fleet_reprobes(client, runs_dir=runs_dir, campaigns_root=campaigns_dir)
+    actions2 = plan2.filtered(model="probe-model", capability="tools", only_required=True)
+    assert actions2 == ()
+
+
+def test_native_probe_inconclusive_remains_reprobe_worthy_not_a_terminal_status(tmp_path):
+    # A native PROBE_INCONCLUSIVE observation (metadata-only/non-functional)
+    # must classify as PROBE_INCONCLUSIVE, not a fabricated CURRENT_VALID or
+    # terminal negative -- and PROBE_INCONCLUSIVE must stay reprobe-worthy
+    # (per advice item 5), unlike a genuine measured terminal state.
+    from llm_modelbench.capability_evidence_classification import REPROBE_NOT_REQUIRED, classify_model_capability
+
+    assert EvidenceCellStatus.PROBE_INCONCLUSIVE not in REPROBE_NOT_REQUIRED
+
+    runs_dir = tmp_path / "runs"
+    runs_dir.mkdir()
+    ledger = EvidenceLedger(default_ledger_path(runs_dir))
+    inconclusive = _observation(result=MeasuredCapabilityState.PROBE_INCONCLUSIVE)
+    append_capability_observation(ledger, inconclusive)
+
+    cell = classify_model_capability(
+        "probe-model", "text", [], current_identity=None, ledger=ledger,
+    )
+    # No current_identity means no native lookup happens at all (see
+    # classify_model_capability's own guard) -- this asserts that guard
+    # rather than a native match, so cover the identity-present path too via
+    # a real classify_fleet() call against a client whose identity matches.
+    assert cell.status == EvidenceCellStatus.MISSING
+
+    class _InconclusiveClient(_FakeClient):
+        pass
+
+    client = _InconclusiveClient()
+    # Reuse the exact identity classify_fleet() itself would compute for
+    # "probe-model" against this client, then append a matching native
+    # PROBE_INCONCLUSIVE observation under that identity.
+    from llm_modelbench.capabilities import current_capability_identity
+    from llm_modelbench.capability_evidence_adapter import typed_identity_from_capability_identity
+
+    live_identity = current_capability_identity(client, "probe-model")
+    typed = typed_identity_from_capability_identity(live_identity, protocol_version=PROBE_PROTOCOL_VERSION)
+    matching_observation = CapabilityObservation(
+        model_identity=typed.model_identity,
+        runtime_profile_identity=typed.runtime_profile_identity,
+        capability="text",
+        result=MeasuredCapabilityState.PROBE_INCONCLUSIVE,
+        probe_protocol_version=PROBE_PROTOCOL_VERSION,
+        capability_schema_version=CAPABILITY_SCHEMA_VERSION,
+        template_config_hash=typed.template_hash,
+        endpoint_identity=typed.endpoint_identity,
+    )
+    ledger2 = EvidenceLedger(default_ledger_path(runs_dir).with_name("ledger2.jsonl"))
+    append_capability_observation(ledger2, matching_observation)
+
+    report = classify_fleet(client, runs_dir=runs_dir, campaigns_root=tmp_path / "campaigns", ledger=ledger2)
+    cell2 = next(c for c in report.cells if c.model == "probe-model" and c.capability == "text")
+    assert cell2.status == EvidenceCellStatus.PROBE_INCONCLUSIVE
+    assert cell2.status not in REPROBE_NOT_REQUIRED
+
+
+# ---------------------------------------------------------------------------
 # Before/after fleet metrics: two separate axes, per stage-2.7C-execution.md
 # decision 1 -- the legacy axis is provably unchanged by construction.
 # ---------------------------------------------------------------------------

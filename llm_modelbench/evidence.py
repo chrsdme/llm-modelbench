@@ -335,19 +335,39 @@ class EvidenceLedger:
         self.path = path
         self._lock = FileLock(path.with_suffix(path.suffix + ".lock"), phase="append")
         self._index: Optional[Dict[str, LedgerRecord]] = None
+        self._malformed_lines: List[Tuple[int, str]] = []
 
     def _load_index(self) -> Dict[str, LedgerRecord]:
         if self._index is not None:
             return self._index
         index: Dict[str, LedgerRecord] = {}
+        malformed: List[Tuple[int, str]] = []
         if self.path.exists():
-            for line in self.path.read_text(encoding="utf-8").splitlines():
+            for line_number, line in enumerate(self.path.read_text(encoding="utf-8").splitlines(), start=1):
                 if not line.strip():
                     continue
-                record = LedgerRecord.from_json_line(line)
+                try:
+                    record = LedgerRecord.from_json_line(line)
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                    # A malformed line is skipped -- never treated as a valid
+                    # record -- rather than failing the whole ledger read.
+                    # Every consumer of get/all/find inherits this: fail-closed
+                    # means an unusable line drops out of consideration, not
+                    # that the entire ledger becomes unreadable.
+                    malformed.append((line_number, f"{type(exc).__name__}: {exc}"))
+                    continue
                 index[record.record_id] = record
         self._index = index
+        self._malformed_lines = malformed
         return index
+
+    def malformed_lines(self) -> Tuple[Tuple[int, str], ...]:
+        """1-based line numbers and reasons for lines skipped during the
+        most recent index load because they failed to parse as a
+        ``LedgerRecord``. Empty when the ledger is clean. Call after any
+        read (``get``/``all``/``find``) to check for corrupt entries."""
+        self._load_index()
+        return tuple(self._malformed_lines)
 
     def append(
         self,

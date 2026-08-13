@@ -111,12 +111,18 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any, List, Mapping, Optional
+from typing import Any, List, Mapping, Optional, Tuple
 
 from .capabilities import CAPABILITY_SCHEMA_VERSION, PROBE_PROTOCOL_VERSION, MeasuredCapabilityState
 from .capability_observation import CapabilityObservation
-from .capability_projection import decide_capability_from_projection, project_capability_observation
+from .capability_projection import (
+    CapabilityProjectionStatus,
+    decide_capability_from_projection,
+    project_capability_from_ledger,
+    project_capability_observation,
+)
 from .classify import FAMILY_ORDER
+from .evidence import EvidenceLedger
 from .identity import ModelArtifactIdentity, RuntimeProfileIdentity
 
 __all__ = [
@@ -296,3 +302,133 @@ def new_measured_supported_families(
         if decide_capability_from_projection(projection).applicable:
             fams.append(family)
     return fams
+
+
+@dataclass(frozen=True)
+class EffectiveCapabilityDisagreement:
+    """One family where native ``EvidenceLedger`` evidence and the
+    legacy-adapter-derived evidence disagree on applicability. Recorded,
+    never silently resolved -- Stage 2.9's explicit policy is that native
+    evidence wins when it is itself unambiguous, but the disagreement
+    must still be visible rather than quietly overwritten. ``native_reason``
+    is a ``CapabilityDecisionReason`` value when native evidence produced a
+    decision, or a ``CapabilityProjectionStatus`` value (e.g.
+    ``"ambiguous_compatible_observations"``) when native evidence itself
+    was ambiguous/conflicted and had to fail closed."""
+
+    family: str
+    native_applicable: Optional[bool]
+    native_reason: str
+    legacy_applicable: bool
+    legacy_reason: str
+
+
+@dataclass(frozen=True)
+class EffectiveSupportedFamiliesResult:
+    families: Tuple[str, ...]
+    disagreements: Tuple[EffectiveCapabilityDisagreement, ...] = ()
+
+
+def effective_measured_supported_families(
+    profile: Mapping[str, Any],
+    current_identity: Optional[Mapping[str, Any]],
+    *,
+    ledger: Optional[EvidenceLedger] = None,
+) -> EffectiveSupportedFamiliesResult:
+    """Stage 2.9 native-evidence-preferred capability-authority gate. A
+    new sibling of :func:`new_measured_supported_families`, not a
+    replacement for it -- that function's contract (bare ``List[str]``,
+    legacy-adapter-only) stays exactly as-is for any caller not yet
+    migrated, so this can be adopted per call site without touching the
+    other three at once.
+
+    Per family in ``FAMILY_ORDER``:
+
+    - If ``ledger`` yields a current, identity-compatible native
+      observation (``CapabilityProjectionStatus.SELECTED``), that decision
+      is authoritative -- it is never overridden by the legacy/adapter
+      path, even when they disagree. A disagreement is recorded in the
+      result, not resolved by picking a side, averaging, or preferring
+      whichever is newer.
+    - If native evidence for the family is itself ambiguous or conflicted
+      (``AMBIGUOUS_COMPATIBLE_OBSERVATIONS`` / ``SUPERSESSION_CONFLICT``),
+      the family fails closed -- excluded regardless of what the legacy
+      adapter would have said. Ambiguous native evidence is never rescued
+      by falling back to a convenient legacy answer.
+    - Otherwise (no native evidence exists yet for the family, or no
+      ``ledger`` was given at all), the legacy adapter path applies
+      unchanged -- the Stage 2.6 compatibility fallback for fleet cells
+      not yet reprobed under Stage 2.7C.
+    """
+    current_typed_identity = (
+        typed_identity_from_capability_identity(current_identity, protocol_version=PROBE_PROTOCOL_VERSION)
+        if current_identity is not None else None
+    )
+    families: List[str] = []
+    disagreements: List[EffectiveCapabilityDisagreement] = []
+
+    for family in FAMILY_ORDER:
+        legacy_observation = adapt_legacy_profile_family_to_observation(profile, family)
+        legacy_projection = project_capability_observation(
+            [legacy_observation] if legacy_observation is not None else [],
+            capability=family,
+            current_model_identity=current_typed_identity.model_identity if current_typed_identity else None,
+            current_runtime_profile_identity=current_typed_identity.runtime_profile_identity if current_typed_identity else None,
+            current_probe_protocol_version=PROBE_PROTOCOL_VERSION,
+            current_capability_schema_version=CAPABILITY_SCHEMA_VERSION,
+            current_template_config_hash=current_typed_identity.template_hash if current_typed_identity else None,
+            current_endpoint_identity=current_typed_identity.endpoint_identity if current_typed_identity else None,
+        )
+        legacy_decision = decide_capability_from_projection(legacy_projection)
+
+        native_projection = None
+        if ledger is not None:
+            native_projection = project_capability_from_ledger(
+                ledger,
+                capability=family,
+                current_model_identity=current_typed_identity.model_identity if current_typed_identity else None,
+                current_runtime_profile_identity=current_typed_identity.runtime_profile_identity if current_typed_identity else None,
+                current_probe_protocol_version=PROBE_PROTOCOL_VERSION,
+                current_capability_schema_version=CAPABILITY_SCHEMA_VERSION,
+                current_template_config_hash=current_typed_identity.template_hash if current_typed_identity else None,
+                current_endpoint_identity=current_typed_identity.endpoint_identity if current_typed_identity else None,
+            )
+
+        if native_projection is not None and native_projection.status in (
+            CapabilityProjectionStatus.AMBIGUOUS_COMPATIBLE_OBSERVATIONS,
+            CapabilityProjectionStatus.SUPERSESSION_CONFLICT,
+        ):
+            if legacy_decision.applicable:
+                disagreements.append(
+                    EffectiveCapabilityDisagreement(
+                        family=family,
+                        native_applicable=None,
+                        native_reason=native_projection.status.value,
+                        legacy_applicable=True,
+                        legacy_reason=legacy_decision.reason.value,
+                    )
+                )
+            continue  # fail closed: ambiguous native evidence is never rescued by legacy
+
+        if native_projection is not None and native_projection.status == CapabilityProjectionStatus.SELECTED:
+            native_decision = decide_capability_from_projection(native_projection)
+            if native_decision.applicable != legacy_decision.applicable:
+                disagreements.append(
+                    EffectiveCapabilityDisagreement(
+                        family=family,
+                        native_applicable=native_decision.applicable,
+                        native_reason=native_decision.reason.value,
+                        legacy_applicable=legacy_decision.applicable,
+                        legacy_reason=legacy_decision.reason.value,
+                    )
+                )
+            if native_decision.applicable:
+                families.append(family)
+            continue
+
+        # No usable native evidence for this family -- legacy/adapter
+        # compatibility fallback, unchanged Stage 2.6 behavior.
+        if legacy_decision.applicable:
+            families.append(family)
+
+    return EffectiveSupportedFamiliesResult(families=tuple(families), disagreements=tuple(disagreements))
