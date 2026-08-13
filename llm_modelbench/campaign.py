@@ -3158,6 +3158,9 @@ def _judge_measured_text_state(item: Dict[str, Any]) -> str:
     return state
 
 
+_SYNTHETIC_IDENTITY_DIGEST_ONLY_INCOMPATIBILITY_REASONS = frozenset({"model_digest_changed"})
+
+
 def _candidate_current_capability_identity(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """The identity to project stored judge-candidate evidence against, for
     the typed Stage 2 capability authority (Anvil Stage 2.6D).
@@ -3176,6 +3179,28 @@ def _candidate_current_capability_identity(item: Dict[str, Any]) -> Optional[Dic
     independent digest: that would make compatibility compare evidence to
     itself and could never detect staleness, silently laundering legacy
     authority into a supposedly-live typed check.
+
+    **Digest is the only field this function independently re-observes.**
+    Backend, endpoint, implementation, and template-config hash are copied
+    verbatim from the stored identity -- there is no live client at
+    judge-candidate-construction time to re-probe them (unlike planner/
+    runner). A drift confined to one of those fields, with the digest
+    unchanged, is therefore structurally invisible to the projection this
+    identity feeds -- confirmed by direct experiment during this slice's
+    Task #8 comparison-gate build: a candidate whose precomputed
+    ``capability_identity_compatibility`` field says ``backend_changed``
+    (compatible=False, digest matching) was, before this check existed,
+    still admitted by the typed authority -- a real legacy-NO -> new-YES
+    expansion, exactly what the comparison gate's hard-gate exists to
+    catch (`codex-advise_pre2.6D.txt` part 5/13). Fixed here: the
+    precomputed legacy compatibility signal (or a live one, already
+    handled above) is the *only* evidence available for those
+    non-digest dimensions, so a negative signal for any reason other than
+    a stale digest -- which this function's own fresh digest override
+    already independently re-verifies -- must still fail closed. This is
+    not legacy admitting a candidate (forbidden); it is legacy blocking
+    one for a dimension the typed stack has no independent evidence for,
+    which is always the safe direction.
     """
     live = item.get("current_capability_identity")
     if isinstance(live, Mapping):
@@ -3185,6 +3210,12 @@ def _candidate_current_capability_identity(item: Dict[str, Any]) -> Optional[Dic
         return None
     digest = _candidate_digest(item)
     if not digest:
+        return None
+    legacy_compatibility = _candidate_capability_identity_compatibility(item)
+    if (
+        not legacy_compatibility.get("compatible")
+        and legacy_compatibility.get("reason") not in _SYNTHETIC_IDENTITY_DIGEST_ONLY_INCOMPATIBILITY_REASONS
+    ):
         return None
     identity = copy.deepcopy(dict(stored))
     model_identity = dict(identity.get("model") or {})

@@ -59,11 +59,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from .capabilities import (
     CAPABILITY_SCHEMA_VERSION,
     PROBE_PROTOCOL_VERSION,
+    MeasuredCapabilityState,
     capability_identity_compatibility,
     measured_supported_families,
 )
@@ -73,7 +74,13 @@ from .capability_evidence_adapter import (
 )
 from .capability_projection import decide_capability_from_projection, project_capability_observation
 
-__all__ = ["ComparisonDirection", "ComparisonVerdict", "CapabilityDecisionComparison", "compare_planner_capability_decision"]
+__all__ = [
+    "ComparisonDirection",
+    "ComparisonVerdict",
+    "CapabilityDecisionComparison",
+    "compare_planner_capability_decision",
+    "compare_judge_capability_eligibility",
+]
 
 
 class ComparisonDirection(str, Enum):
@@ -162,6 +169,90 @@ def compare_planner_capability_decision(
         legacy_reason=legacy_reason,
         new_applicable=new_applicable,
         new_reason=new_reason,
+        direction=direction,
+        verdict=verdict,
+    )
+
+
+def _legacy_judge_capability_rejection_reference(item: Mapping[str, Any]) -> Optional[str]:
+    """Frozen, verbatim reproduction of ``campaign.py``'s pre-Stage-2.6D
+    ``_judge_capability_rejection()`` (as it existed at commit ``36be6e6``,
+    the parent of the 2.6D migration), reconstructed here from the same
+    unchanged helper primitives 2.6D deliberately kept callable as a
+    "regression oracle, comparison source" (per
+    ``codex-advise_pre2.6D.txt`` part 9) rather than deleted.
+
+    This function is used **only** by :func:`compare_judge_capability_eligibility`
+    below (Task #8's comparison gate). It is never called by production
+    code and must not be treated as authority -- ``campaign.py``'s current
+    ``_judge_capability_rejection()`` (the post-2.6D typed-authority
+    version) is the real production decision; this is its frozen
+    predecessor, kept only to prove what changed.
+    """
+    from .campaign import (
+        _candidate_capability_identity_compatibility,
+        _canonical_candidate_families,
+        _judge_measured_text_state,
+    )
+
+    if item.get("capability_schema_version") != CAPABILITY_SCHEMA_VERSION:
+        return "capability_reprobe_required"
+    state = _judge_measured_text_state(item)
+    families = _canonical_candidate_families(item)
+    if state == MeasuredCapabilityState.MEASURED_SUPPORTED.value:
+        if not _candidate_capability_identity_compatibility(item).get("compatible"):
+            return "capability_reprobe_required"
+        return None
+    if state == MeasuredCapabilityState.PROBE_INCONCLUSIVE.value:
+        return "capability_reprobe_required"
+    if "embedding" in families:
+        return "non_generative_embedding_only"
+    if "vision" in families:
+        return "non_generative_vision_only"
+    return "unknown_or_non_generative_capability"
+
+
+def compare_judge_capability_eligibility(
+    item: Dict[str, Any],
+    *,
+    known_correction: bool = False,
+) -> CapabilityDecisionComparison:
+    """Anvil Stage 2.6D, Task #8 -- compare the legacy (pre-2.6D, frozen
+    above) judge candidate text-capability-eligibility decision against
+    ``campaign.py``'s real, current (post-2.6D) ``_judge_capability_rejection()``,
+    for the same candidate ``item`` dict.
+
+    Both sides call ``campaign.py``'s actual functions (the frozen
+    reference on the legacy side, the live production function on the new
+    side) rather than re-implementing judge eligibility logic a third
+    time -- a discrepancy here reflects a real behavioral difference, not
+    a harness bug. ``known_correction=True`` is the only way a difference
+    becomes ``EXPECTED_CORRECTION``, matching
+    :func:`compare_planner_capability_decision`'s existing convention.
+    """
+    from .campaign import _judge_capability_rejection
+
+    legacy_rejection = _legacy_judge_capability_rejection_reference(item)
+    legacy_applicable = legacy_rejection is None
+    new_rejection = _judge_capability_rejection(item)
+    new_applicable = new_rejection is None
+
+    if legacy_applicable == new_applicable:
+        direction = ComparisonDirection.NONE
+        verdict = ComparisonVerdict.MATCH
+    elif legacy_applicable and not new_applicable:
+        direction = ComparisonDirection.CONTRACTION
+        verdict = ComparisonVerdict.EXPECTED_CORRECTION if known_correction else ComparisonVerdict.UNEXPLAINED_DIFFERENCE
+    else:
+        direction = ComparisonDirection.EXPANSION
+        verdict = ComparisonVerdict.EXPECTED_CORRECTION if known_correction else ComparisonVerdict.UNEXPLAINED_DIFFERENCE
+
+    return CapabilityDecisionComparison(
+        family="text",
+        legacy_applicable=legacy_applicable,
+        legacy_reason=legacy_rejection or "eligible",
+        new_applicable=new_applicable,
+        new_reason=new_rejection or "eligible",
         direction=direction,
         verdict=verdict,
     )
