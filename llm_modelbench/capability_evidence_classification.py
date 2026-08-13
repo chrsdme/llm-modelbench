@@ -59,15 +59,25 @@ cell is not currently valid -- never to decide validity itself. That
 keeps to the same discipline as every other Anvil Stage 2 migration:
 legacy dict-shaped logic may narrow a message, never grant authority.
 
-**SUPERSESSION_CONFLICT is listed but structurally unreachable here.** It
-only arises from :func:`~llm_modelbench.capability_projection.project_capability_from_ledger`
-resolving a ``SUPERSEDES`` chain via ``EvidenceLedger``. Confirmed
-unchanged since the Stage 2.6E audit: ``EvidenceLedger`` is never
-instantiated in production. This classifier reads plain
-``capability_report.json`` files, not a ledger, so no supersession chain
-can ever exist to conflict. The bucket is kept in the enum (per the
-advice's explicit minimum list) so a later ledger-backed stage can reuse
-this same vocabulary without a rename.
+**SUPERSESSION_CONFLICT was unreachable here through Stage 2.7C; Stage
+2.9 made it reachable, deliberately.** Through Stage 2.7C this classifier
+read only plain ``capability_report.json`` files, never a ledger, so no
+``SUPERSEDES`` chain could ever exist to conflict. As of Stage 2.9,
+``classify_model_capability()``/``classify_fleet()`` accept an optional
+``ledger`` parameter (auto-defaulting to
+``<runs_dir>/capability_evidence_ledger.jsonl``, the same convention
+``reprobe-execute`` writes to) and consult
+:func:`~llm_modelbench.capability_projection.project_capability_from_ledger`
+before falling back to the legacy-only path below. When that native
+lookup itself resolves to ``SUPERSESSION_CONFLICT`` (a resolver-detected
+cycle, missing source, or cross-capability fork in the ledger's own
+provenance graph) or ``AMBIGUOUS_COMPATIBLE_OBSERVATIONS`` (multiple
+disagreeing compatible native observations with no supersession relation
+between them), that status is reported directly and the cell fails
+closed -- never silently treated as no-evidence, never falling back to a
+legacy answer. See ``tests/test_capability_evidence_adapter_effective_
+authority.py`` and ``tests/test_capability_reprobe_execute.py``'s Stage
+2.9 sections for coverage of both branches through this exact function.
 
 **VALID_BUT_OLD is deliberately omitted.** The advice is explicit: only add
 it "if there is an actual age/freshness policy. Do not invent staleness

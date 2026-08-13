@@ -12,6 +12,7 @@ import pytest
 
 from llm_modelbench.capabilities import CAPABILITY_SCHEMA_VERSION, PROBE_PROTOCOL_VERSION, MeasuredCapabilityState
 from llm_modelbench.capabilities import _canonical_hash as legacy_canonical_hash
+from llm_modelbench.capability_evidence_adapter import typed_identity_from_capability_identity
 from llm_modelbench.capability_evidence_classification import (
     REPROBE_NOT_REQUIRED,
     EvidenceCellStatus,
@@ -20,6 +21,8 @@ from llm_modelbench.capability_evidence_classification import (
     discover_capability_report_files,
     load_fleet_evidence,
 )
+from llm_modelbench.capability_observation import CAPABILITY_OBSERVATION_RECORD_TYPE, CapabilityObservation
+from llm_modelbench.evidence import EvidenceLedger, ProvenanceLink, ProvenanceRelation
 
 
 def _template_config(*, num_ctx=8192):
@@ -241,6 +244,75 @@ def test_monkeypatch_lie_does_not_flip_classification(monkeypatch):
     # underlying MODEL_IDENTITY_CHANGED-vs-CURRENT_VALID applicability call.
     assert cell.status != EvidenceCellStatus.CURRENT_VALID
     assert cell.typed_decision_reason == "no_current_projection"
+
+
+# ---------------------------------------------------------------------------
+# Anvil Stage 2.9: native EvidenceLedger evidence, preferred over the legacy
+# axis, failing closed when itself ambiguous/conflicted -- SUPERSESSION_
+# CONFLICT and AMBIGUOUS_COMPATIBLE_OBSERVATIONS are reachable through this
+# module's own classify_model_capability()/classify_fleet(), not just
+# through the adapter's effective_measured_supported_families() (covered
+# separately in test_capability_evidence_adapter_effective_authority.py).
+# ---------------------------------------------------------------------------
+
+def _native_observation(*, family="text", state=MeasuredCapabilityState.MEASURED_SUPPORTED, digest="sha256:abc123"):
+    typed = typed_identity_from_capability_identity(_capability_identity(digest=digest), protocol_version=PROBE_PROTOCOL_VERSION)
+    return CapabilityObservation(
+        model_identity=typed.model_identity,
+        runtime_profile_identity=typed.runtime_profile_identity,
+        capability=family,
+        result=state,
+        probe_protocol_version=PROBE_PROTOCOL_VERSION,
+        capability_schema_version=CAPABILITY_SCHEMA_VERSION,
+        template_config_hash=typed.template_hash,
+        endpoint_identity=typed.endpoint_identity,
+    )
+
+
+def test_native_selected_overrides_legacy_missing(tmp_path):
+    ledger = EvidenceLedger(tmp_path / "ledger.jsonl")
+    from llm_modelbench.capability_observation import append_capability_observation
+
+    append_capability_observation(ledger, _native_observation(state=MeasuredCapabilityState.MEASURED_SUPPORTED))
+    cell = classify_model_capability("qwen2.5-coder:14b", "text", [], _current_identity(), ledger=ledger)
+    assert cell.status == EvidenceCellStatus.CURRENT_VALID
+    assert cell.reason.startswith("selected native EvidenceLedger observation")
+
+
+def test_native_ambiguous_fails_closed_through_classify_model_capability(tmp_path):
+    ledger = EvidenceLedger(tmp_path / "ledger.jsonl")
+    from llm_modelbench.capability_observation import append_capability_observation
+
+    append_capability_observation(ledger, _native_observation(state=MeasuredCapabilityState.MEASURED_SUPPORTED))
+    append_capability_observation(ledger, _native_observation(state=MeasuredCapabilityState.MEASURED_UNSUPPORTED))
+    # A positive legacy profile exists too -- must not rescue the cell from
+    # the ambiguous native evidence.
+    stored = [(Path("runs/r1/capability_report.json"), _profile(state=MeasuredCapabilityState.MEASURED_SUPPORTED))]
+    cell = classify_model_capability("qwen2.5-coder:14b", "text", stored, _current_identity(), ledger=ledger)
+    assert cell.status == EvidenceCellStatus.AMBIGUOUS_COMPATIBLE_OBSERVATIONS
+    assert cell.status not in REPROBE_NOT_REQUIRED
+
+
+def test_native_supersession_conflict_reachable_through_classify_fleet(tmp_path):
+    # A genuine cycle in the ledger's own provenance graph, same
+    # construction as test_resolver_detects_a_cycle in the Stage 0 evidence
+    # model suite.
+    ledger = EvidenceLedger(tmp_path / "ledger.jsonl")
+    obs_a = _native_observation(state=MeasuredCapabilityState.MEASURED_SUPPORTED)
+    obs_b = _native_observation(state=MeasuredCapabilityState.MEASURED_UNSUPPORTED, digest="sha256:def456")
+    ledger.append(
+        CAPABILITY_OBSERVATION_RECORD_TYPE, obs_a.to_ledger_payload(), record_id="oa",
+        provenance=[ProvenanceLink(ProvenanceRelation.SUPERSEDES, "ob")],
+    )
+    ledger.append(
+        CAPABILITY_OBSERVATION_RECORD_TYPE, obs_b.to_ledger_payload(), record_id="ob",
+        provenance=[ProvenanceLink(ProvenanceRelation.SUPERSEDES, "oa")],
+    )
+    client = _FakeClient({"qwen2.5-coder:14b": "sha256:abc123"})
+    report = classify_fleet(client, runs_dir=tmp_path / "runs", campaigns_root=tmp_path / "campaigns", ledger=ledger)
+    cell = next(c for c in report.cells if c.model == "qwen2.5-coder:14b" and c.capability == "text")
+    assert cell.status == EvidenceCellStatus.SUPERSESSION_CONFLICT
+    assert cell.status not in REPROBE_NOT_REQUIRED
 
 
 # ---------------------------------------------------------------------------
