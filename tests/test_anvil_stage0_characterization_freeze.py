@@ -106,6 +106,24 @@ def _normalize(value: Any) -> Any:
                 # Portable fixtures must not bake in a contributor's actual
                 # hardware identity.
                 out[key] = "<HOST_DERIVED_HASH>"
+            elif key in (
+                "physical_gpu_uuids", "declared_device_order", "gpu_uuid_assignment",
+            ):
+                # Real finding, caught the same way as identity_hash above,
+                # by an actual CI run rather than by inspection: real GPU
+                # topology detection is NOT mocked by --mock, so these lists'
+                # *length* (not just their UUID values, already scrubbed by
+                # the GPU-UUID regex below) reflects whatever host generated
+                # the fixture -- 2 GPUs on the machine that froze this
+                # fixture, 0 GPUs on a standard GitHub Actions runner. A
+                # value-level scrub can turn a real UUID into <GPU_UUID_0>,
+                # but it can't turn a 2-element list into an empty one --
+                # collapse the whole field to one topology-agnostic
+                # placeholder rather than attempt to preserve shape.
+                out[key] = "<GPU_TOPOLOGY_LIST>"
+            elif key == "pci_bus_ids":
+                # Same finding, dict form (GPU UUID -> PCI bus ID).
+                out[key] = "<GPU_TOPOLOGY_MAP>"
             else:
                 out[key] = _normalize(val)
         return out
@@ -375,6 +393,21 @@ def _normalize_argparse_help(text: str) -> str:
     return text.replace("optional arguments:", "options:")
 
 
+def _collapse_whitespace(text: str) -> str:
+    """argparse's HelpFormatter can wrap the same content at different
+    column positions across Python versions/patch releases -- confirmed
+    directly: a subparsers choice list's trailing "..." landed on its own
+    wrapped line under Python 3.9 but stayed on the closing-brace line
+    under the version that froze this fixture, with byte-identical content
+    otherwise. Used only at comparison time (not when writing the frozen
+    .txt fixtures, which stay human-readable multi-line on disk) so the
+    test tolerates *where* argparse chose to wrap a line while still
+    catching a real surface change -- an added/removed/renamed flag or
+    changed help text still changes the collapsed text, only the wrap
+    position is ignored."""
+    return re.sub(r"\s+", " ", text).strip()
+
+
 @pytest.mark.parametrize("name", _all_help_fixture_names())
 def test_cli_help_matches_frozen_baseline(name: str) -> None:
     """Every command/sub-subcommand's --help text matches the Stage 0.0
@@ -394,7 +427,7 @@ def test_cli_help_matches_frozen_baseline(name: str) -> None:
             node = sub_action.choices[part]
     expected = (CLI_HELP_DIR / f"{name}.txt").read_text()
     actual = _normalize_argparse_help(node.format_help())
-    assert actual == expected
+    assert _collapse_whitespace(actual) == _collapse_whitespace(expected)
 
 
 def test_cli_help_fixture_set_is_complete() -> None:

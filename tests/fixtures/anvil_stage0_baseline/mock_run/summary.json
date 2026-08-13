@@ -53,10 +53,7 @@
           "adapter_identity": "MockBackendAdapter",
           "backend": "ollama",
           "completeness": "complete",
-          "declared_device_order": [
-            "<GPU_UUID_0>",
-            "<GPU_UUID_1>"
-          ],
+          "declared_device_order": "<GPU_TOPOLOGY_LIST>",
           "endpoint": "http://127.0.0.1:11434",
           "evidence_provenance": "selected_profile_and_backend_metadata",
           "execution": {
@@ -78,14 +75,8 @@
             "display_name": "llama3.1:8b",
             "provenance": "backend_declared_model_metadata"
           },
-          "pci_bus_ids": {
-            "<GPU_UUID_0>": "<PCI_BUS_ID_1>",
-            "<GPU_UUID_1>": "<PCI_BUS_ID_0>"
-          },
-          "physical_gpu_uuids": [
-            "<GPU_UUID_0>",
-            "<GPU_UUID_1>"
-          ],
+          "pci_bus_ids": "<GPU_TOPOLOGY_MAP>",
+          "physical_gpu_uuids": "<GPU_TOPOLOGY_LIST>",
           "profile_name": "legacy-ollama",
           "profile_provenance": "legacy-default",
           "profile_schema_version": 1,
@@ -96,10 +87,7 @@
           "adapter_identity": "MockBackendAdapter",
           "backend": "ollama",
           "completeness": "complete",
-          "declared_device_order": [
-            "<GPU_UUID_0>",
-            "<GPU_UUID_1>"
-          ],
+          "declared_device_order": "<GPU_TOPOLOGY_LIST>",
           "endpoint": "http://127.0.0.1:11434",
           "evidence_provenance": "selected_profile_and_backend_metadata",
           "execution": {
@@ -121,14 +109,8 @@
             "display_name": "qwen2.5-coder:14b",
             "provenance": "backend_declared_model_metadata"
           },
-          "pci_bus_ids": {
-            "<GPU_UUID_0>": "<PCI_BUS_ID_1>",
-            "<GPU_UUID_1>": "<PCI_BUS_ID_0>"
-          },
-          "physical_gpu_uuids": [
-            "<GPU_UUID_0>",
-            "<GPU_UUID_1>"
-          ],
+          "pci_bus_ids": "<GPU_TOPOLOGY_MAP>",
+          "physical_gpu_uuids": "<GPU_TOPOLOGY_LIST>",
           "profile_name": "legacy-ollama",
           "profile_provenance": "legacy-default",
           "profile_schema_version": 1,
@@ -150,14 +132,14 @@
         "backend": "ollama",
         "batch_size": null,
         "context_size": null,
-        "declared_device_order": null,
+        "declared_device_order": "<GPU_TOPOLOGY_LIST>",
         "execution_strategy": null,
         "kv_cache_type": null,
         "micro_batch_size": null,
         "model_artifact_digest": "mock-qwen25coder14b",
         "offload_layers": null,
         "parallel_sequences": null,
-        "physical_gpu_uuids": null,
+        "physical_gpu_uuids": "<GPU_TOPOLOGY_LIST>",
         "runtime_identity_hash": "<HOST_DERIVED_HASH>",
         "runtime_identity_schema_version": 1,
         "runtime_profile": "legacy-ollama",
@@ -226,10 +208,7 @@
           "adapter_identity": "MockBackendAdapter",
           "backend": "ollama",
           "completeness": "complete",
-          "declared_device_order": [
-            "<GPU_UUID_0>",
-            "<GPU_UUID_1>"
-          ],
+          "declared_device_order": "<GPU_TOPOLOGY_LIST>",
           "endpoint": "http://127.0.0.1:11434",
           "evidence_provenance": "selected_profile_and_backend_metadata",
           "execution": {
@@ -251,14 +230,8 @@
             "display_name": "llama3.1:8b",
             "provenance": "backend_declared_model_metadata"
           },
-          "pci_bus_ids": {
-            "<GPU_UUID_0>": "<PCI_BUS_ID_1>",
-            "<GPU_UUID_1>": "<PCI_BUS_ID_0>"
-          },
-          "physical_gpu_uuids": [
-            "<GPU_UUID_0>",
-            "<GPU_UUID_1>"
-          ],
+          "pci_bus_ids": "<GPU_TOPOLOGY_MAP>",
+          "physical_gpu_uuids": "<GPU_TOPOLOGY_LIST>",
           "profile_name": "legacy-ollama",
           "profile_provenance": "legacy-default",
           "profile_schema_version": 1,
@@ -269,10 +242,7 @@
           "adapter_identity": "MockBackendAdapter",
           "backend": "ollama",
           "completeness": "complete",
-          "declared_device_order": [
-            "<GPU_UUID_0>",
-            "<GPU_UUID_1>"
-          ],
+          "declared_device_order": "<GPU_TOPOLOGY_LIST>",
           "endpoint": "http://127.0.0.1:11434",
           "evidence_provenance": "selected_profile_and_backend_metadata",
           "execution": {
@@ -294,14 +264,8 @@
             "display_name": "qwen2.5-coder:14b",
             "provenance": "backend_declared_model_metadata"
           },
-          "pci_bus_ids": {
-            "<GPU_UUID_0>": "<PCI_BUS_ID_1>",
-            "<GPU_UUID_1>": "<PCI_BUS_ID_0>"
-          },
-          "physical_gpu_uuids": [
-            "<GPU_UUID_0>",
-            "<GPU_UUID_1>"
-          ],
+          "pci_bus_ids": "<GPU_TOPOLOGY_MAP>",
+          "physical_gpu_uuids": "<GPU_TOPOLOGY_LIST>",
           "profile_name": "legacy-ollama",
           "profile_provenance": "legacy-default",
           "profile_schema_version": 1,
@@ -323,14 +287,14 @@
         "backend": "ollama",
         "batch_size": null,
         "context_size": null,
-        "declared_device_order": null,
+        "declared_device_order": "<GPU_TOPOLOGY_LIST>",
         "execution_strategy": null,
         "kv_cache_type": null,
         "micro_batch_size": null,
         "model_artifact_digest": "mock-llama318b",
         "offload_layers": null,
         "parallel_sequences": null,
-        "physical_gpu_uuids": null,
+        "physical_gpu_uuids": "<GPU_TOPOLOGY_LIST>",
         "runtime_identity_hash": "<HOST_DERIVED_HASH>",
         "runtime_identity_schema_version": 1,
         "runtime_profile": "legacy-ollama",
