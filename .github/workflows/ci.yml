@@ -124,7 +124,7 @@ jobs:
             --mock \
             --models 'qwen2.5-vl:7b' \
             --level short \
-            --no-auto-probe \
+            --auto \
             --tasks ocr_receipt_total,ocr_table_cell,ocr_form_code,ocr_noisy_label \
             --run-id wheel-resource-smoke \
             --out /tmp/llmb-wheel-runs \
