@@ -19,6 +19,8 @@ Fixtures live under tests/fixtures/anvil_stage0_baseline/. Regenerate them
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import os
 import re
@@ -168,6 +170,45 @@ def _normalize_json_text(text: str) -> str:
     )
 
 
+_CSV_HOST_DERIVED_HASH_COLUMNS = ("runtime_identity_hashes",)
+
+
+def _normalize_csv_text(text: str) -> str:
+    """scorecard.csv's runtime_identity_hashes column embeds a
+    RuntimeIdentity.identity_hash value per model -- like the JSON
+    identity_hash/runtime_identity_hash/runtime_variant_id fields
+    _normalize() already handles, this is derived from real physical GPU
+    UUIDs/PCI bus IDs on whatever host generated it, so it is host-
+    identifying, not run-to-run stable content. A raw byte comparison
+    across two different hosts (e.g. the machine that froze this fixture
+    vs. an ephemeral CI runner) never matches on this column even though
+    every other field in the row is genuinely deterministic under --mock.
+    Confirmed root cause of this project's CI always failing on
+    test_mock_run_evidence_matches_frozen_baseline: scorecard.csv was
+    copied and compared raw (no normalization at all), unlike every other
+    frozen evidence file, which does go through _normalize() for exactly
+    this concern."""
+    rows = list(csv.reader(io.StringIO(text)))
+    if not rows:
+        return text
+    header = rows[0]
+    hash_columns = [
+        index for index, column in enumerate(header) if column in _CSV_HOST_DERIVED_HASH_COLUMNS
+    ]
+    for row in rows[1:]:
+        for index in hash_columns:
+            if index >= len(row) or not row[index]:
+                continue
+            try:
+                hashes = json.loads(row[index])
+            except json.JSONDecodeError:
+                continue
+            row[index] = json.dumps(["<HOST_DERIVED_HASH>" for _ in hashes])
+    output = io.StringIO()
+    csv.writer(output, lineterminator="\n").writerows(rows)
+    return output.getvalue()
+
+
 def _run_mock_benchmark(out_dir: Path, run_id: str) -> Path:
     """Run a deterministic, fully offline mock benchmark. Returns the run directory."""
     env = dict(os.environ)
@@ -213,7 +254,8 @@ def _run_mock_benchmark(out_dir: Path, run_id: str) -> Path:
 # EXPECTED_EVIDENCE_FILES) — freezing their exact bytes wasn't warranted by
 # this pass (either clearly derived/redundant with what's frozen here, or
 # not yet confirmed stable across environments).
-FROZEN_TEXT_FILES = ["routing.md", "prune.md", "clones.md", "scorecard.csv"]
+FROZEN_TEXT_FILES = ["routing.md", "prune.md", "clones.md"]
+FROZEN_CSV_FILES = ["scorecard.csv"]
 FROZEN_JSON_FILES = ["summary.json"]
 FROZEN_JSONL_FILES = ["raw_results.jsonl"]
 
@@ -252,7 +294,7 @@ def _generate_fixtures() -> None:
 
     def walk(parser: argparse.ArgumentParser, path: list[str]) -> None:
         name = "top" if not path else "_".join(path)
-        (CLI_HELP_DIR / f"{name}.txt").write_text(parser.format_help())
+        (CLI_HELP_DIR / f"{name}.txt").write_text(_normalize_argparse_help(parser.format_help()))
         for action in parser._actions:
             if isinstance(action, argparse._SubParsersAction):
                 for choice, subparser in action.choices.items():
@@ -272,6 +314,9 @@ def _generate_fixtures() -> None:
         )
         for name in FROZEN_TEXT_FILES:
             shutil.copy(run_dir / name, MOCK_RUN_DIR / name)
+        for name in FROZEN_CSV_FILES:
+            text = (run_dir / name).read_text()
+            (MOCK_RUN_DIR / name).write_text(_normalize_csv_text(text))
         for name in FROZEN_JSON_FILES:
             text = (run_dir / name).read_text()
             (MOCK_RUN_DIR / name).write_text(_normalize_json_text(text))
@@ -317,6 +362,19 @@ def _all_help_fixture_names() -> list[str]:
     return sorted(p.stem for p in CLI_HELP_DIR.glob("*.txt"))
 
 
+def _normalize_argparse_help(text: str) -> str:
+    """argparse renamed its default options-group heading from "optional
+    arguments:" (Python <=3.9) to "options:" (Python >=3.10) -- a cosmetic
+    change internal to argparse itself, not a change to this project's CLI
+    surface. Fixtures are frozen under one Python version; without this
+    normalization, every --help comparison fails on whichever Python major
+    version wasn't used to generate the fixture (confirmed: this broke
+    every test_cli_help_matches_frozen_baseline case on the CI matrix's
+    Python 3.9 leg, every run, since the fixtures were frozen under
+    3.10+)."""
+    return text.replace("optional arguments:", "options:")
+
+
 @pytest.mark.parametrize("name", _all_help_fixture_names())
 def test_cli_help_matches_frozen_baseline(name: str) -> None:
     """Every command/sub-subcommand's --help text matches the Stage 0.0
@@ -335,7 +393,8 @@ def test_cli_help_matches_frozen_baseline(name: str) -> None:
             )
             node = sub_action.choices[part]
     expected = (CLI_HELP_DIR / f"{name}.txt").read_text()
-    assert node.format_help() == expected
+    actual = _normalize_argparse_help(node.format_help())
+    assert actual == expected
 
 
 def test_cli_help_fixture_set_is_complete() -> None:
@@ -381,6 +440,11 @@ def test_mock_run_evidence_matches_frozen_baseline(tmp_path: Path) -> None:
 
     for name in FROZEN_TEXT_FILES:
         actual = (run_dir / name).read_text()
+        expected = (MOCK_RUN_DIR / name).read_text()
+        assert actual == expected, f"{name} diverged from the Stage 0.0 baseline"
+
+    for name in FROZEN_CSV_FILES:
+        actual = _normalize_csv_text((run_dir / name).read_text())
         expected = (MOCK_RUN_DIR / name).read_text()
         assert actual == expected, f"{name} diverged from the Stage 0.0 baseline"
 
