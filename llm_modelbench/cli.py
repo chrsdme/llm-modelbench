@@ -28,7 +28,7 @@ from urllib.parse import urlparse
 
 from . import __version__
 from .config import Config
-from .classify import classify_model, families_for, size_gb
+from .classify import FAMILY_ORDER, classify_model, families_for, size_gb
 from .filters import parse_task_ids
 from .backend import (
     BackendCapability,
@@ -306,6 +306,40 @@ def cmd_capability_evidence(args, cfg):
     print(f"{label}:")
     for cell in cells:
         print(f"  {cell.model:<40} {cell.capability:<10} {cell.status.value:<36} {cell.reason}")
+
+
+def cmd_reprobe_plan(args, cfg):
+    """Anvil Stage 2.7B: deterministic, read-only reprobe plan built from
+    Stage 2.7A's evidence classification -- never runs a probe, never
+    appends evidence, never mutates any stored file."""
+    from pathlib import Path as _Path
+    from .capability_reprobe_plan import plan_fleet_reprobes
+    client = _client(args, cfg)
+    plan = plan_fleet_reprobes(client, runs_dir=_Path(args.runs_dir), campaigns_root=_Path(args.campaigns_dir))
+    actions = plan.filtered(
+        model=args.model, capability=args.capability, backend=args.backend,
+        reason=args.reason, only_required=args.only_required,
+    )
+    if args.json:
+        payload = plan.to_dict()
+        payload["actions"] = [action.to_dict() for action in actions]
+        print(json.dumps(payload, indent=2))
+        return
+    summary = plan.summary()
+    print(f"plan hash: {plan.canonical_plan_hash()}")
+    print(f"models considered: {len(plan.models_considered)}")
+    print(f"total cells examined: {summary['total_cells_examined']}")
+    print(f"total reprobe actions: {summary['total_actions']}")
+    print()
+    print("by classification:")
+    for classification, count in summary["by_classification"].items():
+        if count:
+            print(f"  {classification:<36} {count}")
+    print()
+    label = "reprobe actions" if args.only_required else "actions"
+    print(f"{label} (after filters):")
+    for action in actions:
+        print(f"  {action.model:<40} {action.capability:<10} {action.action.value:<10} {action.classification:<36} {action.classification_reason}")
 
 
 def cmd_runtime_fit(args, cfg):
@@ -1754,6 +1788,21 @@ def build_parser():
     ce.add_argument("--campaigns-dir", default="campaigns", help="root directory to scan for campaign evidence (default: campaigns)")
     ce.add_argument("--reprobe-required-only", action="store_true", help="in text mode, list only cells that need a reprobe")
 
+    rp = sub.add_parser(
+        "reprobe-plan",
+        help="deterministic, read-only capability reprobe plan from Stage 2.7A evidence classification (Anvil Stage 2.7B)",
+    )
+    rp.add_argument("--json", action="store_true", help="write the full machine-readable plan to stdout")
+    rp.add_argument("--mock", action="store_true", help="use offline stub model list")
+    rp.add_argument("--runtime-profile", help="saved runtime profile; explicit selection takes precedence")
+    rp.add_argument("--runs-dir", default="runs", help="root directory to scan for capability_report.json (default: runs)")
+    rp.add_argument("--campaigns-dir", default="campaigns", help="root directory to scan for campaign evidence (default: campaigns)")
+    rp.add_argument("--model", help="filter to one model alias")
+    rp.add_argument("--capability", choices=list(FAMILY_ORDER), help="filter to one capability family")
+    rp.add_argument("--backend", help="filter to one current backend")
+    rp.add_argument("--reason", help="filter to one Stage 2.7A classification bucket (e.g. model_identity_changed)")
+    rp.add_argument("--only-required", action="store_true", help="show only cells that need a reprobe")
+
     fit = sub.add_parser("runtime-fit", help="read-only conservative model-to-runtime GPU capacity assessment")
     fit.add_argument("--model", required=True, help="exact model name already known to the selected runtime")
     fit.add_argument("--runtime-profile", help="saved runtime profile; explicit selection takes precedence")
@@ -2215,6 +2264,8 @@ def _main(argv=None):
         cmd_inventory(args, cfg)
     elif args.cmd == "capability-evidence":
         cmd_capability_evidence(args, cfg)
+    elif args.cmd == "reprobe-plan":
+        cmd_reprobe_plan(args, cfg)
     elif args.cmd == "runtime-fit":
         cmd_runtime_fit(args, cfg)
     elif args.cmd == "plan":

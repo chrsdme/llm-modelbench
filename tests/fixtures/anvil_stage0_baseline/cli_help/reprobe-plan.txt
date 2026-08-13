@@ -1,0 +1,28 @@
+usage: llm-modelbench reprobe-plan [-h] [--json] [--mock]
+                                   [--runtime-profile RUNTIME_PROFILE]
+                                   [--runs-dir RUNS_DIR]
+                                   [--campaigns-dir CAMPAIGNS_DIR]
+                                   [--model MODEL]
+                                   [--capability {vision,text,embedding,tools,insert}]
+                                   [--backend BACKEND] [--reason REASON]
+                                   [--only-required]
+
+options:
+  -h, --help            show this help message and exit
+  --json                write the full machine-readable plan to stdout
+  --mock                use offline stub model list
+  --runtime-profile RUNTIME_PROFILE
+                        saved runtime profile; explicit selection takes
+                        precedence
+  --runs-dir RUNS_DIR   root directory to scan for capability_report.json
+                        (default: runs)
+  --campaigns-dir CAMPAIGNS_DIR
+                        root directory to scan for campaign evidence (default:
+                        campaigns)
+  --model MODEL         filter to one model alias
+  --capability {vision,text,embedding,tools,insert}
+                        filter to one capability family
+  --backend BACKEND     filter to one current backend
+  --reason REASON       filter to one Stage 2.7A classification bucket (e.g.
+                        model_identity_changed)
+  --only-required       show only cells that need a reprobe

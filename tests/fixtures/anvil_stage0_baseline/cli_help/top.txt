@@ -1,14 +1,16 @@
 usage: llm-modelbench [-h] [--version] [--config CONFIG] [--selftest]
-                      {inventory,capability-evidence,runtime-fit,doctor,runtime,plan,campaign,run,watch,report,simulate,context-profile,model-cards,freeze,serve,pack-subjective,grade,judge-dumps,repair,wizard,diff,export-review,repeat-report,sensitivity-plan,sensitivity-report,coverage,gaps,dossier,rankings,selftest} ...
+                      {inventory,capability-evidence,reprobe-plan,runtime-fit,doctor,runtime,plan,campaign,run,watch,report,simulate,context-profile,model-cards,freeze,serve,pack-subjective,grade,judge-dumps,repair,wizard,diff,export-review,repeat-report,sensitivity-plan,sensitivity-report,coverage,gaps,dossier,rankings,selftest} ...
 
 Hardware-adaptive benchmark suite for local Ollama models.
 
 positional arguments:
-  {inventory,capability-evidence,runtime-fit,doctor,runtime,plan,campaign,run,watch,report,simulate,context-profile,model-cards,freeze,serve,pack-subjective,grade,judge-dumps,repair,wizard,diff,export-review,repeat-report,sensitivity-plan,sensitivity-report,coverage,gaps,dossier,rankings,selftest}
+  {inventory,capability-evidence,reprobe-plan,runtime-fit,doctor,runtime,plan,campaign,run,watch,report,simulate,context-profile,model-cards,freeze,serve,pack-subjective,grade,judge-dumps,repair,wizard,diff,export-review,repeat-report,sensitivity-plan,sensitivity-report,coverage,gaps,dossier,rankings,selftest}
     inventory           list local models
     capability-evidence
                         read-only classification of the fleet's stored
                         capability evidence (Anvil Stage 2.7A)
+    reprobe-plan        deterministic, read-only capability reprobe plan from
+                        Stage 2.7A evidence classification (Anvil Stage 2.7B)
     runtime-fit         read-only conservative model-to-runtime GPU capacity
                         assessment
     doctor              preflight environment, import path, Ollama, GPU, disk

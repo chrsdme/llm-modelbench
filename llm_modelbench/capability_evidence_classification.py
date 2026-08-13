@@ -172,6 +172,19 @@ class EvidenceCell:
     structurally_adaptable_profile_count: int = 0
     considered_source_paths: Tuple[str, ...] = ()
     current_identity_available: bool = False
+    # Anvil Stage 2.7B: surfaced so a reprobe planner can consume this
+    # module's classification directly (per the go-ahead advice's "do not
+    # reinterpret legacy profiles separately inside the planner") instead
+    # of re-deriving identity/evidence-hash material from raw profiles a
+    # second time. ``current_*`` describes the live model/runtime this
+    # cell was compared against; the evidence-hash fields describe what
+    # was actually found in storage, when anything was.
+    current_model_artifact_set_id: Optional[str] = None
+    current_model_primary_sha256: Optional[str] = None
+    current_runtime_profile_stable_key: Optional[str] = None
+    current_backend: Optional[str] = None
+    selected_evidence_hash: Optional[str] = None
+    considered_evidence_hashes: Tuple[str, ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -185,6 +198,12 @@ class EvidenceCell:
             "structurally_adaptable_profile_count": self.structurally_adaptable_profile_count,
             "considered_source_paths": list(self.considered_source_paths),
             "current_identity_available": self.current_identity_available,
+            "current_model_artifact_set_id": self.current_model_artifact_set_id,
+            "current_model_primary_sha256": self.current_model_primary_sha256,
+            "current_runtime_profile_stable_key": self.current_runtime_profile_stable_key,
+            "current_backend": self.current_backend,
+            "selected_evidence_hash": self.selected_evidence_hash,
+            "considered_evidence_hashes": list(self.considered_evidence_hashes),
             "reprobe_required": self.status not in REPROBE_NOT_REQUIRED,
         }
 
@@ -316,12 +335,24 @@ def classify_model_capability(
     ``None`` if the model is not currently reachable)."""
     source_paths = tuple(str(path) for path, _ in stored_profiles)
 
+    current_typed = (
+        typed_identity_from_capability_identity(current_identity, protocol_version=PROBE_PROTOCOL_VERSION)
+        if current_identity is not None else None
+    )
+    identity_fields = dict(
+        current_model_artifact_set_id=current_typed.model_identity.artifact_set_id if current_typed else None,
+        current_model_primary_sha256=current_typed.model_identity.primary_sha256 if current_typed else None,
+        current_runtime_profile_stable_key=current_typed.runtime_profile_identity.stable_key() if current_typed else None,
+        current_backend=current_typed.runtime_profile_identity.backend if current_typed else None,
+    )
+
     if not stored_profiles:
         return EvidenceCell(
             model=model, capability=capability, status=EvidenceCellStatus.MISSING,
             reason="no capability_report.json entry found anywhere in the fleet for this model",
             stored_profile_count=0, structurally_adaptable_profile_count=0,
             considered_source_paths=source_paths, current_identity_available=current_identity is not None,
+            **identity_fields,
         )
 
     adaptable: List[Dict[str, Any]] = []
@@ -344,18 +375,15 @@ def classify_model_capability(
             reason=f"{len(stored_profiles)} stored profile(s) found, none structurally adaptable ({chosen})",
             stored_profile_count=len(stored_profiles), structurally_adaptable_profile_count=0,
             considered_source_paths=source_paths, current_identity_available=current_identity is not None,
+            **identity_fields,
         )
-
-    current_typed = (
-        typed_identity_from_capability_identity(current_identity, protocol_version=PROBE_PROTOCOL_VERSION)
-        if current_identity is not None else None
-    )
 
     observations = [
         obs for obs in (
             adapt_legacy_profile_family_to_observation(profile, capability) for profile in adaptable
         ) if obs is not None
     ]
+    considered_evidence_hashes = tuple(sorted({obs.evidence_hash for obs in observations}))
 
     projection = project_capability_observation(
         observations,
@@ -373,13 +401,16 @@ def classify_model_capability(
         model=model, capability=capability, stored_profile_count=len(stored_profiles),
         structurally_adaptable_profile_count=len(adaptable),
         considered_source_paths=source_paths, current_identity_available=current_identity is not None,
+        considered_evidence_hashes=considered_evidence_hashes,
+        **identity_fields,
     )
 
     if projection.status == CapabilityProjectionStatus.SELECTED:
         status = _DECISION_REASON_TO_STATUS[decision.reason]
         return EvidenceCell(
             status=status, reason=f"selected observation: {decision.reason.value}",
-            typed_decision_reason=decision.reason.value, **common,
+            typed_decision_reason=decision.reason.value,
+            selected_evidence_hash=projection.selected_observation.evidence_hash, **common,
         )
 
     if projection.status == CapabilityProjectionStatus.NO_OBSERVATIONS:

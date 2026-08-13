@@ -97,6 +97,13 @@ def test_current_valid_when_measured_supported_and_identity_matches():
     assert cell.typed_decision_reason == "measured_supported"
     assert cell.stored_profile_count == 1
     assert cell.structurally_adaptable_profile_count == 1
+    # Anvil Stage 2.7B needs these surfaced directly, not re-derived.
+    assert cell.current_backend == "ollama"
+    assert cell.current_model_primary_sha256 == "sha256:abc123"
+    assert cell.current_model_artifact_set_id
+    assert cell.current_runtime_profile_stable_key
+    assert cell.selected_evidence_hash
+    assert cell.considered_evidence_hashes == (cell.selected_evidence_hash,)
 
 
 @pytest.mark.parametrize("state,expected", [
