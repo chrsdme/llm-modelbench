@@ -63,27 +63,33 @@ structurally produce ``NO_CURRENT_PROJECTION`` ->
 ``CAPABILITY_REPROBE_REQUIRED`` by simply having no observation to find,
 exactly matching what Stage 2.3 already does for absent evidence.
 
-This module is still purely additive: it is not called from
-``planner.py``, ``runner.py``, ``repair.py``, or ``campaign.py``. It
-exists to make the comparison harness (also this slice) possible, and to
-be the eventual real adapter once a call site is migrated -- but no call
-site is migrated yet.
+Anvil Stage 2.6A (phase 2) migrated ``planner.py``'s scheduling gate onto
+this module's ``new_measured_supported_families()`` (added this slice).
+Anvil Stage 2.6B migrates ``runner.py``'s two equivalent call sites the
+same way. ``repair.py`` and ``campaign.py`` are not migrated yet.
+``new_measured_supported_families()`` lives here rather than in
+``planner.py`` or ``runner.py`` specifically so both can import it
+without creating a circular import (``planner.py`` already imports from
+``runner.py``); this module has no dependency on either.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional
+from typing import Any, List, Mapping, Optional
 
-from .capabilities import CAPABILITY_SCHEMA_VERSION, MeasuredCapabilityState
+from .capabilities import CAPABILITY_SCHEMA_VERSION, PROBE_PROTOCOL_VERSION, MeasuredCapabilityState
 from .capability_observation import CapabilityObservation
+from .capability_projection import decide_capability_from_projection, project_capability_observation
+from .classify import FAMILY_ORDER
 from .identity import ModelArtifactIdentity, RuntimeProfileIdentity
 
 __all__ = [
     "TypedLegacyIdentity",
     "typed_identity_from_capability_identity",
     "adapt_legacy_profile_family_to_observation",
+    "new_measured_supported_families",
 ]
 
 
@@ -218,3 +224,41 @@ def adapt_legacy_profile_family_to_observation(
         endpoint_identity=identity.endpoint_identity,
         declared_hint=tuple(profile.get("declared_capabilities") or ()),
     )
+
+
+def new_measured_supported_families(
+    profile: Mapping[str, Any], current_identity: Optional[Mapping[str, Any]]
+) -> List[str]:
+    """The typed Stage 2.1-2.3 capability-authority replacement for
+    ``capabilities.measured_supported_families()``. For each family in
+    ``FAMILY_ORDER``, adapts ``profile`` into a ``CapabilityObservation``
+    (or finds none), projects it against ``current_identity`` (the same
+    dict shape ``capabilities.current_capability_identity()`` produces),
+    and includes the family only when the resulting
+    ``CapabilityDecision.applicable`` is true.
+
+    Shared by ``planner.py`` (Stage 2.6A phase 2) and ``runner.py``
+    (Stage 2.6B) as their execution-authority gate -- built once here so
+    both consume the identical adapter/projection/decision pipeline
+    rather than two independently-maintained copies.
+    """
+    current_typed_identity = (
+        typed_identity_from_capability_identity(current_identity, protocol_version=PROBE_PROTOCOL_VERSION)
+        if current_identity is not None else None
+    )
+    fams: List[str] = []
+    for family in FAMILY_ORDER:
+        observation = adapt_legacy_profile_family_to_observation(profile, family)
+        projection = project_capability_observation(
+            [observation] if observation is not None else [],
+            capability=family,
+            current_model_identity=current_typed_identity.model_identity if current_typed_identity else None,
+            current_runtime_profile_identity=current_typed_identity.runtime_profile_identity if current_typed_identity else None,
+            current_probe_protocol_version=PROBE_PROTOCOL_VERSION,
+            current_capability_schema_version=CAPABILITY_SCHEMA_VERSION,
+            current_template_config_hash=current_typed_identity.template_hash if current_typed_identity else None,
+            current_endpoint_identity=current_typed_identity.endpoint_identity if current_typed_identity else None,
+        )
+        if decide_capability_from_projection(projection).applicable:
+            fams.append(family)
+    return fams

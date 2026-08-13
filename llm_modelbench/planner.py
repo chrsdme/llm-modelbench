@@ -12,66 +12,18 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .capabilities import (
-    CAPABILITY_SCHEMA_VERSION,
-    PROBE_PROTOCOL_VERSION,
     capability_identity_compatibility,
     current_capability_identity,
     interrogate_models,
 )
-from .capability_evidence_adapter import (
-    adapt_legacy_profile_family_to_observation,
-    typed_identity_from_capability_identity,
-)
-from .capability_projection import decide_capability_from_projection, project_capability_observation
-from .classify import FAMILY_ORDER, classify_model, size_gb
+from .capability_evidence_adapter import new_measured_supported_families
+from .classify import classify_model, size_gb
 from .filters import describe_filters, filter_models, filter_tasks, validate_task_ids
 from .runner import _samples_for_task
 from .tasks import TASKS, tasks_for
 from .progress import seconds_hms
 from .backend import InferenceClient
 from .placement import model_placement_fit
-
-
-def _new_measured_supported_families(
-    profile: Dict[str, Any], current_identity: Optional[Dict[str, Any]]
-) -> List[str]:
-    """Anvil Stage 2.6A phase 2: the actual planner execution-authority
-    gate, migrated off ``capabilities.measured_supported_families()``
-    onto the typed Stage 2.1-2.3 capability stack
-    (``CapabilityObservation`` -> ``CapabilityProjection`` ->
-    ``CapabilityDecision``), built from the same legacy profile dict via
-    ``capability_evidence_adapter`` -- the adapter and comparison harness
-    proven faithful against the full 20-case fail-closed regression
-    matrix (`tests/test_capability_migration_comparison_corpus.py`)
-    before this call site was touched.
-
-    ``capabilities.py``'s legacy ``capability_identity_compatibility()``/
-    ``measured_supported_families()`` are unchanged and remain callable
-    -- still used a few lines above purely for the informational
-    ``capability_identity_compatibility`` field recorded on the profile
-    and for the reprobe-trigger heuristic -- but this function, not
-    those, now decides which families a model may run.
-    """
-    current_typed_identity = (
-        typed_identity_from_capability_identity(current_identity, protocol_version=PROBE_PROTOCOL_VERSION)
-        if current_identity is not None else None
-    )
-    fams: List[str] = []
-    for family in FAMILY_ORDER:
-        observation = adapt_legacy_profile_family_to_observation(profile, family)
-        projection = project_capability_observation(
-            [observation] if observation is not None else [],
-            capability=family,
-            current_model_identity=current_typed_identity.model_identity if current_typed_identity else None,
-            current_runtime_profile_identity=current_typed_identity.runtime_profile_identity if current_typed_identity else None,
-            current_probe_protocol_version=PROBE_PROTOCOL_VERSION,
-            current_capability_schema_version=CAPABILITY_SCHEMA_VERSION,
-            current_template_config_hash=current_typed_identity.template_hash if current_typed_identity else None,
-            current_endpoint_identity=current_typed_identity.endpoint_identity if current_typed_identity else None,
-        )
-        if decide_capability_from_projection(projection).applicable:
-            fams.append(family)
-    return fams
 
 
 def _rough_seconds(samples_total: int, models_total: int) -> int:
@@ -167,7 +119,7 @@ def build_plan(
         profile = profiles[model]
         compatibility = capability_identity_compatibility(profile, current_identities.get(model))
         profile["capability_identity_compatibility"] = compatibility
-        fams = _new_measured_supported_families(profile, current_identities.get(model))
+        fams = new_measured_supported_families(profile, current_identities.get(model))
         if not fams:
             skipped.append({"model": model, "reason": "no_measured_supported_capabilities"})
             continue

@@ -83,6 +83,12 @@ def classify_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     event: Optional[Dict[str, Any]] = None
     if row.get("error_kind") in {"empty_output", "thinking_only", "harness_error"} or reason.startswith(("ERROR_EMPTY_OUTPUT", "ERROR_THINKING_ONLY")):
         event = {"kind": "ERROR", "model": model, "task": task, "score": score, "reason": reason}
+    elif row.get("error_kind") == "environment_limited":
+        # Anvil Stage 2.6B: a known, expected disposition (VRAM/KV budget
+        # could not fit the requested configuration), not a harness
+        # malfunction -- worth surfacing to the operator live, but not as
+        # an "ERROR" implying something went wrong.
+        event = {"kind": "WARN", "model": model, "task": task, "score": score, "reason": reason}
     elif row.get("warning_kind") == "truncated" or reason.startswith("WARN_TRUNCATED"):
         event = {"kind": "WARN", "model": model, "task": task, "score": score, "reason": reason}
     elif score == 0:

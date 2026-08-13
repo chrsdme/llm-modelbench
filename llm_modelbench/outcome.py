@@ -12,6 +12,7 @@ from typing import Any, Dict, Literal, Optional, Union
 
 MODEL_FAILURE_KINDS = {"empty_output", "thinking_only", "truncated_no_answer"}
 HARNESS_FAILURE_KINDS = {"harness_error"}
+ENVIRONMENT_FAILURE_KINDS = {"environment_limited"}
 NOT_ATTEMPTED_KINDS = {
     "judge_off",
     "needs_judge",
@@ -82,6 +83,8 @@ def row_to_outcome(row: Dict[str, Any]) -> Outcome:
     """
     reason = str(row.get("reason") or "")
     kind = str(row.get("error_kind") or "")
+    if kind in ENVIRONMENT_FAILURE_KINDS:
+        return NotAttempted(kind, "harness", reason)
     if kind in HARNESS_FAILURE_KINDS or reason.startswith("HARNESS_ERROR"):
         return HarnessError(kind or "harness_error", reason)
     if kind in MODEL_FAILURE_KINDS:

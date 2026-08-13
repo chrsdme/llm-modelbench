@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from . import scoring, judge as judge_mod, media, fingerprint, progress, sandbox, __version__
+from .capability_evidence_adapter import new_measured_supported_families
 from .filters import (
     describe_filters,
     filter_models,
@@ -1139,12 +1140,36 @@ def _run_once(
         max_verified_ctx, non_mono = _max_verified_prefix(attempted)
         if not hits:
             first_detail = next((a.get("harness_error_detail") for a in attempted if a.get("harness_error_detail")), None)
+            # Anvil Stage 2.6B: nothing was even attempted (zero backend
+            # calls made) and every depth was excluded purely by the
+            # pre-flight environment check (_needle_environment_skip's
+            # VRAM/KV/RAM-floor gate, skip_class=="environment") -- this
+            # is not a harness failure, it's a known environment-does-not-
+            # fit disposition. "environment_limited" is the existing,
+            # already-wired row-level error_kind (campaign.classify_recovery_row(),
+            # TERMINAL_DISPOSITIONS, rankings_v3._STATUS_WEIGHT already
+            # recognize it; nothing in production previously produced it).
+            # Reclassifying also lets repair._needle_observation() -- built
+            # for exactly this VRAM/KV triage and previously unreachable
+            # here because "harness_error" always intercepted the row
+            # first -- actually run for these rows instead of falling into
+            # generic manual_harness_triage. If anything was genuinely
+            # attempted (even if it errored) or any exclusion was
+            # operator/model-capability rather than environment, this
+            # stays harness_error -- deliberately conservative, not a
+            # blanket reclassification.
+            environment_only = bool(skipped) and not attempted and all(
+                item.get("skip_class") == "environment" for item in skipped
+            )
+            error_kind = "environment_limited" if environment_only else "harness_error"
+            environment_skip_reason = skipped[0].get("reason") if environment_only else None
             return {"score": None, "reason": "no scored needle probes; " + " ".join(reasons), "tps": None,
                     "ttft_ms": None, "ttft_visible_ms": None, "tokens": None, "output_chars": None,
                     "needle_attempted": attempted, "needle_skipped": skipped, "needle_coverage": needle_coverage,
                     "max_verified_ctx": max_verified_ctx, "non_monotonic_needle": non_mono,
                     "harness_error_detail": first_detail,
-                    "error_kind": "harness_error", "num_predict": needle_num_predict,
+                    "environment_skip_reason": environment_skip_reason,
+                    "error_kind": error_kind, "num_predict": needle_num_predict,
                     **profile_summary}
         row_score = None if needle_coverage < 1.0 else round(sum(hits) / len(hits), 2)
         row = {"score": row_score, "reason": " ".join(reasons),
@@ -1456,7 +1481,7 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
     cats = categories
     task_source_level = "full" if context_only else level
     fingerprints: Dict[str, List[str]] = {}
-    from .capabilities import capability_identity_compatibility, current_capability_identity, measured_supported_families
+    from .capabilities import capability_identity_compatibility, current_capability_identity
     profiles = dict(capability_profiles or {})
     current_capability_identities = {model: current_capability_identity(client, model) for model in models}
     if any(model not in profiles for model in models):
@@ -1477,7 +1502,7 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
         capabilities = profile.get("declared_capabilities") or []
         compatibility = capability_identity_compatibility(profile, current_capability_identities.get(model))
         profile["capability_identity_compatibility"] = compatibility
-        fams = measured_supported_families(profile) if compatibility.get("compatible") else []
+        fams = new_measured_supported_families(profile, current_capability_identities.get(model))
         if not fams:
             skipped_models.append({"model": model, "reason": "no_measured_supported_capabilities"})
             continue
@@ -1498,6 +1523,12 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
             "samples_total": sum(_samples_for_task(t, cfg, sample_mode, judge_mode) for t in all_tasks),
         })
     _validate_needle_ctx_override(cfg, active_task_union)
+    # Anvil Stage 2.6B: the families a model may run are decided exactly
+    # once, above, by new_measured_supported_families(). The execution
+    # loop below consumes that same decision by model name rather than
+    # recomputing it a second time -- runner must not independently
+    # re-derive capability support.
+    fams_by_model = {m["model"]: m["families"] for m in model_plan}
 
     run_id = out_dir.name
     filter_descriptions = describe_filters(
@@ -1562,8 +1593,7 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
         for model_index, model in enumerate(active_models, start=1):
             profile = profiles[model]
             capabilities = profile.get("declared_capabilities") or []
-            compatibility = profile.get("capability_identity_compatibility") or {}
-            fams = measured_supported_families(profile) if compatibility.get("compatible") else []
+            fams = fams_by_model[model]
             cls = classify_model(model, capabilities, fams)
             sz = size_gb(models_rows[model])
             all_model_tasks = filter_tasks(tasks_for(task_source_level, cats, fams), task_ids=task_ids,
@@ -1752,6 +1782,15 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
                         "needle_target_ollama_pss_delta_mb", "needle_target_swap_delta_mb",
                         "needle_target_behavior_suspect", "needle_slow_depths",
                         "needle_critical_slow_depths",
+                        # Anvil Stage 2.6B: both computed in _run_once's
+                        # needle "no scored probes" branch but previously
+                        # dropped here before ever reaching
+                        # raw_results.jsonl -- the same class of
+                        # computed-then-discarded evidence gap the Stage
+                        # 2.4-era harness_error_detail fix closed for the
+                        # per-attempt case, still open for this row-level
+                        # summary case until now.
+                        "harness_error_detail", "environment_skip_reason",
                     ):
                         row[key] = samples[0].get(key)
                 if task.scorer == "retrieval":
