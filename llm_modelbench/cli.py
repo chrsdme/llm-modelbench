@@ -282,6 +282,32 @@ def cmd_inventory(args, cfg):
         print(f"{it['class']:<11} {it['size_gb']:>6}GB  {it['fit_classification']:<28} {it['name']}")
 
 
+def cmd_capability_evidence(args, cfg):
+    """Anvil Stage 2.7A: read-only classification of the fleet's stored
+    capability evidence -- never reprobes, never mutates any
+    ``capability_report.json``."""
+    from pathlib import Path as _Path
+    from .capability_evidence_classification import classify_fleet
+    client = _client(args, cfg)
+    report = classify_fleet(client, runs_dir=_Path(args.runs_dir), campaigns_root=_Path(args.campaigns_dir))
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2))
+        return
+    print(f"models considered: {len(report.models_considered)}")
+    print(f"source files scanned: {len(report.source_files_scanned)}")
+    print()
+    print("by status:")
+    for status, count in report.by_status().items():
+        if count:
+            print(f"  {status:<36} {count}")
+    print()
+    cells = report.reprobe_required_cells() if args.reprobe_required_only else report.cells
+    label = "reprobe-required cells" if args.reprobe_required_only else "cells"
+    print(f"{label}:")
+    for cell in cells:
+        print(f"  {cell.model:<40} {cell.capability:<10} {cell.status.value:<36} {cell.reason}")
+
+
 def cmd_runtime_fit(args, cfg):
     """Read-only Stage 7 assessment; it does not issue a generation request."""
     from .runtime_fit import RuntimeFitProfile, collect_runtime_fit
@@ -1717,6 +1743,17 @@ def build_parser():
     inv.add_argument("--auto", action="store_true", help="also run functional capability probes")
     inv.add_argument("--runtime-profile", help="saved runtime profile; explicit selection takes precedence")
 
+    ce = sub.add_parser(
+        "capability-evidence",
+        help="read-only classification of the fleet's stored capability evidence (Anvil Stage 2.7A)",
+    )
+    ce.add_argument("--json", action="store_true", help="write the full machine-readable report to stdout")
+    ce.add_argument("--mock", action="store_true", help="use offline stub model list")
+    ce.add_argument("--runtime-profile", help="saved runtime profile; explicit selection takes precedence")
+    ce.add_argument("--runs-dir", default="runs", help="root directory to scan for capability_report.json (default: runs)")
+    ce.add_argument("--campaigns-dir", default="campaigns", help="root directory to scan for campaign evidence (default: campaigns)")
+    ce.add_argument("--reprobe-required-only", action="store_true", help="in text mode, list only cells that need a reprobe")
+
     fit = sub.add_parser("runtime-fit", help="read-only conservative model-to-runtime GPU capacity assessment")
     fit.add_argument("--model", required=True, help="exact model name already known to the selected runtime")
     fit.add_argument("--runtime-profile", help="saved runtime profile; explicit selection takes precedence")
@@ -2176,6 +2213,8 @@ def _main(argv=None):
         cmd_doctor(args, cfg)
     elif args.cmd == "inventory":
         cmd_inventory(args, cfg)
+    elif args.cmd == "capability-evidence":
+        cmd_capability_evidence(args, cfg)
     elif args.cmd == "runtime-fit":
         cmd_runtime_fit(args, cfg)
     elif args.cmd == "plan":

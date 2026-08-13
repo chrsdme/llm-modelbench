@@ -1,0 +1,20 @@
+usage: llm-modelbench capability-evidence [-h] [--json] [--mock]
+                                          [--runtime-profile RUNTIME_PROFILE]
+                                          [--runs-dir RUNS_DIR]
+                                          [--campaigns-dir CAMPAIGNS_DIR]
+                                          [--reprobe-required-only]
+
+options:
+  -h, --help            show this help message and exit
+  --json                write the full machine-readable report to stdout
+  --mock                use offline stub model list
+  --runtime-profile RUNTIME_PROFILE
+                        saved runtime profile; explicit selection takes
+                        precedence
+  --runs-dir RUNS_DIR   root directory to scan for capability_report.json
+                        (default: runs)
+  --campaigns-dir CAMPAIGNS_DIR
+                        root directory to scan for campaign evidence (default:
+                        campaigns)
+  --reprobe-required-only
+                        in text mode, list only cells that need a reprobe
