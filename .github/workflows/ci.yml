@@ -120,6 +120,13 @@ jobs:
           print(f"packaged resources: {len(resources)}")
           PYCODE
 
+          # Core wheel is verified dependency-free above (--no-deps install,
+          # --version/selftest, packaged-resource loading). The OCR run below
+          # needs the optional `vision` extra (Pillow) for its functional
+          # capability probe -- installed only now, after that verification,
+          # so it doesn't mask a regression in the zero-dependency core.
+          /tmp/llmb-wheel-test/bin/python -m pip install "pillow>=10.0"
+
           /tmp/llmb-wheel-test/bin/llm-modelbench run \
             --mock \
             --models 'qwen2.5-vl:7b' \
