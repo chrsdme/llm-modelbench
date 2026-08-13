@@ -18,6 +18,11 @@ def _identity(name, digest):
 
 
 def _bind(item):
+    # Real interrogate_model() output carries probe_protocol_version both
+    # top-level and nested inside capability_identity (set together from
+    # one PROBE_PROTOCOL_VERSION constant, capabilities.py:455/573); the
+    # Stage 2.6D typed adapter reads the top-level copy.
+    item.setdefault("probe_protocol_version", PROBE_PROTOCOL_VERSION)
     item["capability_identity"] = _identity(item["name"], item["digest"])
     item["capability_identity_compatibility"] = {"compatible": True, "reason": "identity_match"}
     return item

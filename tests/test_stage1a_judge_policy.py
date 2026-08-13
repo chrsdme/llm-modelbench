@@ -15,6 +15,13 @@ def _identity(name, digest, *, backend="mock", endpoint="http://fake.invalid", t
 
 
 def _bind(item, *, compatible=True, reason="identity_match"):
+    # Real interrogate_model() output always carries probe_protocol_version
+    # both top-level and nested inside capability_identity (capabilities.py
+    # sets both from the same PROBE_PROTOCOL_VERSION constant in one call,
+    # see capabilities.py:455/573) -- the typed Stage 2.6D adapter reads the
+    # top-level copy (capability_evidence_adapter.adapt_legacy_profile_family_to_observation),
+    # so a fixture representing a real bound profile must set it too.
+    item.setdefault("probe_protocol_version", PROBE_PROTOCOL_VERSION)
     item["capability_identity"] = _identity(item["name"], item["digest"])
     item["capability_identity_compatibility"] = {"compatible": compatible, "reason": reason}
     return item

@@ -12,6 +12,7 @@ orphaned by this change, but every *new* campaign uses this layout only.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -34,6 +35,7 @@ from .capabilities import (
     family_applicability,
     measured_supported_families,
 )
+from .capability_evidence_adapter import new_measured_supported_families
 
 CAMPAIGNS_ROOT = Path("campaigns")
 MANIFEST_SCHEMA_VERSION = 1
@@ -3145,6 +3147,9 @@ def _candidate_capability_identity_compatibility(item: Dict[str, Any]) -> Dict[s
 
 
 def _judge_measured_text_state(item: Dict[str, Any]) -> str:
+    """Legacy measured-state lookup, kept as a message-selection helper and
+    regression oracle only (Anvil Stage 2.6D) -- ``_judge_capability_rejection``
+    no longer treats this as authority. See its docstring."""
     if item.get("capability_schema_version") != CAPABILITY_SCHEMA_VERSION:
         return MeasuredCapabilityState.PROBE_INCONCLUSIVE.value
     state = family_applicability(item, "text")
@@ -3153,17 +3158,74 @@ def _judge_measured_text_state(item: Dict[str, Any]) -> str:
     return state
 
 
+def _candidate_current_capability_identity(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The identity to project stored judge-candidate evidence against, for
+    the typed Stage 2 capability authority (Anvil Stage 2.6D).
+
+    Prefers a genuinely live ``current_capability_identity`` when a caller
+    already attached one (a fresh client-derived compare, as planner/runner
+    do). Otherwise -- mirroring repair.py's Stage 2.6C
+    ``_profile_source_identity()`` -- reuses the stored ``capability_identity``
+    but overrides only the model digest with this candidate's own
+    independently-observed digest (``_candidate_digest()``). In the real
+    ``cli.py`` judge-candidate path this digest comes from a fresh
+    ``client.tags()`` call made at candidate-construction time, separate
+    from the stored profile's own capture-time digest -- so this is a
+    genuine freshness check, not a self-comparison. Never synthesizes a
+    "current" identity by copying the stored one verbatim with no
+    independent digest: that would make compatibility compare evidence to
+    itself and could never detect staleness, silently laundering legacy
+    authority into a supposedly-live typed check.
+    """
+    live = item.get("current_capability_identity")
+    if isinstance(live, Mapping):
+        return dict(live)
+    stored = item.get("capability_identity")
+    if not isinstance(stored, Mapping):
+        return None
+    digest = _candidate_digest(item)
+    if not digest:
+        return None
+    identity = copy.deepcopy(dict(stored))
+    model_identity = dict(identity.get("model") or {})
+    model_identity["canonical_name"] = model_identity.get("canonical_name") or _candidate_name(item)
+    model_identity["digest"] = digest
+    identity["model"] = model_identity
+    return identity
+
+
+def _judge_capability_authorized_families(item: Dict[str, Any]) -> List[str]:
+    """Typed Stage 2 measured-capability authority for one judge candidate
+    (Anvil Stage 2.6D). The sole source of positive judge capability
+    eligibility -- declared/hint/legacy fields never authorize on their
+    own; see ``_judge_capability_rejection``."""
+    if item.get("capability_schema_version") != CAPABILITY_SCHEMA_VERSION:
+        return []
+    current_identity = _candidate_current_capability_identity(item)
+    return new_measured_supported_families(item, current_identity)
+
+
 def _judge_capability_rejection(item: Dict[str, Any]) -> Optional[str]:
-    """Fail closed unless canonical evidence confirms normal text generation."""
+    """Fail closed unless the typed Stage 2 capability authority confirms
+    measured, identity-compatible text generation (Anvil Stage 2.6D).
+
+    Positive eligibility comes only from
+    ``_judge_capability_authorized_families()``. ``_judge_measured_text_state()``
+    and ``_candidate_capability_identity_compatibility()`` (both legacy) are
+    consulted only to select the right rejection message when the typed
+    authority does not admit the candidate -- never to admit one themselves.
+    """
     if item.get("capability_schema_version") != CAPABILITY_SCHEMA_VERSION:
         return "capability_reprobe_required"
+    if "text" in _judge_capability_authorized_families(item):
+        return None
     state = _judge_measured_text_state(item)
     families = _canonical_candidate_families(item)
-    if state == MeasuredCapabilityState.MEASURED_SUPPORTED.value:
-        if not _candidate_capability_identity_compatibility(item).get("compatible"):
-            return "capability_reprobe_required"
-        return None
-    if state == MeasuredCapabilityState.PROBE_INCONCLUSIVE.value:
+    if state in (MeasuredCapabilityState.MEASURED_SUPPORTED.value, MeasuredCapabilityState.PROBE_INCONCLUSIVE.value):
+        # Legacy state claims support (or is itself inconclusive) but the
+        # typed authority did not admit this candidate -- e.g. identity
+        # drift the typed compare caught. Never let a row the typed stack
+        # blocks be reported as anything but a reprobe requirement.
         return "capability_reprobe_required"
     if "embedding" in families:
         return "non_generative_embedding_only"

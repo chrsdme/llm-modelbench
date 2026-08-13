@@ -590,6 +590,11 @@ def test_judge_selection_excludes_cohort_and_prefers_calibrated_other_family():
             "name": name,
             "digest": digest,
             "capability_schema_version": campaign.CAPABILITY_SCHEMA_VERSION,
+            # Real interrogate_model() output carries probe_protocol_version
+            # both top-level and nested inside capability_identity (set
+            # together from one constant, capabilities.py:455/573); the
+            # Stage 2.6D typed adapter reads the top-level copy.
+            "probe_protocol_version": "capability-smoke-v2",
             "capability_identity": {
                 "schema_version": campaign.CAPABILITY_SCHEMA_VERSION,
                 "model": {"canonical_name": name, "backend_model_id": name, "digest": digest, "size": 1, "details": {}},

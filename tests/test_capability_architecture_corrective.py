@@ -309,8 +309,15 @@ def test_judge_eligibility_requires_schema_v2_measured_text_support():
     protocol_mismatch = _profile("protocol-mismatch", {
         "text": MeasuredCapabilityState.MEASURED_SUPPORTED.value,
     }, digest="same")
+    # A real protocol-version drift predates today's code, so both the
+    # top-level probe_protocol_version and the copy nested inside
+    # capability_identity carry the old value together -- interrogate_model()
+    # sets both from the same constant in one call (capabilities.py:455/573).
+    # Mutating only one would be an unrealistic shape neither the legacy nor
+    # the typed Stage 2.6D adapter would ever see from real stored evidence.
     protocol_mismatch["capability_identity"] = dict(protocol_mismatch["capability_identity"])
     protocol_mismatch["capability_identity"]["probe_protocol_version"] = "old"
+    protocol_mismatch["probe_protocol_version"] = "old"
     protocol_mismatch["current_capability_identity"] = current_capability_identity(CapabilityClient(name="protocol-mismatch", digest="same"), "protocol-mismatch")
     protocol_result = campaign.build_judge_selection([{**protocol_mismatch, "name": "protocol-mismatch", "digest": "same"}], [], policy)
     assert protocol_result.selected is None
