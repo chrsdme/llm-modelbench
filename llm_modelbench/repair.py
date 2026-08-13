@@ -38,7 +38,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .capabilities import capability_identity_compatibility, interrogate_model
-from .capabilities import MeasuredCapabilityState, family_applicability, family_is_applicable, measured_supported_families
+from .capabilities import MeasuredCapabilityState, family_applicability
+from .capability_evidence_adapter import new_measured_supported_families
 from .hardware import detect_gpu
 from .judge_dumps import apply_judgements, judge_run
 from .rankings import _CURRENT_HASHES, rank_for_output
@@ -842,14 +843,32 @@ def build_plan(
             source_digest_available=bool(row.get("_source_digest_available")),
         )
         capability_compatibility = profile.get("capability_identity_compatibility") or {}
-        if error_kind and not capability_compatibility.get("compatible"):
+        current_identity = _profile_source_identity(profile, model=model_name, digest=str(row.get("model_digest_resolved") or ""))
+        capability_authorized = task.family in new_measured_supported_families(profile, current_identity)
+        # Authority (whether this family may be retried) is decided solely by
+        # new_measured_supported_families() -- the typed Stage 2 pipeline,
+        # identical to planner.py/runner.py's migrated gates. The legacy
+        # capability_identity_compatibility()/family_applicability() calls
+        # above/below are kept only to choose *which* of the two existing
+        # observation messages to emit and to populate their reason text
+        # (e.g. "model_digest_changed") -- purely informational, never
+        # authoritative, same division of labor as 2.6A/2.6B.
+        if error_kind and not capability_authorized and not capability_compatibility.get("compatible"):
             observations.append({
                 **_capability_identity_observation(row, task_id, task.family, capability_compatibility),
                 "previous_error_kind": error_kind,
             })
             continue
         capability_state = family_applicability(profile, task.family)
-        capability_positive = family_is_applicable(profile, task.family)
+        if capability_state == MeasuredCapabilityState.MEASURED_SUPPORTED.value and not capability_authorized:
+            # The legacy per-family state and the new identity-aware
+            # authority disagree (only reachable when capability_authorized
+            # is False here, since a True value already returned above) --
+            # this row is genuinely blocked, so labelling it
+            # "capability_applicable" would misdescribe evidence this
+            # code is not, in fact, trusting. Surface the disagreement as
+            # reprobe-worthy rather than a stale positive claim.
+            capability_state = MeasuredCapabilityState.PROBE_INCONCLUSIVE.value
         known_unavailable = unavailable_families_by_model.get(model_name, set())
         if task.family in known_unavailable:
             observations.append({
@@ -859,7 +878,7 @@ def build_plan(
                            "model build; generic --force does not re-probe terminal capability evidence"),
             })
             continue
-        if error_kind and not capability_positive:
+        if error_kind and not capability_authorized:
             observations.append({
                 **_capability_observation(row, task_id, task.family, capability_state),
                 "previous_error_kind": error_kind,
@@ -965,9 +984,8 @@ def build_plan(
                 source_digest=str(context.get("digest") or ""),
                 source_digest_available=bool(context.get("digest")),
             )
-            if not (profile.get("capability_identity_compatibility") or {}).get("compatible"):
-                continue
-            families = set(measured_supported_families(profile))
+            current_identity = _profile_source_identity(profile, model=str(context.get("model") or ""), digest=str(context.get("digest") or ""))
+            families = set(new_measured_supported_families(profile, current_identity))
             model_name = str(context.get("model") or "")
             known_unavailable = unavailable_families_by_model.get(model_name, set())
             for task in TASKS:
