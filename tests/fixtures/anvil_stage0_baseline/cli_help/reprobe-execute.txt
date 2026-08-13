@@ -1,0 +1,34 @@
+usage: llm-modelbench reprobe-execute [-h] [--json] [--mock]
+                                      [--runtime-profile RUNTIME_PROFILE]
+                                      [--runs-dir RUNS_DIR]
+                                      [--campaigns-dir CAMPAIGNS_DIR]
+                                      [--ledger-path LEDGER_PATH]
+                                      [--model MODEL]
+                                      [--capability {vision,text,embedding,tools,insert}]
+                                      [--backend BACKEND] [--reason REASON]
+                                      [--apply]
+
+options:
+  -h, --help            show this help message and exit
+  --json                write the full machine-readable execution report to
+                        stdout
+  --mock                use offline stub model list
+  --runtime-profile RUNTIME_PROFILE
+                        saved runtime profile; explicit selection takes
+                        precedence
+  --runs-dir RUNS_DIR   root directory to scan for capability_report.json
+                        (default: runs)
+  --campaigns-dir CAMPAIGNS_DIR
+                        root directory to scan for campaign evidence (default:
+                        campaigns)
+  --ledger-path LEDGER_PATH
+                        EvidenceLedger JSONL file (default: <runs-
+                        dir>/capability_evidence_ledger.jsonl)
+  --model MODEL         filter to one model alias
+  --capability {vision,text,embedding,tools,insert}
+                        filter to one capability family
+  --backend BACKEND     filter to one current backend
+  --reason REASON       filter to one Stage 2.7A classification bucket (e.g.
+                        model_identity_changed)
+  --apply               actually run probes and append evidence; default is
+                        dry-run (plan only)

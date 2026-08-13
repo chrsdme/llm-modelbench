@@ -342,6 +342,58 @@ def cmd_reprobe_plan(args, cfg):
         print(f"  {action.model:<40} {action.capability:<10} {action.action.value:<10} {action.classification:<36} {action.classification_reason}")
 
 
+def cmd_reprobe_execute(args, cfg):
+    """Anvil Stage 2.7C: execute only the REPROBE actions from a Stage 2.7B
+    plan -- runs real functional probes, appends CapabilityObservation
+    records to an EvidenceLedger (explicit SUPERSEDES where a prior native
+    observation exists), and reports before/after fleet evidence metrics.
+    Dry-run by default; requires --apply for any probe or ledger write."""
+    from pathlib import Path as _Path
+    from .capability_reprobe_execute import default_ledger_path, run_reprobe_execution
+    from .capability_reprobe_plan import plan_fleet_reprobes
+    from .evidence import EvidenceLedger
+
+    client = _client(args, cfg)
+    runs_dir = _Path(args.runs_dir)
+    campaigns_dir = _Path(args.campaigns_dir)
+    plan = plan_fleet_reprobes(client, runs_dir=runs_dir, campaigns_root=campaigns_dir)
+    actions = plan.filtered(
+        model=args.model, capability=args.capability, backend=args.backend,
+        reason=args.reason, only_required=True,
+    )
+    print(f"plan hash: {plan.canonical_plan_hash()}")
+    print(f"reprobe actions selected (after filters): {len(actions)}")
+    for action in actions:
+        print(f"  {action.model:<40} {action.capability:<10} {action.classification:<36} {action.classification_reason}")
+    if not args.apply:
+        print("dry-run only; no probes were run and no evidence was appended (pass --apply to execute)")
+        return
+    if not actions:
+        print("nothing to execute: no REPROBE action survives the current filters")
+        return
+
+    ledger_path = _Path(args.ledger_path) if args.ledger_path else default_ledger_path(runs_dir)
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    ledger = EvidenceLedger(ledger_path)
+    report = run_reprobe_execution(
+        plan, client, ledger, runs_dir=runs_dir, campaigns_root=campaigns_dir, actions=actions,
+    )
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2))
+        return
+    print()
+    print(f"ledger: {ledger_path}")
+    native = report.native_evidence_after
+    print(f"attempted: {native['attempted']}  appended: {native['appended']}  skipped: {native['skipped']}  errored: {native['errored']}")
+    print(f"superseded prior records: {native['superseded_record_count']}")
+    print()
+    print("outcomes:")
+    for outcome in report.outcomes:
+        status = "OK" if outcome.appended else ("ERROR" if outcome.error else "SKIP")
+        detail = outcome.after_status if outcome.appended else (outcome.error or outcome.skip_reason)
+        print(f"  {status:<6} {outcome.model:<40} {outcome.capability:<10} {detail}")
+
+
 def cmd_runtime_fit(args, cfg):
     """Read-only Stage 7 assessment; it does not issue a generation request."""
     from .runtime_fit import RuntimeFitProfile, collect_runtime_fit
@@ -1803,6 +1855,22 @@ def build_parser():
     rp.add_argument("--reason", help="filter to one Stage 2.7A classification bucket (e.g. model_identity_changed)")
     rp.add_argument("--only-required", action="store_true", help="show only cells that need a reprobe")
 
+    rx = sub.add_parser(
+        "reprobe-execute",
+        help="execute a Stage 2.7B reprobe plan's REPROBE actions and append evidence (Anvil Stage 2.7C)",
+    )
+    rx.add_argument("--json", action="store_true", help="write the full machine-readable execution report to stdout")
+    rx.add_argument("--mock", action="store_true", help="use offline stub model list")
+    rx.add_argument("--runtime-profile", help="saved runtime profile; explicit selection takes precedence")
+    rx.add_argument("--runs-dir", default="runs", help="root directory to scan for capability_report.json (default: runs)")
+    rx.add_argument("--campaigns-dir", default="campaigns", help="root directory to scan for campaign evidence (default: campaigns)")
+    rx.add_argument("--ledger-path", help="EvidenceLedger JSONL file (default: <runs-dir>/capability_evidence_ledger.jsonl)")
+    rx.add_argument("--model", help="filter to one model alias")
+    rx.add_argument("--capability", choices=list(FAMILY_ORDER), help="filter to one capability family")
+    rx.add_argument("--backend", help="filter to one current backend")
+    rx.add_argument("--reason", help="filter to one Stage 2.7A classification bucket (e.g. model_identity_changed)")
+    rx.add_argument("--apply", action="store_true", help="actually run probes and append evidence; default is dry-run (plan only)")
+
     fit = sub.add_parser("runtime-fit", help="read-only conservative model-to-runtime GPU capacity assessment")
     fit.add_argument("--model", required=True, help="exact model name already known to the selected runtime")
     fit.add_argument("--runtime-profile", help="saved runtime profile; explicit selection takes precedence")
@@ -2266,6 +2334,8 @@ def _main(argv=None):
         cmd_capability_evidence(args, cfg)
     elif args.cmd == "reprobe-plan":
         cmd_reprobe_plan(args, cfg)
+    elif args.cmd == "reprobe-execute":
+        cmd_reprobe_execute(args, cfg)
     elif args.cmd == "runtime-fit":
         cmd_runtime_fit(args, cfg)
     elif args.cmd == "plan":
