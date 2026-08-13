@@ -4,13 +4,23 @@
 Scope is deliberately narrow, per this session's Codex/GPT scoping pass
 (``local_only/anvil/codex-advice_stage2.2.txt``): this module decides
 whether a stored ``CapabilityObservation`` is identity-compatible with the
-currently running model/runtime identity, and nothing else. Purely additive
--- like Stage 2.1's ``CapabilityObservation`` before it, nothing here is
-wired into ``planner.py``, ``runner.py``, ``campaign.py``, ``repair.py``,
-reprobe logic, or judge qualification yet. The existing
-``capabilities.capability_identity_compatibility()`` (dict-in, dict-out)
-remains the operationally authoritative function for every real command
-path until a later slice deliberately migrates call sites (Stage 2.6).
+currently running model/runtime identity, and nothing else.
+
+**Status update (Anvil Stage 2.6E, correcting the two claims below, which
+were accurate at Stage 2.2 but are stale as written)**: this module is now
+wired in -- transitively, via :mod:`~llm_modelbench.capability_projection`,
+which imports and calls this module's compatibility contract as part of
+``project_capability_observation()``. Every one of ``planner.py``,
+``runner.py``, ``repair.py``, and ``campaign.py``'s judge-selection
+functions sources its positive capability authority through that same
+projection path (via
+:func:`~llm_modelbench.capability_evidence_adapter.new_measured_supported_families`),
+as of Stages 2.6A-D. The legacy ``capabilities.capability_identity_compatibility()``
+(dict-in, dict-out) is *not* the operationally authoritative function for
+any of those four real command paths any more -- it remains live only for
+message/observation-field selection and as a regression-oracle comparison
+target, never to admit a candidate. See
+``local_only/anvil/stage-2.6E-authority-audit.md`` for the full audit.
 
 Explicit non-goals for this slice (all later Stage 2 work, not this one):
 - No ``CapabilityProjection`` -- selecting which observation is currently

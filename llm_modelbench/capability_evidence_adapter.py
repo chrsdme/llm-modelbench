@@ -63,14 +63,48 @@ structurally produce ``NO_CURRENT_PROJECTION`` ->
 ``CAPABILITY_REPROBE_REQUIRED`` by simply having no observation to find,
 exactly matching what Stage 2.3 already does for absent evidence.
 
-Anvil Stage 2.6A (phase 2) migrated ``planner.py``'s scheduling gate onto
-this module's ``new_measured_supported_families()`` (added this slice).
-Anvil Stage 2.6B migrates ``runner.py``'s two equivalent call sites the
-same way. ``repair.py`` and ``campaign.py`` are not migrated yet.
+Migration status (all four live consumers now migrated, as of Anvil Stage
+2.6D): ``planner.py`` (2.6A phase 2), ``runner.py`` (2.6B), ``repair.py``
+(2.6C), and ``campaign.py``'s judge-selection functions (2.6D) all source
+their sole positive execution/recovery/judge-eligibility authority from
+this module's ``new_measured_supported_families()``.
 ``new_measured_supported_families()`` lives here rather than in
 ``planner.py`` or ``runner.py`` specifically so both can import it
 without creating a circular import (``planner.py`` already imports from
 ``runner.py``); this module has no dependency on either.
+
+**Lifecycle (Anvil Stage 2.6E)**: this module is a *migration bridge* --
+validated, already-captured ``interrogate_model()`` profile evidence
+translated into typed Stage 2 capability authority. It is explicitly not:
+declared-metadata promotion, a generic "bless legacy data" mechanism, or a
+permanent parallel capability system meant to coexist with
+:mod:`~llm_modelbench.capability_observation`/
+:mod:`~llm_modelbench.evidence` indefinitely. It exists only because
+production capability evidence is not yet natively produced/persisted as
+typed ``CapabilityObservation`` records (``EvidenceLedger`` is still never
+instantiated in production, confirmed unchanged since this module was
+first built). Its expected demotion/removal point is whenever a later
+stage (tracked as Stage 2.7+ legacy-evidence migration, or Stage 3) makes
+native ``CapabilityObservation`` production/persistence the normal path --
+at that point this adapter's job is done and callers should read real
+observations directly instead of translating legacy dicts on every call.
+
+**Long-term architecture (decided at Stage 2.6E closure, not left
+implicit)**: each of the four migrated consumers deliberately asks this
+module's *capability-only* question (``new_measured_supported_families()``)
+rather than being forced through the fuller
+:mod:`~llm_modelbench.task_applicability` composition
+(capability + environment + operator policy) that only ``planner.py``'s
+own family-routing gate ever needed that full shape for. This is an
+intentional design choice, not an unfinished migration: "one capability
+authority, not necessarily one giant decision object everywhere." A
+subsystem that only ever asks a capability question (runner's execution
+gate, repair's recovery gate, judge eligibility) should keep asking only
+that question through this module; forcing every consumer through
+``TaskApplicability`` for uniformity's own sake would add environment/
+operator-policy inputs those call sites don't have and don't need. See
+``local_only/anvil/stage-2.6E-authority-audit.md`` for the full audit this
+decision was made against.
 """
 from __future__ import annotations
 

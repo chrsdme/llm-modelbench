@@ -33,6 +33,7 @@ from .capabilities import (
     MeasuredCapabilityState,
     capability_identity_compatibility,
     family_applicability,
+    interrogate_model,
     measured_supported_families,
 )
 from .capability_evidence_adapter import new_measured_supported_families
@@ -3491,6 +3492,55 @@ def qualify_judge(client: Any, candidate: Dict[str, Any], *, repeats: int = 2) -
     qualification["roles"] = _model_roles(candidate)
     qualification["stable_identity"] = stable_model_identity(candidate)
     return qualification
+
+
+def build_manual_judge_candidate(client: Any, judge_model: str) -> Dict[str, Any]:
+    """Build a real, freshly-interrogated judge candidate for the operator-
+    named ``--judge-model`` path (``judge_dumps.py``'s manual override), so
+    it can be evaluated through the exact same typed capability-authority,
+    qualification, and independence gates as an automatically-selected
+    candidate (Anvil Stage 2.6E). Named selection chooses *which* candidate
+    to evaluate -- it must never manufacture capability by itself.
+
+    Unlike the automatic judge-candidate path (``cli.py``'s ``cmd_run``
+    judging branch), there is no guaranteed prior campaign-plan profile for
+    an arbitrary operator-named model, so this always runs a fresh
+    functional interrogation rather than reusing a stored one. The digest
+    is sourced independently from a live ``client.tags()`` call, mirroring
+    the automatic path's own freshness pattern.
+
+    Unlike the automatic path (whose candidate never carries a live
+    ``current_capability_identity`` -- confirmed by the Stage 2.6D design
+    trace of the real ``cli.py`` call site), this candidate genuinely does:
+    the whole profile, identity, and digest were all captured together in
+    this one live interrogation, so ``current_capability_identity`` is set
+    explicitly (a copy of the just-captured identity, digest independently
+    re-confirmed from ``client.tags()`` rather than trusted verbatim) --
+    the strongest, most direct evidence branch
+    (``_candidate_current_capability_identity()``'s branch 1), not a
+    synthetic fallback.
+    """
+    profile = interrogate_model(client, judge_model, functional=True)
+    digest = None
+    try:
+        tags = client.tags() if hasattr(client, "tags") else []
+    except Exception:
+        tags = []
+    for item in tags:
+        if str(item.get("name") or item.get("model") or "") == judge_model:
+            digest = item.get("digest")
+            break
+    current_identity = copy.deepcopy(profile.get("capability_identity") or {})
+    if isinstance(current_identity.get("model"), dict):
+        current_identity["model"] = dict(current_identity["model"])
+        current_identity["model"]["digest"] = digest
+    return {
+        **profile,
+        "name": judge_model,
+        "digest": digest,
+        "current_capability_identity": current_identity,
+        "manual_designation": True,
+    }
 
 
 def select_campaign_judge(inventory: List[Dict[str, Any]], cohort: List[Dict[str, Any]], *,

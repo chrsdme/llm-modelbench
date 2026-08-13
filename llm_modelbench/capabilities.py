@@ -3,6 +3,30 @@
 Metadata is cheap and always collected, but it is only a hint. Actual routing
 requires measured capability evidence from functional smoke probes. Probes never
 execute a proposed tool call.
+
+``interrogate_model()`` remains the sole production entry point that collects
+this evidence (metadata hints, functional probe results, and the identity
+snapshot they were captured against) -- unchanged by the Anvil Stage 2
+migration.
+
+**Post Anvil Stage 2.6E status of this module's own capability_identity_compatibility()
+/ measured_supported_families() / family_applicability() / family_is_applicable()**
+(the pre-Stage-2 decision layer, as opposed to interrogation/collection
+above): none of the four live production execution/recovery/judge-eligibility
+consumers (``planner.py``, ``runner.py``, ``repair.py``, ``campaign.py``'s
+judge-selection functions) treat these as authority any more -- each was
+migrated onto the typed Stage 2 stack
+(``capability_evidence_adapter.new_measured_supported_families()`` ->
+``capability_projection``/``capability_observation``) across Stages 2.6A-D.
+These four functions remain live and are deliberately not deleted, kept
+callable for: rejection/observation *message* selection in the four migrated
+consumers (never to admit a candidate -- only to pick which explanation to
+show once the typed stack has already decided), the legacy side of
+``capability_migration_comparison.py``'s regression-oracle comparisons, and
+historical/report-facing readers. ``family_is_applicable()`` specifically has
+no remaining callers anywhere in this repository as of 2.6E (confirmed by a
+full-repo grep during the 2.6E closure audit) -- kept for now as a documented,
+harmless convenience wrapper, not because anything still calls it.
 """
 from __future__ import annotations
 
@@ -152,6 +176,12 @@ def capability_identity_compatibility(
     profile: Mapping[str, Any],
     current_identity: Optional[Mapping[str, Any]],
 ) -> Dict[str, Any]:
+    """Pre-Stage-2 identity-compatibility check. Not live execution/recovery/
+    judge authority anywhere in this repository as of Anvil Stage 2.6E -- see
+    this module's docstring. Still called directly by the four migrated
+    consumers (planner/runner/repair/campaign) to populate an informational
+    ``capability_identity_compatibility`` field for message selection, and by
+    ``capability_migration_comparison.py``'s legacy-side regression oracle."""
     stored = profile.get("capability_identity")
     if not isinstance(stored, Mapping):
         return {"compatible": False, "reason": "legacy_or_unbound_capability_profile"}
@@ -426,6 +456,10 @@ def measured_capability_states(profile: Mapping[str, Any]) -> Dict[str, str]:
 
 
 def measured_supported_families(profile: Mapping[str, Any], *, allow_legacy: bool = False) -> List[str]:
+    """Pre-Stage-2 family authority. Not live execution/recovery/judge
+    authority anywhere in this repository as of Anvil Stage 2.6E -- see this
+    module's docstring. ``allow_legacy=True`` is never passed by any
+    production caller (confirmed by the 2.6E audit)."""
     if not allow_legacy and profile.get("capability_schema_version") != CAPABILITY_SCHEMA_VERSION:
         return []
     states = measured_capability_states(profile)
@@ -433,12 +467,20 @@ def measured_supported_families(profile: Mapping[str, Any], *, allow_legacy: boo
 
 
 def family_applicability(profile: Mapping[str, Any], family: str, *, allow_legacy: bool = False) -> str:
+    """Pre-Stage-2 family authority. Not live execution/recovery/judge
+    authority anywhere in this repository as of Anvil Stage 2.6E -- see this
+    module's docstring. ``allow_legacy=True`` is never passed by any
+    production caller (confirmed by the 2.6E audit)."""
     if not allow_legacy and profile.get("capability_schema_version") != CAPABILITY_SCHEMA_VERSION:
         return MeasuredCapabilityState.PROBE_INCONCLUSIVE.value
     return measured_capability_states(profile).get(str(family), MeasuredCapabilityState.NOT_APPLICABLE.value)
 
 
 def family_is_applicable(profile: Mapping[str, Any], family: str, *, allow_legacy: bool = False) -> bool:
+    """Pre-Stage-2 boolean wrapper. Confirmed by the Anvil Stage 2.6E audit
+    to have zero remaining callers anywhere in this repository -- kept as a
+    documented, harmless convenience wrapper, not because anything still
+    calls it."""
     return family_applicability(profile, family, allow_legacy=allow_legacy) == MeasuredCapabilityState.MEASURED_SUPPORTED.value
 
 

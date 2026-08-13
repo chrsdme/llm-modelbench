@@ -92,12 +92,58 @@ def discover_runs(runs_dir: Path) -> List[Path]:
     )
 
 
-def _manual_judge_pool(judge_model: str) -> List[Dict[str, Any]]:
+class ManualJudgeIneligibleError(Exception):
+    """The explicitly-named ``--judge-model`` candidate does not satisfy the
+    typed capability-authority and qualification gates every other judge
+    candidate must pass (Anvil Stage 2.6E closure fix). Named selection
+    chooses which candidate to evaluate; it does not manufacture capability
+    or bypass qualification -- see ``campaign.build_manual_judge_candidate()``.
+    """
+
+
+def _resolve_manual_judge_pool(client: Any, judge_model: str) -> List[Dict[str, Any]]:
+    """Resolve the operator-named ``--judge-model`` into a real qualified-
+    judge pool of at most one entry.
+
+    Before Anvil Stage 2.6E this bypassed the capability-eligibility and
+    qualification gates entirely (a bare dict tagged
+    ``manual_unqualified_designation``, handed straight to
+    ``campaign.resolve_independent_judge_for_row()``) -- confirmed by
+    tracing that neither ``campaign.build_judge_selection()`` nor
+    ``campaign.qualify_judge()`` was ever reached on this path. That was a
+    real, live judge-authority bypass (category C, "positive judge
+    authority outside the typed Stage 2 path" in the 2.6E audit), not a
+    cosmetic gap. Fixed per the go-ahead advice's preferred "Option A":
+    named selection still chooses the candidate, but the candidate must
+    independently pass measured capability eligibility and qualification,
+    identically to an automatically-selected candidate. Raises
+    :class:`ManualJudgeIneligibleError` with a clear reason rather than
+    silently returning an empty pool (which would otherwise surface only
+    as an opaque ``awaiting_independent_judge`` state with no indication
+    the operator's explicit choice was the reason).
+    """
+    if client is None:
+        raise ManualJudgeIneligibleError(
+            f"cannot resolve manual judge {judge_model!r}: a live client is required to interrogate and qualify it"
+        )
+    candidate = campaign.build_manual_judge_candidate(client, judge_model)
+    capability_rejection = campaign._judge_capability_rejection(candidate)
+    if capability_rejection:
+        raise ManualJudgeIneligibleError(
+            f"--judge-model {judge_model!r} is not capability-eligible to judge: {capability_rejection}"
+        )
+    qualification = campaign.qualify_judge(client, candidate)
+    if not qualification.get("qualified"):
+        raise ManualJudgeIneligibleError(
+            f"--judge-model {judge_model!r} failed judge qualification: {qualification.get('aggregate_disposition')}"
+        )
     return [{
-        "name": judge_model,
-        "model": judge_model,
+        **candidate,
+        "qualified": True,
+        "qualification": qualification,
         "manual_designation": True,
-        "qualification_state": "manual_unqualified_designation",
+        "roles": campaign._model_roles(candidate),
+        "stable_identity": campaign.stable_model_identity(candidate),
     }]
 
 
@@ -233,10 +279,11 @@ def scan_run(
     num_ctx: Optional[int] = None,
     think: str = "auto",
     force: bool = False,
+    client: Any = None,
 ) -> Dict[str, Any]:
     raw_rows = _jsonl(run_dir / "raw_results.jsonl")
     existing = _jsonl(run_dir / "judge_results.jsonl")
-    qualified_judges = qualified_judges if qualified_judges is not None else _manual_judge_pool(judge_model)
+    qualified_judges = qualified_judges if qualified_judges is not None else _resolve_manual_judge_pool(client, judge_model)
     pool_signature = campaign.judge_pool_signature(qualified_judges)
     judge_mode_configuration = _judge_config(judge_mode, num_ctx, think)
     execution_fingerprint = _execution_fingerprint(qualified_judges, judge_mode_configuration)
@@ -304,7 +351,7 @@ def judge_run(
 ) -> Dict[str, Any]:
     if judge_mode not in {"single", "panel"}:
         raise ValueError("judge mode must be single or panel")
-    qualified_judges = qualified_judges if qualified_judges is not None else _manual_judge_pool(judge_model)
+    qualified_judges = qualified_judges if qualified_judges is not None else _resolve_manual_judge_pool(client, judge_model)
     scan = scan_run(
         run_dir,
         judge_model=judge_model,
@@ -313,6 +360,7 @@ def judge_run(
         num_ctx=num_ctx,
         think=think,
         force=force,
+        client=client,
     )
     eligible = scan.pop("eligible")
     pool_signature = str(scan.get("judge_pool_signature") or "")
@@ -625,6 +673,13 @@ def judge_everything(
     progress: Optional[Callable[[int, int, Path, Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     runs = discover_runs(runs_dir)
+    # Resolve the manual judge pool once, up front, rather than once per run
+    # directory: interrogation + qualification are real live-client calls,
+    # and re-running them per run_dir would repeat the same expensive work
+    # for the same judge_model (same discipline as Stage 1.3's GPU-inventory
+    # reuse -- resolve once, thread the result through).
+    if qualified_judges is None:
+        qualified_judges = _resolve_manual_judge_pool(client, judge_model)
     results = []
     for index, run_dir in enumerate(runs, start=1):
         result = judge_run(

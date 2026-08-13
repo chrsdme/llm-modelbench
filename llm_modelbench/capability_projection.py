@@ -6,14 +6,24 @@ set of typed observations for one capability, which measurement is
 currently authoritative (:class:`CapabilityProjection`), and what
 capability-only decision follows from that (:class:`CapabilityDecision`)?
 
-Scope is deliberately narrow, per this session's Codex/GPT scoping pass
-(``local_only/anvil/codex-advice_stage2.3.txt``): purely additive, like
-Stage 2.1/2.2 before it. Nothing here is wired into ``capabilities.py``,
-``planner.py``, ``runner.py``, ``campaign.py``, or ``repair.py`` -- the
-existing dict-shaped ``capability_identity_compatibility()`` in
-``capabilities.py`` remains the sole operationally authoritative
-compatibility/routing check for every real command path until Stage 2.6
-migrates call sites.
+Scope was deliberately narrow at introduction, per this session's Codex/GPT
+scoping pass (``local_only/anvil/codex-advice_stage2.3.txt``): purely
+additive, like Stage 2.1/2.2 before it, with nothing wired into
+``capabilities.py``, ``planner.py``, ``runner.py``, ``campaign.py``, or
+``repair.py`` yet at that time.
+
+**Status update (Anvil Stage 2.6E, correcting the claim above, which is
+stale as originally written)**: this module is now the core of the typed
+capability-authority path every migrated consumer sources its positive
+authority from --
+:func:`~llm_modelbench.capability_evidence_adapter.new_measured_supported_families`
+calls ``project_capability_observation()``/``decide_capability_from_projection()``
+here directly, and ``planner.py``/``runner.py``/``repair.py``/``campaign.py``'s
+judge-selection functions all call that shared helper (Stages 2.6A-D). The
+legacy dict-shaped ``capability_identity_compatibility()`` in
+``capabilities.py`` is *not* operationally authoritative for any of those
+four real command paths any more -- see
+``local_only/anvil/stage-2.6E-authority-audit.md`` for the full audit.
 
 Explicit non-goals for this slice (all later Stage 2 work, not this one):
 - No ``EnvironmentDecision`` -- "can this specific configuration run here,

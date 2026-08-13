@@ -1,14 +1,22 @@
 """Anvil Stage 2.1 -- CapabilityObservation: an append-only evidence type
 for a single functional capability probe, plus its persistence semantics.
 
-Scope is deliberately narrow, per the second Codex/GPT pre-Stage-2 review
-(``local_only/anvil/codex-advice_pre_stage2.txt``, Part 2): this module
-introduces the evidence type and its persistence, and nothing else. It does
-NOT define ``CapabilityProjection``, ``TaskApplicability``, or migrate the
-planner/runner/recovery/judge call sites -- those stay on today's
-``capabilities.py`` (``current_capability_identity`` /
-``capability_identity_compatibility``) until later Stage 2 slices
-deliberately replace them. Nothing here is wired into any command path yet.
+Scope was deliberately narrow at introduction, per the second Codex/GPT
+pre-Stage-2 review (``local_only/anvil/codex-advice_pre_stage2.txt``, Part
+2): this module introduces the evidence type and its persistence, and
+nothing else. It does NOT itself define ``CapabilityProjection`` or
+``TaskApplicability``, and did not migrate the planner/runner/recovery/
+judge call sites on its own -- those stayed on ``capabilities.py``
+(``current_capability_identity`` / ``capability_identity_compatibility``)
+until later Stage 2 slices deliberately migrated them.
+
+**Status update (Anvil Stage 2.6E, correcting the claim above, which is
+stale as originally written)**: ``CapabilityObservation`` (this module) is
+now the typed evidence type that flows through the whole migrated
+authority path (``capability_evidence_adapter`` ->
+``capability_projection`` -> the four real command paths, Stages
+2.6A-D) -- not "nothing here is wired into any command path yet." See
+``local_only/anvil/stage-2.6E-authority-audit.md`` for the full audit.
 
 Two more explicit non-goals for this slice, both from the same review:
 

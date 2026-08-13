@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from llm_modelbench import campaign, judge_dumps
 from llm_modelbench.capabilities import PROBE_PROTOCOL_VERSION
 from llm_modelbench.runner import _task_hash
@@ -277,17 +279,25 @@ def test_unchanged_pending_rerun_is_noop_but_new_independent_judge_can_judge(tmp
 
 
 def test_manual_judge_dumps_path_does_not_fabricate_qualification_and_fails_closed(tmp_path):
+    # Anvil Stage 2.6E made this test's own name even more true: before
+    # 2.6E, the manual --judge-model path did not fabricate *qualification*
+    # but it also never checked *capability* at all -- an unresolvable judge
+    # candidate silently reached "skipped_indeterminate_identity" via
+    # indeterminate role/identity matching, not because anything actually
+    # verified it. 2.6E's closure fix (campaign.build_manual_judge_candidate(),
+    # judge_dumps.ManualJudgeIneligibleError) now runs a real capability
+    # interrogation first, so a genuinely unresolvable manual judge fails
+    # closed immediately with a clear capability reason -- never fabricating
+    # qualification, and never silently proceeding on indeterminate evidence.
     run = _write_subjective_run(tmp_path, [{"model": "alias-a", "digest": "digest-a"}])
     client = RecordingJudgeClient()
 
-    result = judge_dumps.judge_run(client, run, judge_model="alias-b")
-
-    assert client.models == []
-    assert result["pending"] == 1
-    resolution = result["entries"][0]["judge_resolution"]
-    assert resolution["attempts"][0]["status"] == "skipped_indeterminate_identity"
-    assert resolution["attempts"][0]["judge_identity"]["roles"] == []
-    assert resolution["attempts"][0]["judge_identity"]["digest"] is None
+    with pytest.raises(judge_dumps.ManualJudgeIneligibleError, match="not capability-eligible"):
+        judge_dumps.judge_run(client, run, judge_model="alias-b")
+    # One real functional text-probe call during interrogation (the
+    # capability check itself) -- but never a real judging call, since the
+    # capability gate aborts before any row is ever judged.
+    assert client.models == ["alias-b"]
 
 
 def test_pending_sidecar_propagates_to_effective_rows_and_blocks_readiness(tmp_path):

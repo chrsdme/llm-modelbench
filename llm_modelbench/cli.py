@@ -1110,6 +1110,13 @@ def cmd_judge_dumps(args, cfg):
         raise SystemExit("judge-dumps requires --judge-model or configured judge_model")
     client = _client(args, cfg)
 
+    try:
+        _cmd_judge_dumps_run(args, cfg, client, judge_dumps, report)
+    except judge_dumps.ManualJudgeIneligibleError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def _cmd_judge_dumps_run(args, cfg, client, judge_dumps, report):
     if args.everything:
         runs_dir = Path(args.runs_dir or "runs")
         rankings_dir = _ranking_dir_for(args, run_id="judge_everything")

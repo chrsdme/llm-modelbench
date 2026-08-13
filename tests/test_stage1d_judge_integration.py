@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from llm_modelbench import campaign, judge_dumps
 from llm_modelbench.capabilities import PROBE_PROTOCOL_VERSION
 from llm_modelbench.runner import _task_hash
@@ -682,14 +684,21 @@ def test_stage1d_non_structural_runtime_failure_does_not_continue_qualification(
 
 
 def test_stage1d_incomplete_identity_and_manual_judge_dump_fail_closed(tmp_path):
+    # Anvil Stage 2.6E superseded this test's original premise: before 2.6E,
+    # an unresolvable manual --judge-model bypassed capability eligibility
+    # and qualification entirely, landing here as an indeterminate-identity
+    # "awaiting_independent_judge" state (qualification_state
+    # "manual_unqualified_designation", never actually verified). 2.6E's
+    # closure fix (judge_dumps.ManualJudgeIneligibleError,
+    # campaign.build_manual_judge_candidate()) requires every manual judge
+    # candidate to pass the same real capability-authority gate as an
+    # automatically-selected one -- RecordingJudgeClient's chat() doesn't
+    # answer the real functional text probe correctly (it returns a judging-
+    # style JSON payload, not "AIW_TEXT_OK"), so "manual-judge" now correctly
+    # fails closed at the capability gate itself, with a clear reason,
+    # instead of silently proceeding as an unqualified-but-usable candidate.
     run = _write_subjective_run(tmp_path, [{"model": "source-a", "digest": "digest-source"}])
     client = RecordingJudgeClient()
 
-    result = judge_dumps.judge_run(client, run, judge_model="manual-judge")
-    entry = result["entries"][0]
-
-    assert client.calls == []
-    assert entry["status"] == "awaiting_independent_judge"
-    assert entry["qualified_judge_pool"][0]["qualification_state"] == "manual_unqualified_designation"
-    assert entry["qualified_judge_pool"][0]["qualification_protocol_version"] is None
-    assert entry["judge_resolution"]["attempts"][0]["status"] == "skipped_indeterminate_identity"
+    with pytest.raises(judge_dumps.ManualJudgeIneligibleError, match="not capability-eligible"):
+        judge_dumps.judge_run(client, run, judge_model="manual-judge")
