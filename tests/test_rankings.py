@@ -346,13 +346,15 @@ def test_embedding_only_specialist_is_not_cross_class_overall_ranked(tmp_path):
 
 
 def test_measured_family_evidence_is_not_overridden_by_declared_capability_metadata(tmp_path):
-    """Stage 3.0A regression: ``families``/``overall_comparable`` are governed
-    by each row's own measured/executed evidence, never by re-running declared
+    """Stage 3.0A regression, matching the architecture proposal's own named
+    test-strategy fixture (a model with declared ``embedding`` but measured
+    ``text``+``tools``): ``families``/``overall_comparable`` are governed by
+    each row's own measured/executed evidence, never by re-running declared
     Ollama metadata through today's classifier. Before the fix, a row whose
-    declared capabilities said ``embedding`` (with no ``completion`` capability)
-    had its entire measured family_set discarded and replaced with
-    ``["embedding"]`` -- even though this row records an actually-executed
-    text task."""
+    declared capabilities said ``embedding`` (with no ``completion``
+    capability) had its entire measured family_set discarded and replaced
+    with ``["embedding"]`` -- even though these rows record actually-executed
+    text and tools tasks."""
     runs_dir = tmp_path / "runs"
     runs_dir.mkdir()
     _write_run(runs_dir, "r1", "full",
@@ -360,12 +362,17 @@ def test_measured_family_evidence_is_not_overridden_by_declared_capability_metad
                  "family": "text", "score": 100.0,
                  "task_hash": rankings._CURRENT_HASHES["py_anagram"],
                  "capabilities_declared": ["embedding"],
+                 "timestamp": "2026-01-01T00:00:00Z"},
+                {"model": "custom-model", "task": "agent_native_tool_call", "category": "agentic_tool",
+                 "family": "tools", "score": 100.0,
+                 "task_hash": rankings._CURRENT_HASHES["agent_native_tool_call"],
+                 "capabilities_declared": ["embedding"],
                  "timestamp": "2026-01-01T00:00:00Z"}],
                identities={"custom-model": {"digest": "d-custom"}})
     out = tmp_path / "rankings"
     rankings.write_rankings(runs_dir, out)
     entry = json.loads((out / "master_summary.json").read_text())[0]
-    assert entry["families"] == ["text"]
+    assert entry["families"] == ["text", "tools"]
     assert entry["overall_comparable"] is True
 
 

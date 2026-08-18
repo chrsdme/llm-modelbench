@@ -264,19 +264,23 @@ def _task_seconds(rows: Iterable[Dict[str, Any]]) -> Tuple[Optional[float], str]
 
 
 def _families_for_entry(rows: List[Dict[str, Any]]) -> List[str]:
-    """Typed measured evidence governs. Each row's ``capability_families`` /
-    ``family`` / ``capability_profile.supported_families`` are already bound
-    to that row's own recorded run (see ``runner.py``'s
-    ``effective_measured_supported_families()`` call and rankings.py's own
-    ``capability_report.json``-scoped import above) -- never re-derived
+    """Row-bound evidence governs, never today's live/re-derived classifier.
+    Each row's ``capability_families`` (``runner.py``'s
+    ``effective_measured_supported_families()`` result, typed and
+    ledger-preferred) and ``family`` (the task actually executed) are true
+    per-row measured evidence. ``capability_profile.supported_families`` is
+    that specific run's own ``capability_report.json`` -- also bound to that
+    row's recorded run, though it may include declared-but-unprobed families
+    alongside measured ones (see ``capabilities.py``'s ``functional=True``
+    interrogation path); still never today's live state, and never re-derived
     through today's name/declared-capability classifier. A historical run
     measured as ``text`` must keep reading ``text`` even if a later reprobe,
     or today's classifier, would now say ``embedding`` for the same model
     name -- see the Stage 3.0A frozen historical-evidence rule
     (``local_only/anvil/stage-3.0-schema-freeze.md``, "Historical evidence
-    semantics"). Declared-only capability hints are deliberately never
-    unioned into ``family_set`` -- only evidence that reflects what was
-    actually measured/executed for these rows.
+    semantics"). Declared capability hints untethered from any row's own
+    execution (``capabilities_declared``, ``profile.declared_capabilities``)
+    are deliberately never unioned into ``family_set`` at all.
     """
     family_set = set()
     for row in rows:
