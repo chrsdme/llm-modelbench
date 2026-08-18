@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .aggregate import aggregate
+from .capabilities import measured_supported_families
 from .config import DEFAULT_WEIGHTS
 from .runner import _task_hash
 from .tasks import LEVELS, TASKS
@@ -177,9 +178,19 @@ def import_new_runs(
             candidate["ranking_scope"] = run_scope
             candidate["canonical_rankings"] = bool(scope_info.get("canonical_rankings", run_scope == SCOPE_CANONICAL))
             if model in capabilities:
-                candidate["capability_profile"] = capabilities[model]
-                candidate.setdefault("capability_families", capabilities[model].get("supported_families"))
-                candidate.setdefault("capabilities_declared", capabilities[model].get("declared_capabilities"))
+                profile = capabilities[model]
+                profile_digest = ((profile.get("capability_identity") or {}).get("model") or {}).get("digest")
+                # A capability profile only authorizes this row's ranking families
+                # when its own recorded artifact identity provably matches this
+                # row's resolved digest -- never by model-name co-location alone
+                # (capability_report.json is keyed by name, not digest). A profile
+                # with a missing or mismatched identity cannot prove that binding,
+                # so it fails closed here rather than silently authorizing a
+                # family for a possibly unrelated artifact.
+                if profile_digest and profile_digest == digest:
+                    candidate["capability_profile"] = profile
+                    candidate.setdefault("capability_families", measured_supported_families(profile))
+                    candidate.setdefault("capabilities_declared", profile.get("declared_capabilities"))
             tag = new_import_tag(existing_tags)
             existing_tags.add(tag)
             candidate["import_tag"] = tag
@@ -264,23 +275,31 @@ def _task_seconds(rows: Iterable[Dict[str, Any]]) -> Tuple[Optional[float], str]
 
 
 def _families_for_entry(rows: List[Dict[str, Any]]) -> List[str]:
-    """Row-bound evidence governs, never today's live/re-derived classifier.
+    """Row-bound, strictly-measured evidence governs -- never today's live/
+    re-derived classifier, and never a merely declared-but-unprobed family.
     Each row's ``capability_families`` (``runner.py``'s
     ``effective_measured_supported_families()`` result, typed and
     ledger-preferred) and ``family`` (the task actually executed) are true
-    per-row measured evidence. ``capability_profile.supported_families`` is
-    that specific run's own ``capability_report.json`` -- also bound to that
-    row's recorded run, though it may include declared-but-unprobed families
-    alongside measured ones (see ``capabilities.py``'s ``functional=True``
-    interrogation path); still never today's live state, and never re-derived
-    through today's name/declared-capability classifier. A historical run
-    measured as ``text`` must keep reading ``text`` even if a later reprobe,
-    or today's classifier, would now say ``embedding`` for the same model
-    name -- see the Stage 3.0A frozen historical-evidence rule
-    (``local_only/anvil/stage-3.0-schema-freeze.md``, "Historical evidence
-    semantics"). Declared capability hints untethered from any row's own
-    execution (``capabilities_declared``, ``profile.declared_capabilities``)
-    are deliberately never unioned into ``family_set`` at all.
+    per-row measured evidence. ``capability_profile`` is that specific row's
+    own bound ``capability_report.json`` (import-time identity-gated -- see
+    ``import_new_runs()`` -- so it is only ever attached when its own recorded
+    artifact digest matches this row's); its ``supported_families`` field is
+    deliberately never read directly here, since it can include
+    declared-but-unprobed families alongside measured ones (see
+    ``capabilities.py``'s ``functional=True`` interrogation path). Instead
+    ``capabilities.measured_supported_families()`` -- the module's own
+    documented function for exactly this "historical/report-facing reader"
+    use case -- is used, which derives strictly the ``measured_supported``
+    subset from ``measured_capabilities`` and fails closed (returns nothing)
+    for any profile whose schema version isn't current, rather than trusting
+    stale/legacy data. A historical run measured as ``text`` must keep
+    reading ``text`` even if a later reprobe, or today's classifier, would
+    now say ``embedding`` for the same model name -- see the Stage 3.0A
+    frozen historical-evidence rule (``local_only/anvil/stage-3.0-schema-freeze.md``,
+    "Historical evidence semantics"). Declared capability hints untethered
+    from any row's own measured execution (``capabilities_declared``,
+    ``profile.declared_capabilities``) are deliberately never unioned into
+    ``family_set`` at all.
     """
     family_set = set()
     for row in rows:
@@ -288,7 +307,7 @@ def _families_for_entry(rows: List[Dict[str, Any]]) -> List[str]:
         if row.get("family"):
             family_set.add(str(row.get("family")))
         profile = row.get("capability_profile") or {}
-        family_set.update(profile.get("supported_families") or [])
+        family_set.update(measured_supported_families(profile))
 
     if "vision" in family_set:
         family_set.add("text")

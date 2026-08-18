@@ -1,6 +1,7 @@
 import json
 import time
 from llm_modelbench import rankings
+from llm_modelbench.capabilities import CAPABILITY_SCHEMA_VERSION
 
 
 def _write_run(runs_dir, run_id, level, rows, identities=None):
@@ -376,6 +377,127 @@ def test_measured_family_evidence_is_not_overridden_by_declared_capability_metad
     assert entry["overall_comparable"] is True
 
 
+def _capability_profile(*, digest, measured, supported_families, declared_capabilities=None, schema_version=None):
+    """A minimal, schema-shaped ``capability_report.json`` entry for one
+    model -- same dict shape ``capabilities.interrogate_model()`` produces.
+    ``digest=None`` omits ``capability_identity`` entirely (unbound identity)."""
+    return {
+        "capability_schema_version": CAPABILITY_SCHEMA_VERSION if schema_version is None else schema_version,
+        "probe_protocol_version": "v1",
+        "capability_identity": {"model": {"digest": digest}} if digest is not None else {},
+        "declared_capabilities": declared_capabilities or [],
+        "supported_families": supported_families,
+        "measured_capabilities": measured,
+    }
+
+
+def test_declared_unprobed_family_in_capability_profile_cannot_authorize_ranking_family(tmp_path):
+    """Stage 3.0A reconciliation regression: a family that is only declared/
+    name-hinted but was never actually probed (``measured_capabilities``
+    state ``not_applicable``) must not become ranking authority just because
+    it still lingers in the legacy ``supported_families`` list. The row's
+    only real, executed evidence is ``embedding`` -- ``text`` must not
+    appear, and ``overall_comparable`` (gated on ``"text" in families``)
+    must stay False."""
+    runs_dir = tmp_path / "runs"
+    runs_dir.mkdir()
+    run = _write_run(runs_dir, "r1", "full",
+                      [{"model": "embed-model", "task": "ret_ukdocs", "category": "retrieval",
+                        "family": "embedding", "score": 100.0,
+                        "task_hash": rankings._CURRENT_HASHES["ret_ukdocs"],
+                        "timestamp": "2026-01-01T00:00:00Z"}],
+                      identities={"embed-model": {"digest": "d-embed"}})
+    profile = _capability_profile(
+        digest="d-embed",
+        measured={"text": {"state": "not_applicable"}, "embedding": {"state": "measured_supported"}},
+        supported_families=["text", "embedding"],
+    )
+    (run / "capability_report.json").write_text(json.dumps({"embed-model": profile}))
+    out = tmp_path / "rankings"
+    rankings.write_rankings(runs_dir, out)
+    entry = json.loads((out / "master_summary.json").read_text())[0]
+    assert entry["families"] == ["embedding"]
+    assert entry["overall_comparable"] is False
+
+
+def test_measured_unsupported_family_cannot_be_readmitted_by_profile_metadata(tmp_path):
+    """A family explicitly measured unsupported (a failed functional probe)
+    must not be re-admitted as ranking authority even if a malformed/legacy
+    ``supported_families`` list still names it -- ``measured_capabilities``'
+    own state is what governs, not the declarative list alongside it."""
+    runs_dir = tmp_path / "runs"
+    runs_dir.mkdir()
+    run = _write_run(runs_dir, "r1", "full",
+                      [{"model": "embed-model", "task": "ret_ukdocs", "category": "retrieval",
+                        "family": "embedding", "score": 100.0,
+                        "task_hash": rankings._CURRENT_HASHES["ret_ukdocs"],
+                        "timestamp": "2026-01-01T00:00:00Z"}],
+                      identities={"embed-model": {"digest": "d-embed"}})
+    profile = _capability_profile(
+        digest="d-embed",
+        measured={"text": {"state": "measured_unsupported"}, "embedding": {"state": "measured_supported"}},
+        supported_families=["text", "embedding"],  # malformed/legacy: still names the unsupported family
+    )
+    (run / "capability_report.json").write_text(json.dumps({"embed-model": profile}))
+    out = tmp_path / "rankings"
+    rankings.write_rankings(runs_dir, out)
+    entry = json.loads((out / "master_summary.json").read_text())[0]
+    assert entry["families"] == ["embedding"]
+    assert entry["overall_comparable"] is False
+
+
+def test_capability_profile_with_mismatched_digest_cannot_authorize_a_family(tmp_path):
+    """A capability_report.json entry is keyed by model *name*, not digest.
+    If its own recorded artifact identity does not match this row's resolved
+    digest, it must not be trusted as ranking authority at all -- even for a
+    family it claims was genuinely measured_supported."""
+    runs_dir = tmp_path / "runs"
+    runs_dir.mkdir()
+    run = _write_run(runs_dir, "r1", "full",
+                      [{"model": "embed-model", "task": "ret_ukdocs", "category": "retrieval",
+                        "family": "embedding", "score": 100.0,
+                        "task_hash": rankings._CURRENT_HASHES["ret_ukdocs"],
+                        "timestamp": "2026-01-01T00:00:00Z"}],
+                      identities={"embed-model": {"digest": "d-embed"}})
+    profile = _capability_profile(
+        digest="d-a-different-artifact-entirely",
+        measured={"text": {"state": "measured_supported"}, "embedding": {"state": "measured_supported"}},
+        supported_families=["text", "embedding"],
+    )
+    (run / "capability_report.json").write_text(json.dumps({"embed-model": profile}))
+    out = tmp_path / "rankings"
+    rankings.write_rankings(runs_dir, out)
+    entry = json.loads((out / "master_summary.json").read_text())[0]
+    assert entry["families"] == ["embedding"]
+    assert entry["overall_comparable"] is False
+
+
+def test_capability_profile_with_missing_identity_cannot_authorize_a_family(tmp_path):
+    """A capability_report.json entry with no recoverable artifact identity
+    at all cannot prove it belongs to this row's artifact, so it must fail
+    closed exactly like a proven mismatch -- never be silently trusted by
+    model-name co-location alone."""
+    runs_dir = tmp_path / "runs"
+    runs_dir.mkdir()
+    run = _write_run(runs_dir, "r1", "full",
+                      [{"model": "embed-model", "task": "ret_ukdocs", "category": "retrieval",
+                        "family": "embedding", "score": 100.0,
+                        "task_hash": rankings._CURRENT_HASHES["ret_ukdocs"],
+                        "timestamp": "2026-01-01T00:00:00Z"}],
+                      identities={"embed-model": {"digest": "d-embed"}})
+    profile = _capability_profile(
+        digest=None,
+        measured={"text": {"state": "measured_supported"}, "embedding": {"state": "measured_supported"}},
+        supported_families=["text", "embedding"],
+    )
+    (run / "capability_report.json").write_text(json.dumps({"embed-model": profile}))
+    out = tmp_path / "rankings"
+    rankings.write_rankings(runs_dir, out)
+    entry = json.loads((out / "master_summary.json").read_text())[0]
+    assert entry["families"] == ["embedding"]
+    assert entry["overall_comparable"] is False
+
+
 def test_a_timed_out_reprobe_with_no_score_never_supersedes_an_earlier_valid_judged_result(monkeypatch):
     """Regression guard for a real incident: R1-Coder-DARE-7B's canonical run
     got kb_taxonomy/wr_rag genuinely judged (70.0/50.0), then a --think off
@@ -446,3 +568,33 @@ def test_valid_repair_result_supersedes_canonical_error_score(monkeypatch):
     result = rankings.rank_for_output([failed, repaired])
     assert result[0]["run_id"] == "repair"
     assert result[0]["score"] == 100.0
+
+
+def test_capability_profile_with_stale_schema_version_cannot_authorize_a_family(tmp_path):
+    """A matching artifact digest alone is not enough -- a profile recorded
+    under an old ``capability_schema_version`` cannot prove its
+    ``measured_capabilities`` shape means what today's schema means, so it
+    must fail closed too, exactly the same as a missing/mismatched identity.
+    This is the schema-version analogue of the Stage 3.0A historical-evidence
+    rule: old evidence is read on its own terms, never silently reinterpreted
+    as if written under today's rules."""
+    runs_dir = tmp_path / "runs"
+    runs_dir.mkdir()
+    run = _write_run(runs_dir, "r1", "full",
+                      [{"model": "embed-model", "task": "ret_ukdocs", "category": "retrieval",
+                        "family": "embedding", "score": 100.0,
+                        "task_hash": rankings._CURRENT_HASHES["ret_ukdocs"],
+                        "timestamp": "2026-01-01T00:00:00Z"}],
+                      identities={"embed-model": {"digest": "d-embed"}})
+    profile = _capability_profile(
+        digest="d-embed",
+        measured={"text": {"state": "measured_supported"}, "embedding": {"state": "measured_supported"}},
+        supported_families=["text", "embedding"],
+        schema_version=CAPABILITY_SCHEMA_VERSION - 1,
+    )
+    (run / "capability_report.json").write_text(json.dumps({"embed-model": profile}))
+    out = tmp_path / "rankings"
+    rankings.write_rankings(runs_dir, out)
+    entry = json.loads((out / "master_summary.json").read_text())[0]
+    assert entry["families"] == ["embedding"]
+    assert entry["overall_comparable"] is False
