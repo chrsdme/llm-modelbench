@@ -345,6 +345,30 @@ def test_embedding_only_specialist_is_not_cross_class_overall_ranked(tmp_path):
     assert entry["overall_mean_score"] == 100.0
 
 
+def test_measured_family_evidence_is_not_overridden_by_declared_capability_metadata(tmp_path):
+    """Stage 3.0A regression: ``families``/``overall_comparable`` are governed
+    by each row's own measured/executed evidence, never by re-running declared
+    Ollama metadata through today's classifier. Before the fix, a row whose
+    declared capabilities said ``embedding`` (with no ``completion`` capability)
+    had its entire measured family_set discarded and replaced with
+    ``["embedding"]`` -- even though this row records an actually-executed
+    text task."""
+    runs_dir = tmp_path / "runs"
+    runs_dir.mkdir()
+    _write_run(runs_dir, "r1", "full",
+               [{"model": "custom-model", "task": "py_anagram", "category": "coding_python",
+                 "family": "text", "score": 100.0,
+                 "task_hash": rankings._CURRENT_HASHES["py_anagram"],
+                 "capabilities_declared": ["embedding"],
+                 "timestamp": "2026-01-01T00:00:00Z"}],
+               identities={"custom-model": {"digest": "d-custom"}})
+    out = tmp_path / "rankings"
+    rankings.write_rankings(runs_dir, out)
+    entry = json.loads((out / "master_summary.json").read_text())[0]
+    assert entry["families"] == ["text"]
+    assert entry["overall_comparable"] is True
+
+
 def test_a_timed_out_reprobe_with_no_score_never_supersedes_an_earlier_valid_judged_result(monkeypatch):
     """Regression guard for a real incident: R1-Coder-DARE-7B's canonical run
     got kb_taxonomy/wr_rag genuinely judged (70.0/50.0), then a --think off

@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .aggregate import aggregate
-from .classify import families_for
 from .config import DEFAULT_WEIGHTS
 from .runner import _task_hash
 from .tasks import LEVELS, TASKS
@@ -264,27 +263,29 @@ def _task_seconds(rows: Iterable[Dict[str, Any]]) -> Tuple[Optional[float], str]
     return None, "unavailable in legacy row"
 
 
-def _families_for_entry(name: str, rows: List[Dict[str, Any]]) -> List[str]:
+def _families_for_entry(rows: List[Dict[str, Any]]) -> List[str]:
+    """Typed measured evidence governs. Each row's ``capability_families`` /
+    ``family`` / ``capability_profile.supported_families`` are already bound
+    to that row's own recorded run (see ``runner.py``'s
+    ``effective_measured_supported_families()`` call and rankings.py's own
+    ``capability_report.json``-scoped import above) -- never re-derived
+    through today's name/declared-capability classifier. A historical run
+    measured as ``text`` must keep reading ``text`` even if a later reprobe,
+    or today's classifier, would now say ``embedding`` for the same model
+    name -- see the Stage 3.0A frozen historical-evidence rule
+    (``local_only/anvil/stage-3.0-schema-freeze.md``, "Historical evidence
+    semantics"). Declared-only capability hints are deliberately never
+    unioned into ``family_set`` -- only evidence that reflects what was
+    actually measured/executed for these rows.
+    """
     family_set = set()
-    declared: List[str] = []
     for row in rows:
         family_set.update(row.get("capability_families") or [])
         if row.get("family"):
             family_set.add(str(row.get("family")))
-        declared.extend(row.get("capabilities_declared") or [])
         profile = row.get("capability_profile") or {}
         family_set.update(profile.get("supported_families") or [])
-        declared.extend(profile.get("declared_capabilities") or [])
 
-    # Re-evaluate accumulated legacy profiles through the current classifier.
-    # This corrects old fleet rows where embedding-only models were persisted as
-    # text+embedding+tools and prevents those obsolete routes from keeping the
-    # model provisionally incomplete forever after the classifier is fixed.
-    current_route = families_for(name, declared or None)
-    if current_route == ["embedding"]:
-        return ["embedding"]
-    if not family_set:
-        family_set.update(current_route)
     if "vision" in family_set:
         family_set.add("text")
     order = ("vision", "text", "embedding", "tools", "insert")
@@ -507,7 +508,7 @@ def build_summary(
         display_name = names[0] if names else str(digest)
         levels = sorted({str(row.get("level")) for row in all_history if row.get("level")}, key=lambda level: LEVEL_RANK.get(level, -1))
         fully_tested = "full" in levels
-        families = _families_for_entry(display_name, rows)
+        families = _families_for_entry(rows)
 
         scoring_rows: List[Dict[str, Any]] = []
         for row in rows:
