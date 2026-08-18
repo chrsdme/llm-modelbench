@@ -150,13 +150,35 @@ def test_golden_card_adds_stage_3_1_fields_without_disturbing_the_rest():
     )
     card = build_card(row)
     assert card["schema_version"] == 2
-    assert card["evidence_trust_class"] == EvidenceTrustClass.CANONICAL_COMPATIBLE.value
     assert card["human_validation_status"] == HumanValidationStatus.NOT_EVALUATED.value
     assert "human_correlation" not in card
-    assert not any("trust class" in warning for warning in card["evidence_warnings"])
 
 
-def test_evidence_trust_class_is_historical_valid_for_an_older_schema_profile():
+def test_current_capability_schema_alone_does_not_promote_to_canonical_compatible():
+    """Reconciliation regression 1: a bound capability profile whose schema
+    version matches today's ``CAPABILITY_SCHEMA_VERSION`` is not, by itself,
+    proof of scorer compatibility, task-hash compatibility, or the absence
+    of known-broken capability routing -- the actual ``EvidenceTrustClass``
+    contract (``evidence.py``). With no authoritative upstream
+    classification, the card must stay ``unknown_legacy``, never
+    ``canonical_compatible``."""
+    row = _fixed_model_row()
+    row["capability_profile"] = _capability_profile(
+        digest="sha256:abc123",
+        measured={"text": {"state": "measured_supported"}},
+        supported_families=["text"],
+    )
+    card = build_card(row)
+    assert card["evidence_trust_class"] == EvidenceTrustClass.UNKNOWN_LEGACY.value
+
+
+def test_old_capability_schema_alone_does_not_promote_to_historical_valid():
+    """Reconciliation regression 2: an older capability-profile schema
+    version is likewise not, by itself, proof of ``historical_valid`` --
+    with no authoritative upstream classification, it also stays
+    ``unknown_legacy``. Schema staleness is still surfaced -- as a warning,
+    not a trust promotion (see the paired assertion below and
+    ``test_capability_schema_staleness_is_a_warning_not_a_trust_promotion``)."""
     row = _fixed_model_row()
     row["capability_profile"] = _capability_profile(
         digest="sha256:abc123",
@@ -165,15 +187,103 @@ def test_evidence_trust_class_is_historical_valid_for_an_older_schema_profile():
         schema_version=CAPABILITY_SCHEMA_VERSION - 1,
     )
     card = build_card(row)
-    assert card["evidence_trust_class"] == EvidenceTrustClass.HISTORICAL_VALID.value
-    assert any("historical_valid" in warning for warning in card["evidence_warnings"])
+    assert card["evidence_trust_class"] == EvidenceTrustClass.UNKNOWN_LEGACY.value
+
+
+def test_authoritative_upstream_trust_class_is_projected_unchanged():
+    """Reconciliation regression 3: if an explicit, authoritative
+    ``EvidenceTrustClass`` already exists upstream (row-level or nested
+    under ``capability_profile``), ``ModelCard`` projects it exactly --
+    never reclassifies it, even when it disagrees with what schema-version
+    alone would otherwise suggest."""
+    row = _fixed_model_row()
+    row["capability_profile"] = _capability_profile(
+        digest="sha256:abc123",
+        measured={"text": {"state": "measured_supported"}},
+        supported_families=["text"],
+    )
+    row["capability_profile"]["evidence_trust_class"] = "calibration_only"
+    card = build_card(row)
+    assert card["evidence_trust_class"] == EvidenceTrustClass.CALIBRATION_ONLY.value
+
+
+def test_authoritative_upstream_trust_class_on_the_row_itself_is_projected_unchanged():
+    row = _fixed_model_row()
+    row["evidence_trust_class"] = "known_invalid"
+    card = build_card(row)
+    assert card["evidence_trust_class"] == EvidenceTrustClass.KNOWN_INVALID.value
+
+
+def test_malformed_upstream_trust_class_fails_closed_to_the_conservative_default():
+    row = _fixed_model_row()
+    row["evidence_trust_class"] = "not-a-real-trust-class"
+    card = build_card(row)
+    assert card["evidence_trust_class"] == EvidenceTrustClass.UNKNOWN_LEGACY.value
 
 
 def test_evidence_trust_class_is_unknown_legacy_with_no_bound_capability_profile():
+    """Reconciliation regression 4: with no upstream trust classification
+    and no capability profile at all, the card fails conservatively to
+    ``unknown_legacy``."""
     row = _fixed_model_row()
     card = build_card(row)
     assert card["evidence_trust_class"] == EvidenceTrustClass.UNKNOWN_LEGACY.value
-    assert any("unknown_legacy" in warning for warning in card["evidence_warnings"])
+
+
+def test_capability_schema_staleness_is_a_warning_not_a_trust_promotion():
+    """Reconciliation regression 5: schema staleness is surfaced as its own
+    warning, decoupled from ``evidence_trust_class`` -- staleness never
+    invents a stronger (or different) trust class."""
+    row = _fixed_model_row()
+    row["capability_profile"] = _capability_profile(
+        digest="sha256:abc123",
+        measured={"text": {"state": "measured_supported"}},
+        supported_families=["text"],
+        schema_version=CAPABILITY_SCHEMA_VERSION - 1,
+    )
+    card = build_card(row)
+    assert card["evidence_trust_class"] == EvidenceTrustClass.UNKNOWN_LEGACY.value
+    assert any("schema version" in warning for warning in card["evidence_warnings"])
+
+
+def test_current_schema_profile_produces_no_schema_staleness_warning():
+    row = _fixed_model_row()
+    row["capability_profile"] = _capability_profile(
+        digest="sha256:abc123",
+        measured={"text": {"state": "measured_supported"}},
+        supported_families=["text"],
+    )
+    card = build_card(row)
+    assert not any("schema version" in warning for warning in card["evidence_warnings"])
+
+
+def test_model_card_is_zero_authority_no_consumer_reads_it_for_decisions():
+    """Reconciliation regression 6: ``model_card``/``ModelCard`` must not be
+    imported by any planner/applicability/judge/routing/campaign/runner/
+    benchmark-authorization module -- only its own generation module
+    (``model_cards.py``) and this test file may reference it."""
+    import pathlib
+
+    package_dir = pathlib.Path(__import__("llm_modelbench").__file__).parent
+    allowed = {"model_card.py", "model_cards.py"}
+    offenders = []
+    for path in sorted(package_dir.glob("*.py")):
+        if path.name in allowed:
+            continue
+        text = path.read_text(encoding="utf-8")
+        if "model_card" in text.lower() and "model_cards" not in path.name.lower():
+            # Only flag genuine references to the model_card module/objects,
+            # not incidental substring hits (there are none in this codebase
+            # today, but keep the check honest rather than a bare substring).
+            if (
+                "import model_card" in text
+                or "from .model_card import" in text
+                or "from llm_modelbench.model_card import" in text
+                or "ModelCard(" in text
+                or "build_model_card(" in text
+            ):
+                offenders.append(path.name)
+    assert offenders == []
 
 
 def test_no_rendered_output_implies_human_validation_by_default():

@@ -93,26 +93,71 @@ def _artifact_from_model_row(model: Mapping[str, Any]) -> Optional[ModelArtifact
     )
 
 
+def _upstream_evidence_trust_class(model: Mapping[str, Any]) -> Optional[EvidenceTrustClass]:
+    """Projects an already-computed, authoritative ``EvidenceTrustClass`` if
+    one exists upstream -- ``ModelCard`` must never compute this
+    classification itself (see module docstring and ``evidence.py``'s own
+    contract: scorer compatibility, task-hash compatibility, known-broken
+    capability routing, and calibration/debug-only status all bear on trust,
+    not capability-schema freshness alone).
+
+    As of Stage 3.1, a full source-map confirms no production writer sets
+    this anywhere in the pipeline: ``EvidenceLedger.append()`` /
+    ``LedgerRecord`` both default ``trust_class`` to ``CANONICAL_COMPATIBLE``
+    and the repository's one real ``ledger.append()`` call site
+    (``capability_observation.append_capability_observation()``) never
+    overrides it; no ``evidence_trust_class``/``trust_class`` field is ever
+    written into ``master_summary.json`` rows or ``capability_report.json``
+    anywhere in ``rankings.py``/``runner.py``/``capabilities.py``. This
+    function exists so that a future stage recording a real classification
+    is picked up automatically -- without ``ModelCard`` being rewritten --
+    rather than because such a value exists today."""
+    for source in (model, model.get("capability_profile")):
+        if not isinstance(source, Mapping):
+            continue
+        raw = source.get("evidence_trust_class")
+        if raw is None:
+            continue
+        try:
+            return EvidenceTrustClass(raw)
+        except ValueError:
+            continue  # malformed upstream value -- fails closed, not a crash
+    return None
+
+
 def _evidence_trust_class(model: Mapping[str, Any]) -> EvidenceTrustClass:
-    """Grounded in the same schema-version signal ``capabilities.
-    measured_supported_families()`` already fails closed on -- no new
-    infrastructure, no live-ledger reprobe against a historical row (that
-    would violate the Stage 3.0A frozen historical-evidence rule). A row
-    with no bound capability profile at all has no typed basis for a
-    current-comparability claim; a row whose profile is on an older schema
-    is real measured evidence, just not the current schema; a row whose
-    profile matches today's schema is canonical. ``calibration_only`` and
-    ``known_invalid`` are reserved for signals this repository does not yet
-    record per-row -- never guessed at without one."""
+    """No authoritative upstream ``EvidenceTrustClass`` exists anywhere in
+    this pipeline yet (see :func:`_upstream_evidence_trust_class`), so this
+    conservatively defaults to ``UNKNOWN_LEGACY`` rather than inferring a
+    stronger class from a proxy signal. Capability-schema-version match is
+    deliberately *not* used as a proxy for overall evidence trust -- it says
+    nothing about scorer/task-hash compatibility, known-broken capability
+    routing, or calibration/debug-only status, so it cannot by itself prove
+    ``canonical_compatible`` (schema matches) or ``historical_valid``
+    (schema is older). Schema staleness is still surfaced, but as a warning
+    (see :func:`_capability_schema_warning`), never as a trust promotion."""
+    upstream = _upstream_evidence_trust_class(model)
+    if upstream is not None:
+        return upstream
+    return EvidenceTrustClass.UNKNOWN_LEGACY
+
+
+def _capability_schema_warning(model: Mapping[str, Any]) -> Optional[str]:
+    """A separate concern from :func:`_evidence_trust_class`: a bound
+    capability profile on a non-current schema is worth surfacing to a
+    reader, but it must never by itself change the card's trust
+    classification -- see this module's docstring."""
     profile = model.get("capability_profile")
     if not isinstance(profile, Mapping) or not profile:
-        return EvidenceTrustClass.UNKNOWN_LEGACY
+        return None
     schema_version = profile.get("capability_schema_version")
     if schema_version == CAPABILITY_SCHEMA_VERSION:
-        return EvidenceTrustClass.CANONICAL_COMPATIBLE
-    if schema_version is not None:
-        return EvidenceTrustClass.HISTORICAL_VALID
-    return EvidenceTrustClass.UNKNOWN_LEGACY
+        return None
+    return (
+        f"Bound capability profile schema version is '{schema_version}', not the "
+        f"current '{CAPABILITY_SCHEMA_VERSION}' -- capability-derived fields on this "
+        "row may reflect an older probe/classification schema."
+    )
 
 
 def _identity_block(model: Mapping[str, Any]) -> Dict[str, Any]:
@@ -146,10 +191,14 @@ def build_model_card(
     human-validation pipeline exists yet)."""
     trust_class = _evidence_trust_class(model)
     warnings = list(evidence_warnings or [])
+    schema_warning = _capability_schema_warning(model)
+    if schema_warning:
+        warnings.append(schema_warning)
     if trust_class != EvidenceTrustClass.CANONICAL_COMPATIBLE:
         warnings.append(
             f"Evidence trust class is '{trust_class.value}', not canonical_compatible -- "
-            "capability evidence for this row predates or lacks the current schema."
+            "no authoritative upstream evidence-trust classification exists for this row "
+            "yet, so it is not shown as trusted for current comparison."
         )
     return ModelCard(
         model=model.get("display_name"),
