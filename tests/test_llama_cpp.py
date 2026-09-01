@@ -102,26 +102,18 @@ def test_runtime_profile_identity_reflects_llama_cpp_backend_and_version():
     assert identity.backend_version == "b10086-66e4bf7e5"
 
 
-@pytest.mark.parametrize(
-    "method_name,args",
-    [
-        ("start_model", (MODEL,)),
-        ("stop_model", (MODEL,)),
-        ("load_model", (MODEL,)),
-        ("launch_managed_runtime", ()),
-        ("stop_managed_runtime", ()),
-        ("switch_model", (MODEL,)),
-    ],
-)
-def test_managed_lifecycle_methods_fail_closed(method_name, args):
-    """This module's own docstring says it "deliberately contains no server
-    lifecycle, model switching, or mutable-property operations" -- these
-    must refuse clearly, matching that design, not silently no-op."""
+def test_no_generic_managed_lifecycle_api_remains_on_the_llama_cpp_adapter():
+    """Anvil Stage 3.2: the rejected generic runtime-management scaffolding
+    was removed. This module "deliberately contains no server lifecycle,
+    model switching, or mutable-property operations" -- and now does not
+    even carry the failing stubs for them."""
     client, _ = _client()
     adapter = LlamaCppBackendAdapter(client)
-    method = getattr(adapter, method_name)
-    with pytest.raises(BackendCapabilityError):
-        method(*args)
+    for name in (
+        "start_model", "stop_model", "load_model",
+        "launch_managed_runtime", "stop_managed_runtime", "switch_model",
+    ):
+        assert not hasattr(adapter, name), f"{name} should have been removed from LlamaCppBackendAdapter"
 
 
 def test_inventory_deduplicates_dual_arrays_and_rejects_zero_or_router_mode():

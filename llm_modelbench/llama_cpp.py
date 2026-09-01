@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .backend import (
     BackendCapabilities, BackendCapability, BackendCapabilityError,
-    BackendIdentity, CapabilityStatus, require_capability,
+    BackendIdentity, CapabilityStatus,
 )
 from .identity import RuntimeProfileIdentity
 
@@ -538,19 +538,14 @@ _CAPABILITIES = BackendCapabilities({
     BackendCapability.FLUSH_ALL: CapabilityStatus.UNSUPPORTED, BackendCapability.OLLAMA_SERVICE_REPAIR: CapabilityStatus.UNSUPPORTED,
     BackendCapability.OLLAMA_KV_REPAIR: CapabilityStatus.UNSUPPORTED,
     # Anvil Stage 1.2. HEALTH_CHECK is genuinely supported (a read against
-    # a running endpoint). The managed-lifecycle group is UNSUPPORTED by
-    # explicit design, not oversight -- this module's own docstring already
-    # says "deliberately contains no server lifecycle, model switching, or
-    # mutable-property operations. It speaks only to an already-running
-    # endpoint," which is exactly what Stage 3B.4/3B.5 would need to change
-    # (and is explicitly future/gated scope per ANVIL_MASTER_PLAN.md).
+    # a running endpoint). This module "deliberately contains no server
+    # lifecycle, model switching, or mutable-property operations. It speaks
+    # only to an already-running endpoint" -- the rejected generic
+    # managed-lifecycle capability group was removed in Anvil Stage 3.2
+    # (ANVIL_ARCHITECTURE_AMENDMENT.md 2026-09-01); future Stage 3B
+    # llama.cpp execution is a campaign-owned ephemeral child-process
+    # runner, not a generic backend capability.
     BackendCapability.HEALTH_CHECK: CapabilityStatus.SUPPORTED,
-    BackendCapability.START_MODEL: CapabilityStatus.UNSUPPORTED,
-    BackendCapability.STOP_MODEL: CapabilityStatus.UNSUPPORTED,
-    BackendCapability.LOAD_MODEL: CapabilityStatus.UNSUPPORTED,
-    BackendCapability.MANAGED_RUNTIME_LAUNCH: CapabilityStatus.UNSUPPORTED,
-    BackendCapability.MANAGED_RUNTIME_STOP: CapabilityStatus.UNSUPPORTED,
-    BackendCapability.MODEL_SWITCH: CapabilityStatus.UNSUPPORTED,
 })
 
 
@@ -607,21 +602,3 @@ class LlamaCppBackendAdapter:
         except Exception:
             backend_version = None
         return RuntimeProfileIdentity(backend="llama_cpp", backend_version=backend_version)
-
-    def start_model(self, model: str, **kwargs: Any) -> None:
-        require_capability(self, BackendCapability.START_MODEL)
-
-    def stop_model(self, model: str) -> None:
-        require_capability(self, BackendCapability.STOP_MODEL)
-
-    def load_model(self, model: str, **kwargs: Any) -> None:
-        require_capability(self, BackendCapability.LOAD_MODEL)
-
-    def launch_managed_runtime(self, **kwargs: Any) -> None:
-        require_capability(self, BackendCapability.MANAGED_RUNTIME_LAUNCH)
-
-    def stop_managed_runtime(self) -> None:
-        require_capability(self, BackendCapability.MANAGED_RUNTIME_STOP)
-
-    def switch_model(self, model: str, **kwargs: Any) -> None:
-        require_capability(self, BackendCapability.MODEL_SWITCH)

@@ -155,43 +155,25 @@ def test_runtime_profile_identity_survives_version_failure(monkeypatch):
     assert identity.backend_version is None
 
 
-@pytest.mark.parametrize(
-    "method_name,args",
-    [
-        ("start_model", ("some-model",)),
-        ("stop_model", ("some-model",)),
-        ("load_model", ("some-model",)),
-        ("launch_managed_runtime", ()),
-        ("stop_managed_runtime", ()),
-        ("switch_model", ("some-model",)),
-    ],
-)
-def test_stage3b_dependent_methods_fail_closed_on_every_current_adapter(method_name, args):
-    """Not built yet (Stage 3B), and every current adapter must say so
-    clearly -- not raise AttributeError, not silently no-op."""
+def test_no_generic_managed_lifecycle_api_remains_on_the_backend_surface():
+    """Anvil Stage 3.2: the rejected generic runtime-management scaffolding
+    (start_model / stop_model / load_model / launch_managed_runtime /
+    stop_managed_runtime / switch_model, and their BackendCapability
+    members) was removed -- it had zero production callers. Future Stage 3B
+    llama.cpp execution is a campaign-owned ephemeral child-process runner,
+    not a generic backend method."""
+    obsolete = (
+        "start_model", "stop_model", "load_model",
+        "launch_managed_runtime", "stop_managed_runtime", "switch_model",
+    )
     for adapter in (OllamaBackendAdapter(OllamaClient("http://127.0.0.1:11434")), MockBackendAdapter(MockClient())):
-        method = getattr(adapter, method_name)
-        with pytest.raises(BackendCapabilityError):
-            method(*args)
-
-
-def test_stage3b_capabilities_are_explicitly_declared_unsupported_not_unknown():
-    """Distinguishes "not built yet" from "nobody said" -- an UNKNOWN
-    status would silently pass some fail-open checks that UNSUPPORTED
-    correctly blocks."""
-    for capability in (
-        BackendCapability.START_MODEL,
-        BackendCapability.STOP_MODEL,
-        BackendCapability.LOAD_MODEL,
-        BackendCapability.MANAGED_RUNTIME_LAUNCH,
-        BackendCapability.MANAGED_RUNTIME_STOP,
-        BackendCapability.MODEL_SWITCH,
+        for name in obsolete:
+            assert not hasattr(adapter, name), f"{name} should have been removed from the backend surface"
+    for member in (
+        "START_MODEL", "STOP_MODEL", "LOAD_MODEL",
+        "MANAGED_RUNTIME_LAUNCH", "MANAGED_RUNTIME_STOP", "MODEL_SWITCH",
     ):
-        for adapter in (
-            OllamaBackendAdapter(OllamaClient("http://127.0.0.1:11434")),
-            MockBackendAdapter(MockClient()),
-        ):
-            assert adapter.backend_capabilities().state(capability) is CapabilityStatus.UNSUPPORTED
+        assert not hasattr(BackendCapability, member), f"BackendCapability.{member} should have been removed"
 
 
 def test_health_check_capability_is_supported_on_both_current_adapters():

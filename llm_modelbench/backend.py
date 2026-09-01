@@ -59,19 +59,16 @@ class BackendCapability(str, Enum):
     OLLAMA_SERVICE_REPAIR = "ollama_service_repair"
     OLLAMA_KV_REPAIR = "ollama_kv_repair"
     HEALTH_CHECK = "health_check"
-    # Stage 3B-dependent (ANVIL_MASTER_PLAN.md v2.2): managed process
-    # lifecycle for a backend ModelBench itself starts/stops/switches, as
-    # opposed to inspecting an externally-managed one. Deliberately
-    # UNSUPPORTED for every adapter until Stage 3B actually builds this --
-    # declared now so callers get a clear, typed refusal instead of an
-    # AttributeError, per Guiding Principle "unsupported operations return
-    # a typed capability state, not a silent no-op."
-    START_MODEL = "start_model"
-    STOP_MODEL = "stop_model"
-    LOAD_MODEL = "load_model"
-    MANAGED_RUNTIME_LAUNCH = "managed_runtime_launch"
-    MANAGED_RUNTIME_STOP = "managed_runtime_stop"
-    MODEL_SWITCH = "model_switch"
+    # NOTE (Anvil Stage 3.2): the generic managed-process-lifecycle
+    # capabilities (START_MODEL / STOP_MODEL / LOAD_MODEL /
+    # MANAGED_RUNTIME_LAUNCH / MANAGED_RUNTIME_STOP / MODEL_SWITCH) were
+    # removed here. They were scaffolding for the rejected persistent
+    # runtime-management architecture (ANVIL_ARCHITECTURE_AMENDMENT.md
+    # 2026-09-01) and had zero production callers. Future Stage 3B
+    # llama.cpp execution is a narrowly campaign-owned ephemeral
+    # child-process runner/context manager, not a generic backend method;
+    # Ollama stays an endpoint client; sequential GGUF execution is
+    # start/run/stop/start-next, not a switch_model() operation.
 
 
 @dataclass(frozen=True)
@@ -127,18 +124,6 @@ class InferenceClient(Protocol):
     def health(self) -> bool: ...
     def runtime_profile_identity(self) -> RuntimeProfileIdentity: ...
 
-    # Stage 3B-dependent: managed process lifecycle. Every current adapter
-    # declares these UNSUPPORTED (see _OLLAMA_CAPABILITIES/_MOCK_CAPABILITIES
-    # below) and self-guards with require_capability() -- calling one today
-    # raises BackendCapabilityError with a clear message, not an
-    # AttributeError or a silent no-op.
-    def start_model(self, model: str, **kwargs: Any) -> None: ...
-    def stop_model(self, model: str) -> None: ...
-    def load_model(self, model: str, **kwargs: Any) -> None: ...
-    def launch_managed_runtime(self, **kwargs: Any) -> None: ...
-    def stop_managed_runtime(self) -> None: ...
-    def switch_model(self, model: str, **kwargs: Any) -> None: ...
-
 
 def require_capability(client: InferenceClient, capability: BackendCapability) -> None:
     """Fail closed before an adapter-declared unsupported operation."""
@@ -174,12 +159,6 @@ _OLLAMA_CAPABILITIES = BackendCapabilities({
     BackendCapability.OLLAMA_SERVICE_REPAIR: CapabilityStatus.SUPPORTED,
     BackendCapability.OLLAMA_KV_REPAIR: CapabilityStatus.SUPPORTED,
     BackendCapability.HEALTH_CHECK: CapabilityStatus.SUPPORTED,
-    BackendCapability.START_MODEL: CapabilityStatus.UNSUPPORTED,
-    BackendCapability.STOP_MODEL: CapabilityStatus.UNSUPPORTED,
-    BackendCapability.LOAD_MODEL: CapabilityStatus.UNSUPPORTED,
-    BackendCapability.MANAGED_RUNTIME_LAUNCH: CapabilityStatus.UNSUPPORTED,
-    BackendCapability.MANAGED_RUNTIME_STOP: CapabilityStatus.UNSUPPORTED,
-    BackendCapability.MODEL_SWITCH: CapabilityStatus.UNSUPPORTED,
 })
 
 _MOCK_CAPABILITIES = BackendCapabilities({
@@ -265,24 +244,6 @@ class OllamaBackendAdapter:
         except Exception:
             backend_version = None
         return RuntimeProfileIdentity(backend=self.backend_identity().backend, backend_version=backend_version)
-
-    def start_model(self, model: str, **kwargs: Any) -> None:
-        require_capability(self, BackendCapability.START_MODEL)
-
-    def stop_model(self, model: str) -> None:
-        require_capability(self, BackendCapability.STOP_MODEL)
-
-    def load_model(self, model: str, **kwargs: Any) -> None:
-        require_capability(self, BackendCapability.LOAD_MODEL)
-
-    def launch_managed_runtime(self, **kwargs: Any) -> None:
-        require_capability(self, BackendCapability.MANAGED_RUNTIME_LAUNCH)
-
-    def stop_managed_runtime(self) -> None:
-        require_capability(self, BackendCapability.MANAGED_RUNTIME_STOP)
-
-    def switch_model(self, model: str, **kwargs: Any) -> None:
-        require_capability(self, BackendCapability.MODEL_SWITCH)
 
 
 class MockBackendAdapter(OllamaBackendAdapter):
