@@ -1,12 +1,12 @@
 """Generate durable per-model operating cards from master rankings evidence.
 
-Card assembly itself (identity/evidence-trust/human-validation fields) lives
-in ``model_card.py`` (Anvil Stage 3.1's ``ModelCard``) -- this module derives
+Card assembly itself (identity / evidence-trust fields) lives in
+``model_card.py`` (Anvil Stage 3.1's ``ModelCard``) -- this module derives
 the quality/limits/long_context sections from a master-summary row (logic
 unchanged from before Stage 3.1), then builds and renders a ``ModelCard``
 from them. ``build_card()``'s return shape is a deliberate golden-file
-contract: unchanged pre-existing keys plus the two new Stage 3.1 fields --
-see ``tests/test_model_card.py``.
+contract: unchanged pre-existing keys plus the new Stage 3.1
+``evidence_trust_class`` field -- see ``tests/test_model_card.py``.
 """
 from __future__ import annotations
 

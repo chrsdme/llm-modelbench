@@ -16,13 +16,18 @@ agree by construction (Stage 3.0A already made that row-bound field the
 measured-only authority; a second, independent derivation here would just
 be a new bypass path of exactly the kind 3.0A closed).
 
-``evidence_trust_class`` and ``human_validation_status`` are new fields
-required by the master plan (line 137-145, 73-76/486-490) and are not
-optional/legacy-compatibility additions -- see ``HumanValidationStatus``'s
-own docstring: nothing generated from a ``ModelCard`` may imply human
-validation of a ranking/quality claim unless the field is actually
-``validated`` (never true today -- no human-validation pipeline exists yet,
-so it is always ``not_evaluated``).
+``evidence_trust_class`` is a new field required by the master plan
+(line 137-145). It is *projected* from an explicit upstream
+``EvidenceTrustClass`` when one exists and otherwise fails closed to
+``UNKNOWN_LEGACY`` -- ``ModelCard`` never computes the classification
+itself (Stage 3.1 reconciliation ``d5d91af``).
+
+Human validation was removed from Anvil entirely by the 2026-09-01
+Architecture Simplification Amendment (§17): ModelBench already has
+deterministic scorers, bounded recovery, automated judges, and raw
+operator-inspectable evidence, and does not need a formal human-validation
+workflow or a permanent ``human_validation_status = not_evaluated`` field
+for a workflow that was removed from the product.
 """
 from __future__ import annotations
 
@@ -31,7 +36,6 @@ from typing import Any, Dict, List, Mapping, Optional
 
 from .capabilities import CAPABILITY_SCHEMA_VERSION
 from .evidence import EvidenceTrustClass
-from .human_validation import HumanCorrelation, HumanValidationStatus
 from .identity import ModelArtifactIdentity
 from .model_artifact import ModelArtifact
 
@@ -58,17 +62,11 @@ class ModelCard:
     kv_compatibility: Dict[str, Any]
     evidence_warnings: List[str]
     evidence_trust_class: EvidenceTrustClass
-    human_validation_status: HumanValidationStatus = HumanValidationStatus.NOT_EVALUATED
-    human_correlation: Optional[HumanCorrelation] = None
     schema_version: int = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         if not isinstance(self.evidence_trust_class, EvidenceTrustClass):
             raise ModelCardError("evidence_trust_class must be an EvidenceTrustClass")
-        if not isinstance(self.human_validation_status, HumanValidationStatus):
-            raise ModelCardError("human_validation_status must be a HumanValidationStatus")
-        if self.human_correlation is not None and self.human_validation_status == HumanValidationStatus.NOT_EVALUATED:
-            raise ModelCardError("human_correlation requires a status beyond not_evaluated")
 
 
 def _artifact_from_model_row(model: Mapping[str, Any]) -> Optional[ModelArtifact]:
@@ -186,9 +184,8 @@ def build_model_card(
     (``quality``/``limits``/``long_context`` keep their existing shapes and
     derivation logic -- see ``model_cards.py``'s ``build_card()``, which is
     now a thin wrapper over this function) plus the two fields Stage 3.1
-    adds: ``evidence_trust_class`` (derived, see :func:`_evidence_trust_class`)
-    and ``human_validation_status`` (always ``not_evaluated`` -- no
-    human-validation pipeline exists yet)."""
+    adds: ``evidence_trust_class`` (projected, see
+    :func:`_evidence_trust_class`)."""
     trust_class = _evidence_trust_class(model)
     warnings = list(evidence_warnings or [])
     schema_warning = _capability_schema_warning(model)
@@ -211,15 +208,15 @@ def build_model_card(
         kv_compatibility=kv_compatibility or {},
         evidence_warnings=warnings,
         evidence_trust_class=trust_class,
-        human_validation_status=HumanValidationStatus.NOT_EVALUATED,
     )
 
 
 def model_card_to_dict(card: ModelCard) -> Dict[str, Any]:
-    """The existing Card A JSON/Markdown shape, unchanged, plus the two new
-    Stage 3.1 fields. Golden-file compatibility for every pre-existing key
-    is a deliberate contract -- see ``tests/test_model_card.py``."""
-    payload = {
+    """The existing Card A JSON/Markdown shape, unchanged, plus the new
+    Stage 3.1 ``evidence_trust_class`` field. Golden-file compatibility for
+    every pre-existing key is a deliberate contract -- see
+    ``tests/test_model_card.py``."""
+    return {
         "schema_version": card.schema_version,
         "model": card.model,
         "digest": card.digest,
@@ -230,17 +227,7 @@ def model_card_to_dict(card: ModelCard) -> Dict[str, Any]:
         "kv_compatibility": dict(card.kv_compatibility),
         "evidence_warnings": list(card.evidence_warnings),
         "evidence_trust_class": card.evidence_trust_class.value,
-        "human_validation_status": card.human_validation_status.value,
     }
-    if card.human_correlation is not None:
-        payload["human_correlation"] = {
-            "metric": card.human_correlation.metric,
-            "value": card.human_correlation.value,
-            "n": card.human_correlation.n,
-            "rubric_version": card.human_correlation.rubric_version,
-            "evidence_ref": card.human_correlation.evidence_ref,
-        }
-    return payload
 
 
 def _fmt(value: Any, digits: int = 2) -> str:
@@ -266,7 +253,7 @@ def _gb_from_mb(value: Any) -> str:
 def render_model_card_markdown(card: Dict[str, Any]) -> str:
     """Renders the JSON-shaped dict produced by :func:`model_card_to_dict`
     (Card A's existing Markdown format, extended with a Stage 3.1 evidence
-    trust / human validation section)."""
+    trust section)."""
     identity = card["identity"]
     quality = card["quality"]
     limits = card["limits"]
@@ -371,15 +358,10 @@ def render_model_card_markdown(card: Dict[str, Any]) -> str:
 
     lines += [
         "",
-        "## Evidence trust and human validation",
+        "## Evidence trust",
         "",
         f"- Evidence trust class: `{card.get('evidence_trust_class') or 'unknown_legacy'}`",
-        f"- Human validation status: `{card.get('human_validation_status') or 'not_evaluated'}`",
     ]
-    if card.get("human_validation_status") != HumanValidationStatus.VALIDATED.value:
-        lines.append(
-            "- This card does not imply human validation of any ranking or quality claim above."
-        )
 
     lines += ["", "## Status reasons", ""]
     lines.extend(f"- {reason}" for reason in quality.get("reasons") or ["No reasons recorded."])

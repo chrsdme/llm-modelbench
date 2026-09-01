@@ -16,7 +16,6 @@ import pytest
 from llm_modelbench import rankings
 from llm_modelbench.capabilities import CAPABILITY_SCHEMA_VERSION
 from llm_modelbench.evidence import EvidenceTrustClass
-from llm_modelbench.human_validation import HumanCorrelation, HumanValidationStatus
 from llm_modelbench.model_card import ModelCard, ModelCardError
 from llm_modelbench.model_cards import build_card, generate_model_cards
 
@@ -36,28 +35,16 @@ def test_model_card_rejects_non_enum_trust_class():
         _minimal_card(evidence_trust_class="canonical_compatible")  # type: ignore[arg-type]
 
 
-def test_model_card_rejects_non_enum_human_validation_status():
-    with pytest.raises(ModelCardError):
+def test_model_card_has_no_human_validation_fields():
+    """Human validation was removed from Anvil entirely by the 2026-09-01
+    Architecture Simplification Amendment (§17). ``ModelCard`` must carry no
+    ``human_validation_status`` / ``human_correlation`` attribute and must
+    not accept one."""
+    card = _minimal_card()
+    assert not hasattr(card, "human_validation_status")
+    assert not hasattr(card, "human_correlation")
+    with pytest.raises(TypeError):
         _minimal_card(human_validation_status="validated")  # type: ignore[arg-type]
-
-
-def test_model_card_rejects_correlation_without_a_validation_status():
-    correlation = HumanCorrelation(
-        metric="pearson_r", value=0.8, n=20, rubric_version="v1", evidence_ref="ref-1",
-    )
-    with pytest.raises(ModelCardError):
-        _minimal_card(human_correlation=correlation)
-
-
-def test_model_card_accepts_correlation_alongside_provisional_status():
-    correlation = HumanCorrelation(
-        metric="pearson_r", value=0.8, n=20, rubric_version="v1", evidence_ref="ref-1",
-    )
-    card = _minimal_card(
-        human_validation_status=HumanValidationStatus.PROVISIONAL,
-        human_correlation=correlation,
-    )
-    assert card.human_correlation is correlation
 
 
 def _write_run(runs_dir, run_id, level, rows, identities=None):
@@ -150,7 +137,9 @@ def test_golden_card_adds_stage_3_1_fields_without_disturbing_the_rest():
     )
     card = build_card(row)
     assert card["schema_version"] == 2
-    assert card["human_validation_status"] == HumanValidationStatus.NOT_EVALUATED.value
+    assert "evidence_trust_class" in card
+    # Human validation was removed from Anvil (amendment 2026-09-01 §17).
+    assert "human_validation_status" not in card
     assert "human_correlation" not in card
 
 
@@ -286,14 +275,17 @@ def test_model_card_is_zero_authority_no_consumer_reads_it_for_decisions():
     assert offenders == []
 
 
-def test_no_rendered_output_implies_human_validation_by_default():
+def test_no_human_validation_anywhere_in_rendered_output():
+    """Human validation was removed from Anvil entirely (amendment
+    2026-09-01 §17). No ``ModelCard`` JSON key or Markdown text may mention
+    it -- not even a disclaimer about a removed workflow."""
     row = _fixed_model_row()
     card = build_card(row)
-    assert card["human_validation_status"] == HumanValidationStatus.NOT_EVALUATED.value
+    assert not any("human" in key.lower() for key in card)
     from llm_modelbench.model_card import render_model_card_markdown
     markdown = render_model_card_markdown(card)
-    assert "does not imply human validation" in markdown
-    assert "**validated**" not in markdown.lower()
+    assert "human validation" not in markdown.lower()
+    assert "human_validation" not in markdown.lower()
 
 
 def test_measured_family_evidence_agrees_between_model_card_and_master_summary(tmp_path):
@@ -338,9 +330,10 @@ def test_generate_model_cards_end_to_end_still_writes_json_and_markdown(tmp_path
     assert result["models"] == 1
     written = json.loads((out / "model_latest.json").read_text())
     assert written["evidence_trust_class"] == EvidenceTrustClass.UNKNOWN_LEGACY.value
-    assert written["human_validation_status"] == HumanValidationStatus.NOT_EVALUATED.value
+    assert "human_validation_status" not in written
     markdown = (out / "model_latest.md").read_text()
-    assert "Evidence trust and human validation" in markdown
+    assert "## Evidence trust" in markdown
+    assert "human validation" not in markdown.lower()
 
 
 def test_help_page_no_longer_falsely_claims_model_cards_drive_routing():
