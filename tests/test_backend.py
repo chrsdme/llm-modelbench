@@ -174,6 +174,17 @@ def test_no_generic_managed_lifecycle_api_remains_on_the_backend_surface():
         "MANAGED_RUNTIME_LAUNCH", "MANAGED_RUNTIME_STOP", "MODEL_SWITCH",
     ):
         assert not hasattr(BackendCapability, member), f"BackendCapability.{member} should have been removed"
+    # ...and the runtime_checkable InferenceClient Protocol still discriminates
+    # (removing methods widens what satisfies isinstance -- current adapters
+    # still conform, an incomplete client still does not).
+    assert isinstance(OllamaBackendAdapter(OllamaClient("http://127.0.0.1:11434")), InferenceClient)
+    assert isinstance(MockBackendAdapter(MockClient()), InferenceClient)
+
+    class _OnlyChat:
+        def chat(self, *a, **k): ...
+
+    assert not isinstance(_OnlyChat(), InferenceClient)
+    assert not isinstance(object(), InferenceClient)
 
 
 def test_health_check_capability_is_supported_on_both_current_adapters():
