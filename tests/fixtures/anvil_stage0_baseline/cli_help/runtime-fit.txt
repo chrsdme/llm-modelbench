@@ -21,7 +21,10 @@ options:
   --allocation-weights ALLOCATION_WEIGHTS
                         comma-separated GPU-UUID=weight layer allocations;
                         never positional
-  --allow-cpu-spill     record CPU/RAM spill as an explicit conditional policy
+  --allow-cpu-spill     advisory only: mark spill operator-permitted for this
+                        estimate. Host RAM capacity is not checked here;
+                        actual RAM-spill feasibility is decided by the
+                        benchmark execution preflight
   --json                write deterministic JSON to stdout
   --out OUT             optional JSON output path
   --mock                use the offline deterministic model client

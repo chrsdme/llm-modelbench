@@ -1886,7 +1886,9 @@ def build_parser():
     fit.add_argument("--reserve-mib", type=float, default=512.0, help="per-device safety reserve in MiB")
     fit.add_argument("--strategy", choices=["layer_split", "tensor_split"], help="explicit multi-GPU strategy declaration")
     fit.add_argument("--allocation-weights", help="comma-separated GPU-UUID=weight layer allocations; never positional")
-    fit.add_argument("--allow-cpu-spill", action="store_true", help="record CPU/RAM spill as an explicit conditional policy")
+    fit.add_argument("--allow-cpu-spill", action="store_true",
+                     help="advisory only: mark spill operator-permitted for this estimate. Host RAM capacity is "
+                          "not checked here; actual RAM-spill feasibility is decided by the benchmark execution preflight")
     fit.add_argument("--json", action="store_true", help="write deterministic JSON to stdout")
     fit.add_argument("--out", help="optional JSON output path")
     fit.add_argument("--mock", action="store_true", help="use the offline deterministic model client")

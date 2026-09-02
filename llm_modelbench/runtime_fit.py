@@ -3,6 +3,19 @@
 The pure evaluator intentionally does not know how to start a runtime, load a
 model, or translate CUDA ordinals.  Collection is opt-in and uses only the
 existing bounded inventory/live-telemetry and backend metadata interfaces.
+
+**Advisory boundary (Anvil Stage 3.2C-3).**  ``runtime-fit`` is an *advisory
+diagnostic lens*.  It is **not** the authoritative execution placement or
+environment-feasibility path for scored benchmarks.  That authority is the
+Stage 3.2 topology/preflight path
+(:mod:`~llm_modelbench.topology_budget` /
+:mod:`~llm_modelbench.placement` / :mod:`~llm_modelbench.ram_spill_preflight`),
+consumed by :mod:`~llm_modelbench.runner`.  Nothing here feeds ``runner.py``,
+``campaign.py``, the planner, or scoring: ``runtime_fit.json`` is written only
+by the operator-invoked ``runtime-fit`` subcommand and reporting treats it as
+advisory metadata, never as a score input.  In particular this module does
+**not** evaluate host physical-RAM capacity, so it cannot and does not decide
+RAM-spill feasibility -- see ``evaluate_runtime_fit``'s spill branch.
 """
 from __future__ import annotations
 
@@ -162,6 +175,14 @@ class DeviceFitAssessment:
 
 @dataclass(frozen=True)
 class RuntimeFitResult:
+    """Advisory diagnostic estimate (Anvil Stage 3.2C-3).
+
+    A ``conditional_fit`` with reason ``cpu_spill_permitted_host_capacity_unchecked``
+    means spill is operator-permitted for this *estimate*, but host physical-RAM
+    capacity is not evaluated here -- actual RAM-spill feasibility is determined
+    by the benchmark execution preflight, not by this result.
+    """
+
     schema_version: int
     timestamp_utc: str
     model: RuntimeFitModel
@@ -289,7 +310,12 @@ def evaluate_runtime_fit(*, inventory: Iterable[GPUDevice], live_telemetry: Opti
     elif "confirmed_no_fit" in decisions:
         overall, reasons = "confirmed_no_fit", ("lower_bound_exceeds_capacity",)
     elif profile.allow_cpu_spill:
-        overall, reasons = "conditional_fit", ("cpu_spill_required_or_permitted",)
+        # Diagnostic only: spill is operator-permitted for this estimate, but
+        # this advisory path does not sample host physical RAM, so it cannot
+        # judge whether the overflow actually fits.  Actual RAM-spill
+        # feasibility is decided by the benchmark execution preflight
+        # (``ram_spill_preflight``), never here (Anvil Stage 3.2C-3).
+        overall, reasons = "conditional_fit", ("cpu_spill_permitted_host_capacity_unchecked",)
     elif len(targets) > 1:
         overall, reasons = ("conditional_fit", ("explicit_layer_split", "per_device_overhead_unknown")) if profile.strategy == "layer_split" else ("unknown", ("unsupported_tensor_split_memory_model",))
     elif "unknown" in decisions:

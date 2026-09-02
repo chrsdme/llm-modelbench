@@ -81,6 +81,36 @@ def test_spill_is_conditional_and_result_invariants_reject_invalid_confirmation(
         RuntimeFitResult(1, TS, _model(), _profile(U1), 1, None, "unknown", (), "confirmed_fit", ())
 
 
+def test_diagnostic_spill_reason_is_honest_about_not_checking_host_ram():
+    """Anvil Stage 3.2C-3: runtime-fit does not sample host RAM, so its
+    operator-permitted spill branch must not claim spill feasibility."""
+    inventory = _devices((0, U1, 8192))
+    spill = evaluate_runtime_fit(inventory=inventory, live_telemetry=None, model=_model(),
+                                 profile=_profile(U1, spill=True), timestamp_utc=TS)
+    assert spill.reasons == ("cpu_spill_permitted_host_capacity_unchecked",)
+    # the previous, misleadingly-optimistic reason is gone
+    assert "cpu_spill_required_or_permitted" not in spill.reasons
+
+
+def test_runtime_fit_is_advisory_and_not_consumed_by_execution_or_scoring():
+    """The advisory boundary is a real contract: no execution/scoring module
+    imports the runtime_fit evaluator, and reporting treats its artifact as
+    advisory-only (asserted in test_report_offline)."""
+    import ast
+    import pathlib
+
+    pkg = pathlib.Path(__file__).resolve().parent.parent / "llm_modelbench"
+    consumers = []
+    for name in ("runner.py", "campaign.py", "planner.py", "scoring.py", "aggregate.py"):
+        tree = ast.parse((pkg / name).read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module and "runtime_fit" in node.module:
+                consumers.append(name)
+            if isinstance(node, ast.Import) and any("runtime_fit" in a.name for a in node.names):
+                consumers.append(name)
+    assert consumers == [], f"runtime_fit must stay advisory; imported by {consumers}"
+
+
 def test_invalid_reserve_and_profile_inventory_mismatch_rejected():
     with pytest.raises(ValueError, match="reserve_mib"):
         evaluate_runtime_fit(inventory=(), live_telemetry=None, model=_model(), profile=_profile(), reserve_mib=float("nan"), timestamp_utc=TS)
