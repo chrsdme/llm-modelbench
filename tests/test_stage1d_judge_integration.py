@@ -190,7 +190,7 @@ def test_stage1d_selection_qualification_pool_and_judged_sidecar_provenance(monk
     assert any(item["model"] == "embedder" and item["reason"] == "non_generative_embedding_only" for item in selection.rejection_reasons)
     assert any(item["model"] == "qwen2.5:7b" and item["reason"] == "excluded_family" for item in selection.rejection_reasons)
 
-    def fake_qualify(client, candidate):
+    def fake_qualify(client, candidate, **_kw):
         return {
             "model": candidate["name"],
             "digest": candidate["digest"],
@@ -244,7 +244,7 @@ def test_stage1d_structural_qualification_failure_is_bounded_and_fallback_qualif
     ], [], _policy(requested_primary="preferred", configured_fallbacks=("fallback",)))
     calls = []
 
-    def fake_qualify(client, candidate):
+    def fake_qualify(client, candidate, **_kw):
         calls.append(candidate["name"])
         if candidate["name"] == "preferred":
             return {
@@ -456,7 +456,7 @@ def test_stage1d_mocked_campaign_artifacts_link_selection_fallback_judge_and_rea
         _policy(requested_primary="j1", configured_fallbacks=("j2", "embedder"), excluded_families=()),
     )
 
-    def fake_qualify(client, candidate):
+    def fake_qualify(client, candidate, **_kw):
         return {
             "model": candidate["name"],
             "digest": candidate["digest"],
@@ -534,7 +534,7 @@ def test_stage1d_continuation_skips_failed_tail_qualification_and_uses_j3(monkey
     selection_result = _selection(["j1", "j2", "j3"])
     calls = []
 
-    def fake_qualify(client, candidate):
+    def fake_qualify(client, candidate, **_kw):
         calls.append(candidate["name"])
         if candidate["name"] == "j2":
             return {"model": "j2", "digest": "digest-j2", "qualified": False, "aggregate_disposition": "rejected_quality_controls", "protocol_version": "judge-qualification-v1"}
@@ -564,7 +564,7 @@ def test_stage1d_continuation_exhausts_when_tail_fails_qualification(monkeypatch
     paths, raw_row = _campaign_with_subjective_primary(tmp_path, "fallback_exhausted")
     selection_result = _selection(["j1", "j2", "j3"])
 
-    def fake_qualify(client, candidate):
+    def fake_qualify(client, candidate, **_kw):
         return {
             "model": candidate["name"],
             "digest": candidate["digest"],
@@ -596,7 +596,7 @@ def test_stage1d_continuation_reuses_known_bad_j1_after_pool_extension(monkeypat
     paths, raw_row = _campaign_with_subjective_primary(tmp_path, "fallback_reuse")
     selection_result = _selection(["j1", "j2"])
 
-    def fake_qualify(client, candidate):
+    def fake_qualify(client, candidate, **_kw):
         return {"model": candidate["name"], "digest": candidate["digest"], "qualified": True, "aggregate_disposition": "qualified", "protocol_version": "judge-qualification-v1"}
 
     monkeypatch.setattr(campaign, "qualify_judge", fake_qualify)
@@ -623,7 +623,7 @@ def test_stage1d_continuation_changed_fingerprint_reconsiders_j1(monkeypatch, tm
     paths, raw_row = _campaign_with_subjective_primary(tmp_path, "fallback_changed_fingerprint")
     selection_result = _selection(["j1", "j2"])
 
-    def fake_qualify(client, candidate):
+    def fake_qualify(client, candidate, **_kw):
         return {"model": candidate["name"], "digest": candidate["digest"], "qualified": True, "aggregate_disposition": "qualified", "protocol_version": "judge-qualification-v1"}
 
     monkeypatch.setattr(campaign, "qualify_judge", fake_qualify)
@@ -660,7 +660,7 @@ def test_stage1d_non_structural_runtime_failure_does_not_continue_qualification(
     selection_result = _selection(["j1", "j2"])
     calls = []
 
-    def fake_qualify(client, candidate):
+    def fake_qualify(client, candidate, **_kw):
         calls.append(candidate["name"])
         return {"model": candidate["name"], "digest": candidate["digest"], "qualified": True, "aggregate_disposition": "qualified", "protocol_version": "judge-qualification-v1"}
 

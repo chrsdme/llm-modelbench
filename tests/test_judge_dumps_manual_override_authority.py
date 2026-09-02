@@ -98,7 +98,7 @@ def test_genuinely_eligible_manual_judge_still_works(monkeypatch, tmp_path):
     run = _write_subjective_run(tmp_path, [{"model": "source-model", "digest": "digest-source"}])
     client = _InterrogatableClient()
 
-    monkeypatch.setattr(campaign, "qualify_judge", lambda client, candidate: {
+    monkeypatch.setattr(campaign, "qualify_judge", lambda client, candidate, **_kw: {
         "model": candidate["name"], "digest": candidate["digest"], "qualified": True,
         "aggregate_disposition": "qualified", "protocol_version": "judge-qualification-v1",
     })
@@ -128,7 +128,7 @@ def test_qualification_failure_raises_distinctly_from_capability_failure(monkeyp
     run = _write_subjective_run(tmp_path, [{"model": "source-model", "digest": "digest-source"}])
     client = _InterrogatableClient()
 
-    monkeypatch.setattr(campaign, "qualify_judge", lambda client, candidate: {
+    monkeypatch.setattr(campaign, "qualify_judge", lambda client, candidate, **_kw: {
         "model": candidate["name"], "digest": candidate["digest"], "qualified": False,
         "aggregate_disposition": "rejected_unstable", "protocol_version": "judge-qualification-v1",
     })
@@ -164,7 +164,7 @@ def test_judge_everything_resolves_manual_pool_once_not_per_run(monkeypatch, tmp
         return real_resolve(client, judge_model)
 
     monkeypatch.setattr(campaign, "build_manual_judge_candidate", counting_resolve)
-    monkeypatch.setattr(campaign, "qualify_judge", lambda client, candidate: {
+    monkeypatch.setattr(campaign, "qualify_judge", lambda client, candidate, **_kw: {
         "model": candidate["name"], "digest": candidate["digest"], "qualified": True,
         "aggregate_disposition": "qualified", "protocol_version": "judge-qualification-v1",
     })

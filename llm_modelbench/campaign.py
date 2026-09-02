@@ -36,7 +36,13 @@ from .capabilities import (
     interrogate_model,
     measured_supported_families,
 )
-from .capability_evidence_adapter import new_measured_supported_families
+from .capability_evidence_adapter import (
+    EffectiveCapabilityDisagreement,
+    effective_measured_supported_families,
+    new_measured_supported_families,
+)
+from .capability_reprobe_execute import default_ledger_path
+from .evidence import EvidenceLedger
 
 CAMPAIGNS_ROOT = Path("campaigns")
 MANIFEST_SCHEMA_VERSION = 1
@@ -3226,30 +3232,100 @@ def _candidate_current_capability_identity(item: Dict[str, Any]) -> Optional[Dic
     return identity
 
 
-def _judge_capability_authorized_families(item: Dict[str, Any]) -> List[str]:
-    """Typed Stage 2 measured-capability authority for one judge candidate
-    (Anvil Stage 2.6D). The sole source of positive judge capability
-    eligibility -- declared/hint/legacy fields never authorize on their
-    own; see ``_judge_capability_rejection``."""
+def _run_capability_ledger(run_dir: Path) -> EvidenceLedger:
+    """The native capability ``EvidenceLedger`` for a concrete run directory
+    (Anvil Stage 3.5). ``run_dir`` is ``<runs_dir>/<run_id>`` by the
+    ``runner.py`` invariant, so the ledger is
+    ``default_ledger_path(run_dir.parent)`` -- the identical derivation
+    ``runner.py:1596`` uses. A missing ledger file reads as empty, which
+    makes the judge capability gate fall through to the unchanged
+    legacy-adapter path."""
+    return EvidenceLedger(default_ledger_path(Path(run_dir).parent))
+
+
+def _campaign_capability_ledger(evidence_dir: Path) -> EvidenceLedger:
+    """The native capability ``EvidenceLedger`` for a campaign (Anvil Stage
+    3.5). The campaign primary run writes evidence under
+    ``paths.evidence_dir`` with ``run_id="primary"`` and
+    ``execute_recovery_phase`` re-derives ``default_ledger_path(evidence_dir)``
+    -- so this one path is the campaign's canonical capability ledger."""
+    return EvidenceLedger(default_ledger_path(Path(evidence_dir)))
+
+
+def _format_judge_capability_projection_drift(
+    disagreements: Iterable[EffectiveCapabilityDisagreement],
+) -> List[Dict[str, Any]]:
+    """Render native-vs-legacy capability-evidence disagreements for one
+    judge candidate as an additive diagnostic (Anvil Stage 3.5). Native
+    evidence is authoritative -- this is a *record* of the drift, never a
+    silent resolution -- mirroring ``repair.py``'s
+    ``native_legacy_capability_evidence_disagreement`` observation. Pure;
+    never mutates the candidate dict."""
+    return [
+        {
+            "family": d.family,
+            "native_applicable": d.native_applicable,
+            "native_reason": d.native_reason,
+            "legacy_applicable": d.legacy_applicable,
+            "legacy_reason": d.legacy_reason,
+        }
+        for d in disagreements
+    ]
+
+
+def _judge_capability_families_and_drift(
+    item: Dict[str, Any], *, ledger: Optional[EvidenceLedger] = None
+) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """Typed Stage 2 measured-capability authority for one judge candidate,
+    with the native-vs-legacy projection drift alongside (Anvil Stage 2.6D
+    authority; Stage 3.5 native ``EvidenceLedger`` convergence).
+
+    When ``ledger`` is supplied, native identity-compatible
+    ``CapabilityObservation`` evidence wins over the legacy adapter
+    (SELECTED -> authoritative; ambiguous/conflicted native -> fail
+    closed), exactly as ``planner``/``runner``/``repair`` have done since
+    Stage 2.9. When ``ledger`` is ``None`` the families are byte-identical
+    to the pre-3.5 legacy-adapter path and the drift list is empty --
+    callers with no run context (unit tests, the regression-comparison
+    oracle) pass nothing rather than guessing a ledger location."""
     if item.get("capability_schema_version") != CAPABILITY_SCHEMA_VERSION:
-        return []
+        return [], []
     current_identity = _candidate_current_capability_identity(item)
-    return new_measured_supported_families(item, current_identity)
+    if ledger is None:
+        return list(new_measured_supported_families(item, current_identity)), []
+    effective = effective_measured_supported_families(item, current_identity, ledger=ledger)
+    return (
+        list(effective.families),
+        _format_judge_capability_projection_drift(effective.disagreements),
+    )
 
 
-def _judge_capability_rejection(item: Dict[str, Any]) -> Optional[str]:
-    """Fail closed unless the typed Stage 2 capability authority confirms
-    measured, identity-compatible text generation (Anvil Stage 2.6D).
+def _judge_capability_authorized_families(
+    item: Dict[str, Any], *, ledger: Optional[EvidenceLedger] = None
+) -> List[str]:
+    """Typed Stage 2 measured-capability authority for one judge candidate
+    (Anvil Stage 2.6D; native ``EvidenceLedger`` convergence Anvil Stage
+    3.5). The sole source of positive judge capability eligibility --
+    declared/hint/legacy fields never authorize on their own; see
+    ``_judge_capability_rejection``. See
+    :func:`_judge_capability_families_and_drift` for the ``ledger``
+    semantics; this thin wrapper drops the drift diagnostic for the many
+    call sites that only need the family list."""
+    families, _drift = _judge_capability_families_and_drift(item, ledger=ledger)
+    return families
 
-    Positive eligibility comes only from
-    ``_judge_capability_authorized_families()``. ``_judge_measured_text_state()``
-    and ``_candidate_capability_identity_compatibility()`` (both legacy) are
-    consulted only to select the right rejection message when the typed
-    authority does not admit the candidate -- never to admit one themselves.
-    """
+
+def _judge_capability_rejection_for(
+    item: Dict[str, Any], authorized_families: List[str]
+) -> Optional[str]:
+    """Message-selection half of :func:`_judge_capability_rejection`, split
+    out so a caller that already computed the authorized families (with a
+    ledger) does not recompute them (Anvil Stage 3.5). ``authorized_families``
+    is the *only* positive-eligibility input; the legacy helpers below only
+    pick the rejection message when it does not contain ``text``."""
     if item.get("capability_schema_version") != CAPABILITY_SCHEMA_VERSION:
         return "capability_reprobe_required"
-    if "text" in _judge_capability_authorized_families(item):
+    if "text" in authorized_families:
         return None
     state = _judge_measured_text_state(item)
     families = _canonical_candidate_families(item)
@@ -3266,8 +3342,28 @@ def _judge_capability_rejection(item: Dict[str, Any]) -> Optional[str]:
     return "unknown_or_non_generative_capability"
 
 
-def _judge_candidate_is_generative(item: Dict[str, Any]) -> bool:
-    return _judge_capability_rejection(item) is None
+def _judge_capability_rejection(
+    item: Dict[str, Any], *, ledger: Optional[EvidenceLedger] = None
+) -> Optional[str]:
+    """Fail closed unless the typed Stage 2 capability authority confirms
+    measured, identity-compatible text generation (Anvil Stage 2.6D; native
+    ``EvidenceLedger`` convergence Anvil Stage 3.5).
+
+    Positive eligibility comes only from
+    :func:`_judge_capability_families_and_drift`. ``_judge_measured_text_state()``
+    and ``_candidate_capability_identity_compatibility()`` (both legacy) are
+    consulted only to select the right rejection message when the typed
+    authority does not admit the candidate -- never to admit one themselves.
+    See :func:`_judge_capability_families_and_drift` for the ``ledger``
+    semantics (``None`` -> unchanged pre-3.5 legacy-adapter behaviour)."""
+    authorized_families, _drift = _judge_capability_families_and_drift(item, ledger=ledger)
+    return _judge_capability_rejection_for(item, authorized_families)
+
+
+def _judge_candidate_is_generative(
+    item: Dict[str, Any], *, ledger: Optional[EvidenceLedger] = None
+) -> bool:
+    return _judge_capability_rejection(item, ledger=ledger) is None
 
 
 def _normalise_family_identity(value: Any) -> str:
@@ -3363,8 +3459,18 @@ def build_judge_selection(
     inventory: List[Dict[str, Any]],
     cohort: List[Dict[str, Any]],
     policy: JudgePolicy,
+    *,
+    ledger: Optional[EvidenceLedger] = None,
 ) -> JudgeSelectionResult:
-    """Build deterministic judge order and complete rejection evidence."""
+    """Build deterministic judge order and complete rejection evidence.
+
+    ``ledger`` (Anvil Stage 3.5): when supplied, the per-candidate
+    capability-eligibility gate prefers native identity-compatible
+    ``EvidenceLedger`` evidence over the legacy adapter (Stage 2.9
+    semantics). ``None`` keeps the pre-3.5 legacy-adapter behaviour
+    unchanged. Any native-vs-legacy disagreement is surfaced additively as
+    ``capability_projection_drift`` in the corresponding rejection-reason
+    entry -- recorded, never silently resolved."""
     requested_primary = policy.requested_primary if policy.enabled else None
     configured_fallbacks = _dedupe_names(list(policy.configured_fallbacks))
     if requested_primary:
@@ -3431,22 +3537,26 @@ def build_judge_selection(
                 "exclusions": list(exclusions),
             })
             continue
-        capability_rejection = _judge_capability_rejection(item)
+        authorized_families, projection_drift = _judge_capability_families_and_drift(item, ledger=ledger)
+        capability_rejection = _judge_capability_rejection_for(item, authorized_families)
         if capability_rejection:
-            rejection_reasons.append({
+            rejection_entry = {
                 "model": name,
                 "digest": digest,
                 "source": source,
                 "reason": capability_rejection,
                 "capabilities": _candidate_capabilities(item),
                 "canonical_families": _canonical_candidate_families(item),
-            })
+            }
+            if projection_drift:
+                rejection_entry["capability_projection_drift"] = projection_drift
+            rejection_reasons.append(rejection_entry)
             continue
         context = int(item.get("context") or item.get("context_length") or 0)
         if context and context < 1024:
             rejection_reasons.append({"model": name, "digest": digest, "source": source, "reason": "context_too_small", "context": context})
             continue
-        final_eligible_order.append({
+        eligible_entry = {
             **item,
             "selection_source": source,
             "selection_index": index,
@@ -3454,7 +3564,12 @@ def build_judge_selection(
             "excluded_family_override": bool(excluded and source == "configured_primary" and policy.allow_excluded_primary),
             "roles": roles,
             "stable_identity": stable_model_identity(item),
-        })
+        }
+        if projection_drift:
+            # Native evidence admitted this candidate but disagreed with the
+            # legacy adapter on one or more families -- recorded, not hidden.
+            eligible_entry["capability_projection_drift"] = projection_drift
+        final_eligible_order.append(eligible_entry)
 
     return JudgeSelectionResult(
         requested_primary=requested_primary,
@@ -3473,8 +3588,20 @@ def build_judge_selection(
     )
 
 
-def qualify_judge(client: Any, candidate: Dict[str, Any], *, repeats: int = 2) -> Dict[str, Any]:
-    """Run the universal ModelBench judge qualification protocol."""
+def qualify_judge(
+    client: Any,
+    candidate: Dict[str, Any],
+    *,
+    repeats: int = 2,
+    ledger: Optional[EvidenceLedger] = None,
+) -> Dict[str, Any]:
+    """Run the universal ModelBench judge qualification protocol.
+
+    ``ledger`` (Anvil Stage 3.5) is threaded straight into the
+    capability-eligibility re-check so it uses the same native-preferred
+    authority as :func:`build_judge_selection`. ``None`` keeps the pre-3.5
+    legacy-adapter behaviour. The qualification protocol itself is
+    unchanged."""
     name = str(candidate.get("name") or "")
     result: Dict[str, Any] = {"model": name, "digest": candidate.get("digest"),
                               "capabilities": candidate.get("capabilities") or [],
@@ -3482,8 +3609,9 @@ def qualify_judge(client: Any, candidate: Dict[str, Any], *, repeats: int = 2) -
                               "stable_identity": stable_model_identity(candidate),
                               "policy_version": JUDGE_POLICY_VERSION, "qualified": False,
                               "checks": {}, "selection_rationale": ""}
-    if not _judge_candidate_is_generative(candidate):
-        result["selection_rationale"] = _judge_capability_rejection(candidate) or "rejected_non_generative_capability"
+    capability_rejection = _judge_capability_rejection(candidate, ledger=ledger)
+    if capability_rejection is not None:
+        result["selection_rationale"] = capability_rejection or "rejected_non_generative_capability"
         return result
     from .judge_qualification import qualify_candidate
 
@@ -3565,23 +3693,33 @@ def select_campaign_judge(inventory: List[Dict[str, Any]], cohort: List[Dict[str
     return selection.selected
 
 
-def select_qualified_campaign_judge(client: Any, selection: JudgeSelectionResult) -> tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+def select_qualified_campaign_judge(
+    client: Any,
+    selection: JudgeSelectionResult,
+    *,
+    ledger: Optional[EvidenceLedger] = None,
+) -> tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     """Walk the deterministic candidate order, stopping each bad judge once."""
     qualifications: List[Dict[str, Any]] = []
     for candidate in selection.final_eligible_order:
-        qualification = qualify_judge(client, candidate)
+        qualification = qualify_judge(client, candidate, ledger=ledger)
         qualifications.append(qualification)
         if qualification.get("qualified"):
             return candidate, qualifications
     return None, qualifications
 
 
-def select_qualified_campaign_judges(client: Any, selection: JudgeSelectionResult) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def select_qualified_campaign_judges(
+    client: Any,
+    selection: JudgeSelectionResult,
+    *,
+    ledger: Optional[EvidenceLedger] = None,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Return every qualified judge in Stage 1A order after Stage 1B checks."""
     qualified: List[Dict[str, Any]] = []
     qualifications: List[Dict[str, Any]] = []
     for candidate in selection.final_eligible_order:
-        qualification = qualify_judge(client, candidate)
+        qualification = qualify_judge(client, candidate, ledger=ledger)
         qualifications.append(qualification)
         if qualification.get("qualified"):
             qualified.append({
@@ -3598,6 +3736,8 @@ def select_qualified_campaign_judges_for_rows(
     client: Any,
     selection: JudgeSelectionResult,
     source_rows: List[Dict[str, Any]],
+    *,
+    ledger: Optional[EvidenceLedger] = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
     """Qualify only as far as needed for independent coverage of source rows."""
     qualified: List[Dict[str, Any]] = []
@@ -3610,7 +3750,7 @@ def select_qualified_campaign_judges_for_rows(
     remaining = unresolved_rows()
     stop_index: Optional[int] = None
     for index, candidate in enumerate(selection.final_eligible_order):
-        qualification = qualify_judge(client, candidate)
+        qualification = qualify_judge(client, candidate, ledger=ledger)
         qualifications.append(qualification)
         entry = {
             "selection_index": candidate.get("selection_index", index),
@@ -3704,6 +3844,8 @@ def continue_qualification_after_runtime_structural_failure(
     qualifications: List[Dict[str, Any]],
     source_rows: List[Dict[str, Any]],
     structural_entries: List[Dict[str, Any]],
+    *,
+    ledger: Optional[EvidenceLedger] = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
     """Continue Stage 1B qualification through the Stage 1A tail after runtime structural failure."""
     from . import judge_dumps
@@ -3740,7 +3882,7 @@ def continue_qualification_after_runtime_structural_failure(
         remaining_before = unresolved()
         if not remaining_before:
             break
-        qualification = dict(qualify_judge(client, candidate))
+        qualification = dict(qualify_judge(client, candidate, ledger=ledger))
         qualification["qualification_trigger"] = "runtime_structural_fallback"
         qualification["continuation_reason"] = "qualification_continuation_after_structural_incompatibility"
         qualification["selection_index"] = candidate.get("selection_index")
@@ -3795,9 +3937,18 @@ def judge_run_with_structural_continuation(
     num_ctx: Optional[int] = None,
     think: str = "auto",
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
-    """Run post-hoc judging and extend qualification only for structural runtime fallback."""
+    """Run post-hoc judging and extend qualification only for structural runtime fallback.
+
+    The capability-eligibility gate used by any continuation qualification
+    reads the native ``EvidenceLedger`` under the run being judged (Anvil
+    Stage 3.5) -- ``default_ledger_path(run_dir.parent)``, the same
+    derivation ``runner.py`` uses. For a post-hoc judging run against a
+    runs tree that has had ``reprobe-execute`` applied this ledger can be
+    non-empty; otherwise it is absent and the gate falls through to the
+    unchanged legacy-adapter path."""
     from . import judge_dumps
 
+    ledger = _run_capability_ledger(run_dir)
     initial_qualified = list(qualified_judges)
     current_qualified = list(qualified_judges)
     current_qualifications = list(qualifications)
@@ -3813,7 +3964,8 @@ def judge_run_with_structural_continuation(
         if not structural_entries:
             break
         next_qualified, next_qualifications, continuation = continue_qualification_after_runtime_structural_failure(
-            client, selection, current_qualified, current_qualifications, source_rows, structural_entries
+            client, selection, current_qualified, current_qualifications, source_rows, structural_entries,
+            ledger=ledger,
         )
         continuations.append(continuation)
         if len(next_qualified) == len(current_qualified):

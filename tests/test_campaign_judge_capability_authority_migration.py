@@ -130,7 +130,7 @@ def test_01_compatible_measured_qualified_independent_candidate_is_usable(monkey
     )
     assert [item["name"] for item in selection.final_eligible_order] == ["judge-a"]
 
-    monkeypatch.setattr(campaign, "qualify_judge", lambda client, candidate: {
+    monkeypatch.setattr(campaign, "qualify_judge", lambda client, candidate, **_kw: {
         "model": candidate["name"], "digest": candidate["digest"], "qualified": True,
         "aggregate_disposition": "qualified", "protocol_version": "judge-qualification-v1",
     })
@@ -261,7 +261,7 @@ def test_11_same_digest_relation_is_independence_rejection_not_capability(monkey
     candidate = _measured_text("same-as-source", "digest-shared")
     assert campaign._judge_capability_rejection(candidate) is None
 
-    monkeypatch.setattr(campaign, "qualify_judge", lambda client, cand: {
+    monkeypatch.setattr(campaign, "qualify_judge", lambda client, cand, **_kw: {
         "model": cand["name"], "digest": cand["digest"], "qualified": True,
         "aggregate_disposition": "qualified", "protocol_version": "judge-qualification-v1",
     })
@@ -285,7 +285,7 @@ def _fake_qualify_all(monkeypatch):
     # fallback/exhaustion pipeline, so qualification itself is stubbed
     # "always qualified", matching test_stage1d_judge_integration.py's own
     # established pattern for this exact kind of test.
-    monkeypatch.setattr(campaign, "qualify_judge", lambda client, cand: {
+    monkeypatch.setattr(campaign, "qualify_judge", lambda client, cand, **_kw: {
         "model": cand["name"], "digest": cand["digest"], "qualified": True,
         "aggregate_disposition": "qualified", "protocol_version": "judge-qualification-v1",
     })
@@ -402,7 +402,7 @@ def test_15_negative_lie_from_legacy_does_not_block_a_candidate_the_new_stack_ad
 
     # Qualification and independence still apply after the capability gate
     # admits the candidate -- the capability lie does not bypass them.
-    monkeypatch.setattr(campaign, "qualify_judge", lambda client, cand: {
+    monkeypatch.setattr(campaign, "qualify_judge", lambda client, cand, **_kw: {
         "model": cand["name"], "digest": cand["digest"], "qualified": False,
         "aggregate_disposition": "rejected_structural_incompatibility", "protocol_version": "judge-qualification-v1",
     })

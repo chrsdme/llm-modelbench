@@ -1154,8 +1154,13 @@ def cmd_campaign(args, cfg):
                     }
                     candidates.append(candidate)
                 candidates = campaign.apply_campaign_roles_to_judge_candidates(candidates, cohort, judge_policy)
-                judge_selection = campaign.build_judge_selection(candidates, cohort, judge_policy)
-                qualified_judges, qualifications, coverage = campaign.select_qualified_campaign_judges_for_rows(client, judge_selection, eligible)
+                # Anvil Stage 3.5: the judge capability-eligibility gate prefers
+                # native identity-compatible EvidenceLedger evidence over the
+                # legacy adapter. Campaign capability evidence lives at one
+                # canonical path under the campaign evidence dir.
+                capability_ledger = campaign._campaign_capability_ledger(paths.evidence_dir)
+                judge_selection = campaign.build_judge_selection(candidates, cohort, judge_policy, ledger=capability_ledger)
+                qualified_judges, qualifications, coverage = campaign.select_qualified_campaign_judges_for_rows(client, judge_selection, eligible, ledger=capability_ledger)
                 judge = qualified_judges[0] if qualified_judges else None
                 qualification = (judge or {}).get("qualification") if judge else (qualifications[-1] if qualifications else None)
                 selection = {"eligible": len(eligible), "cohort": cohort, "machine_judged_provisional": True, "judge": judge,

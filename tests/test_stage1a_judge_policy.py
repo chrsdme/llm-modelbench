@@ -207,7 +207,7 @@ def test_qualification_consumes_the_existing_selection_order(monkeypatch):
     ], _policy(configured_fallbacks=("second", "first")))
     consumed = []
 
-    def fake_qualify(client, candidate):
+    def fake_qualify(client, candidate, **_kw):
         consumed.append(candidate["name"])
         return {"model": candidate["name"], "qualified": candidate["name"] == "first"}
 

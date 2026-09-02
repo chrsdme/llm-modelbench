@@ -101,9 +101,32 @@ class ManualJudgeIneligibleError(Exception):
     """
 
 
-def _resolve_manual_judge_pool(client: Any, judge_model: str) -> List[Dict[str, Any]]:
+def _capability_ledger_for_runs_dir(runs_dir: Path) -> "campaign.EvidenceLedger":
+    """The native capability ``EvidenceLedger`` for a runs *root* directory
+    (Anvil Stage 3.5) -- ``default_ledger_path(runs_dir)`` directly, unlike
+    :func:`campaign._run_capability_ledger` which takes a single
+    ``<runs_dir>/<run_id>`` run directory."""
+    from .capability_reprobe_execute import default_ledger_path
+
+    return campaign.EvidenceLedger(default_ledger_path(Path(runs_dir)))
+
+
+def _resolve_manual_judge_pool(
+    client: Any,
+    judge_model: str,
+    *,
+    ledger: Optional["campaign.EvidenceLedger"] = None,
+) -> List[Dict[str, Any]]:
     """Resolve the operator-named ``--judge-model`` into a real qualified-
     judge pool of at most one entry.
+
+    ``ledger`` (Anvil Stage 3.5): when supplied, the capability-eligibility
+    and qualification gates below prefer native identity-compatible
+    ``EvidenceLedger`` evidence over the legacy adapter. This is the
+    operator-named judge path -- unlike the automatic campaign path it
+    never flows through ``build_judge_selection``, so this is its *only*
+    capability gate. When ``ledger`` is ``None`` (or absent/empty) the
+    behaviour is the unchanged pre-3.5 legacy-adapter path.
 
     Before Anvil Stage 2.6E this bypassed the capability-eligibility and
     qualification gates entirely (a bare dict tagged
@@ -127,12 +150,12 @@ def _resolve_manual_judge_pool(client: Any, judge_model: str) -> List[Dict[str, 
             f"cannot resolve manual judge {judge_model!r}: a live client is required to interrogate and qualify it"
         )
     candidate = campaign.build_manual_judge_candidate(client, judge_model)
-    capability_rejection = campaign._judge_capability_rejection(candidate)
+    capability_rejection = campaign._judge_capability_rejection(candidate, ledger=ledger)
     if capability_rejection:
         raise ManualJudgeIneligibleError(
             f"--judge-model {judge_model!r} is not capability-eligible to judge: {capability_rejection}"
         )
-    qualification = campaign.qualify_judge(client, candidate)
+    qualification = campaign.qualify_judge(client, candidate, ledger=ledger)
     if not qualification.get("qualified"):
         raise ManualJudgeIneligibleError(
             f"--judge-model {judge_model!r} failed judge qualification: {qualification.get('aggregate_disposition')}"
@@ -283,7 +306,13 @@ def scan_run(
 ) -> Dict[str, Any]:
     raw_rows = _jsonl(run_dir / "raw_results.jsonl")
     existing = _jsonl(run_dir / "judge_results.jsonl")
-    qualified_judges = qualified_judges if qualified_judges is not None else _resolve_manual_judge_pool(client, judge_model)
+    qualified_judges = (
+        qualified_judges
+        if qualified_judges is not None
+        else _resolve_manual_judge_pool(
+            client, judge_model, ledger=campaign._run_capability_ledger(run_dir)
+        )
+    )
     pool_signature = campaign.judge_pool_signature(qualified_judges)
     judge_mode_configuration = _judge_config(judge_mode, num_ctx, think)
     execution_fingerprint = _execution_fingerprint(qualified_judges, judge_mode_configuration)
@@ -351,7 +380,13 @@ def judge_run(
 ) -> Dict[str, Any]:
     if judge_mode not in {"single", "panel"}:
         raise ValueError("judge mode must be single or panel")
-    qualified_judges = qualified_judges if qualified_judges is not None else _resolve_manual_judge_pool(client, judge_model)
+    qualified_judges = (
+        qualified_judges
+        if qualified_judges is not None
+        else _resolve_manual_judge_pool(
+            client, judge_model, ledger=campaign._run_capability_ledger(run_dir)
+        )
+    )
     scan = scan_run(
         run_dir,
         judge_model=judge_model,
@@ -679,7 +714,9 @@ def judge_everything(
     # for the same judge_model (same discipline as Stage 1.3's GPU-inventory
     # reuse -- resolve once, thread the result through).
     if qualified_judges is None:
-        qualified_judges = _resolve_manual_judge_pool(client, judge_model)
+        qualified_judges = _resolve_manual_judge_pool(
+            client, judge_model, ledger=_capability_ledger_for_runs_dir(runs_dir)
+        )
     results = []
     for index, run_dir in enumerate(runs, start=1):
         result = judge_run(
