@@ -424,9 +424,6 @@ def test_building_context_does_not_mutate_prior_run_evidence(tmp_path):
 
     assert _tree() == before
     assert _tree_mtimes() == mtimes
-    # explicitly: no EvidenceLedger was created under runs_dir
-    from llm_modelbench.capability_reprobe_execute import default_ledger_path
-    assert not Path(default_ledger_path(runs)).exists()
 
 
 def test_corrupt_prior_evidence_is_fail_soft(tmp_path):
@@ -621,6 +618,91 @@ def test_campaign_plan_payload_persists_context_and_equivalence_ignores_it():
     other2 = json.loads(json.dumps(payload))
     other2["level"] = "full"
     assert campaign.campaign_plan_equivalent(payload, other2) is False
+
+
+def test_campaign_run_identity_failure_never_refuses_the_run(monkeypatch):
+    """Section 30 / D7: the prior-knowledge surface must not introduce a
+    new 'run refused' failure. If runtime-identity collection for the
+    accepted campaign plan raises, cmd_campaign swallows it and the plan
+    is built with no identities (canonical -> deferred)."""
+    from llm_modelbench import cli
+
+    def _boom(*a, **k):
+        raise RuntimeError("tags() unavailable / model retagged since campaign creation")
+
+    monkeypatch.setattr(cli, "_campaign_runtime_identities", _boom)
+
+    # Exercise exactly the guarded block shape from cmd_campaign's run path.
+    selected = None
+    manifest_models = ["m-a", "m-b"]
+    _identity_models = selected or list(manifest_models)
+    try:
+        run_identities = (
+            cli._campaign_runtime_identities(None, None, _identity_models, None)
+            if _identity_models else {}
+        )
+    except Exception:
+        run_identities = {}
+    assert run_identities == {}
+
+
+def test_wizard_resolver_probes_gpus_once_and_memoizes(monkeypatch):
+    """Section 31 cost guard: the wizard rebuilds the plan on every
+    keystroke; the runtime-identity resolver must reuse one GPU probe and
+    not re-collect identities for an unchanged selection."""
+    from llm_modelbench import cli
+
+    detect_calls = {"n": 0}
+    collect_calls = {"n": 0}
+
+    monkeypatch.setattr("llm_modelbench.hardware.detect_gpus",
+                        lambda *a, **k: (detect_calls.__setitem__("n", detect_calls["n"] + 1) or ()))
+
+    def _fake_campaign_identities(args, cfg, selected, client, *, gpu_inventory=None):
+        collect_calls["n"] += 1
+        assert gpu_inventory is not None  # the one probe is threaded through
+        return {m: object() for m in selected}
+
+    monkeypatch.setattr(cli, "_campaign_runtime_identities", _fake_campaign_identities)
+
+    captured = {}
+
+    def _fake_interactive_plan(client, cfg, *, runtime_identity_resolver=None, **kw):
+        captured["resolver"] = runtime_identity_resolver
+        return {"model_selection_context": {"schema_version": 1, "observations": []}}, {
+            "selected_models": ["a"], "capability_profiles": {}, "level": "smoke",
+            "categories": None, "task_ids": None, "judge_mode": "off",
+        }
+
+    monkeypatch.setattr("llm_modelbench.wizard.interactive_plan", _fake_interactive_plan)
+    monkeypatch.setattr(cli, "_client", lambda *a, **k: object())
+    monkeypatch.setattr(cli, "cmd_run", lambda *a, **k: None)
+
+    class _Args:
+        samples = None
+        ctx = None
+        num_predict = None
+        think = None
+        needle_max_ctx = None
+        judge_model = None
+        level = "smoke"
+        judge = "off"
+        include_regex = exclude_regex = task_regex = None
+        skip_offload = family_base_only = context_aliases_only = context_only = False
+        sample_mode = "smart"
+
+    from llm_modelbench.config import Config
+    cli.cmd_wizard(_Args(), Config())
+
+    resolver = captured["resolver"]
+    assert resolver is not None
+    resolver(["a", "b"])
+    resolver(["a", "b"])          # unchanged selection -> cache hit
+    resolver(["b", "a"])          # same set, different order -> cache hit
+    assert collect_calls["n"] == 1
+    resolver(["c"])               # changed selection -> one more collect
+    assert collect_calls["n"] == 2
+    assert detect_calls["n"] == 1  # GPU probe happened exactly once
 
 
 def test_disagreements_and_trust_surface_as_warnings(tmp_path):

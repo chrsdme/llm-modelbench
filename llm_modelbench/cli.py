@@ -1110,10 +1110,16 @@ def cmd_campaign(args, cfg):
             # no explicit selection filter is given, the campaign manifest
             # is the model set.
             _identity_models = selected or list(manifest.models)
-            _run_identities = (
-                _campaign_runtime_identities(args, cfg, _identity_models, client)
-                if _identity_models else {}
-            )
+            try:
+                _run_identities = (
+                    _campaign_runtime_identities(args, cfg, _identity_models, client)
+                    if _identity_models else {}
+                )
+            except Exception:
+                # D7: the prior-knowledge surface must never introduce a new
+                # "run refused" failure mode. Canonical benchmark runtime
+                # falls back to deferred; the run proceeds.
+                _run_identities = {}
             accepted_plan = _plan_for_args(
                 args, cfg, client, selected_models=selected,
                 runtime_identities=_run_identities,
@@ -1536,11 +1542,28 @@ def cmd_wizard(args, cfg):
         cfg.judge_model = args.judge_model
     client = _client(args, cfg)
 
+    from .hardware import detect_gpus
+    _wizard_inventory = detect_gpus()
+    _wizard_identity_cache: dict = {}
+
     def _wizard_runtime_identities(selected_models):
         # Anvil Stage 3.6: bounded metadata only (same helper the run/
         # campaign paths use); lets the wizard's plan resolve the active
         # protocol / canonical benchmark runtime instead of deferring it.
-        return _campaign_runtime_identities(args, cfg, list(selected_models), client)
+        # The wizard rebuilds the plan on every keystroke -- reuse the
+        # one GPU probe for the whole session, and memoize identities on
+        # the selection (they only move when the selection does). A
+        # failure here is non-fatal: the plan is built without identities.
+        key = tuple(sorted(str(m) for m in selected_models))
+        if key not in _wizard_identity_cache:
+            try:
+                _wizard_identity_cache[key] = _campaign_runtime_identities(
+                    args, cfg, list(selected_models), client,
+                    gpu_inventory=_wizard_inventory,
+                )
+            except Exception:
+                _wizard_identity_cache[key] = {}
+        return _wizard_identity_cache[key]
 
     plan, options = wizard.interactive_plan(
         client, cfg,
