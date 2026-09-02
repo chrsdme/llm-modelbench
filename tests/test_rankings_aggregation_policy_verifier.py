@@ -285,13 +285,69 @@ def _binding_entry_from_tasks(model, tasks, *, cfg, sample_mode="smart", judge_m
     }
 
 
-def test_weight_override_report_path_is_untouched_by_the_verifier():
-    # E7: the verifier is a canonical-ranking concern only. report.build's
-    # aggregate(rows, cfg.weights, difficulty) override path (cmd_report
-    # --weights) must remain a separate, unverified surface -- there is no
-    # aggregation_policy_verdict wiring there.
+def test_report_path_surfaces_the_verdict_without_excluding_rows():
+    # 3.3B category B: report.build surfaces an aggregation-policy
+    # disposition (same defect class as the canonical-ranking gap) but as
+    # advisory metadata only -- it never drops rows from aggregate(), since
+    # a per-run report's summary.json is not a cross-run comparability
+    # input to rankings.
     import inspect
     from llm_modelbench import report
     src = inspect.getsource(report)
-    assert "aggregation_policy_verdict" not in src
-    assert "verify_recorded_aggregation_policy" not in src
+    assert "verify_recorded_aggregation_policy" in src
+    assert "_aggregation_policy_provenance" in src
+    # aggregate() is still called on the full row set -- no eligible-row
+    # filtering was inserted into the report scoring path
+    build_src = inspect.getsource(report.build)
+    assert "aggregate(rows, cfg.weights, difficulty)" in build_src
+    prov_src = inspect.getsource(report._aggregation_policy_provenance)
+    # override must be distinguishable so a "verified" count is not read as
+    # a canonical endorsement of an override-scored report
+    assert "override_active" in prov_src and "weight_override_spec" in prov_src
+
+
+def test_report_aggregation_policy_provenance_flags_override(tmp_path):
+    from types import SimpleNamespace
+    from llm_modelbench import report
+    rows = [{"model": "m", "task": "py_anagram", "score": 90.0}]
+    ctx = {"filters": {}, "sample_mode": "smart", "judge_mode": "single"}
+    canonical = report._aggregation_policy_provenance(tmp_path, rows, SimpleNamespace(weight_override_spec=None), ctx)
+    overridden = report._aggregation_policy_provenance(tmp_path, rows, SimpleNamespace(weight_override_spec="coding_python=2"), ctx)
+    assert canonical["override_active"] is False and canonical["canonical_scorecard"] is True
+    assert overridden["override_active"] is True and overridden["canonical_scorecard"] is False
+
+
+def test_campaign_overlay_path_carries_the_verdict(tmp_path):
+    # campaign.py:3944 canonical rankings go through rankings.write_rankings,
+    # so the 3.3A verdict must appear with no campaign-specific wiring.
+    runs_dir = tmp_path / "runs"
+    cfg = _cfg(samples=1)
+    entry = _binding_entry("m", _SELECTED, cfg=cfg)
+    _write_run(runs_dir, "r1", model="m", digest="d1",
+               task_ids=_SELECTED, bound_entry=entry)
+    out = tmp_path / "rankings"
+    rankings.write_rankings(runs_dir, out)
+    summary = {row["digest"]: row for row in json.loads((out / "master_summary.json").read_text())}
+    assert _entry_for(summary, "d1")["verdict_counts"] == {"verified": 3}
+
+
+def test_dossier_aggregation_policy_by_digest_surfaces_without_excluding(tmp_path, monkeypatch):
+    from llm_modelbench import cli
+    runs_dir = tmp_path / "runs"
+    cfg = _cfg(samples=1)
+    entry = _binding_entry("m", _SELECTED, cfg=cfg)
+    run = _write_run(runs_dir, "r1", model="m", digest="d1",
+                     task_ids=_SELECTED, bound_entry=entry)
+    ledger = {"d1": {"names_seen": ["m"], "categories": {
+        "coding_python": {"out_dir": str(run)}}}}
+    verdicts = cli._aggregation_policy_by_digest_from_ledger(ledger)
+    assert verdicts["d1"]["verdict_counts"] == {"verified": 3}
+    assert verdicts["d1"]["override_runs"] is False
+
+    # difficulty drift on the live task table -> policy_drift, still surfaced
+    drifted = [dataclasses.replace(t, difficulty=t.difficulty + 5.0) if t.id in _SELECTED else t for t in TASKS]
+    import llm_modelbench.tasks as tasks_mod
+    monkeypatch.setattr(tasks_mod, "TASKS", drifted)
+    verdicts2 = cli._aggregation_policy_by_digest_from_ledger(ledger)
+    assert set(verdicts2["d1"]["verdict_counts"]) == {"policy_drift"}
+    assert verdicts2["d1"]["drift_reasons"]

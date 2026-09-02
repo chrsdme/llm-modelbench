@@ -1751,6 +1751,77 @@ def _quality_by_digest_from_ledger(ledger: dict) -> dict:
                     quality_by_digest.setdefault(digest, {})[category] = quality
     return quality_by_digest
 
+def _aggregation_policy_by_digest_from_ledger(ledger: dict) -> dict:
+    """Per digest, count how each contributing ledger run's scored rows
+    compare against today's canonical aggregation policy.
+
+    The dossier composite is a cross-run aggregate on live constants; this
+    surfaces (never excludes) rows whose recorded ``aggregation_policy_hash``
+    no longer matches -- exclusion would be a new owner comparability rule,
+    which Stage 3.3 does not grant for anything but the canonical ranking.
+    A ``--weights`` override run is flagged ``override_active`` so a
+    ``verified`` count cannot be read as a canonical endorsement.
+    """
+    from .benchmark_policy import verify_recorded_aggregation_policy
+    from .tasks import TASKS
+
+    tasks_by_id = {task.id: task for task in TASKS}
+    run_dirs = {entry.get("out_dir") for ledger_entry in ledger.values()
+                for entry in ledger_entry.get("categories", {}).values() if entry.get("out_dir")}
+    by_digest: dict = {}
+    for out_dir in run_dirs:
+        run = Path(out_dir)
+        raw_path, identities_path = run / "raw_results.jsonl", run / "model_identities.json"
+        if not raw_path.exists() or not identities_path.exists():
+            continue
+        identities = json.loads(identities_path.read_text())
+        filters = json.loads((run / "filters.json").read_text()) if (run / "filters.json").exists() else {}
+        bindings = json.loads((run / "benchmark_bindings.json").read_text()) if (run / "benchmark_bindings.json").exists() else {}
+        override_active = bool(filters.get("weight_override_spec") or filters.get("weight_override"))
+        protocols_by_key: dict = {}
+        for entry in (bindings.get("bindings") or {}).values():
+            key = ((entry or {}).get("binding") or {}).get("binding_key")
+            protocol = (entry or {}).get("protocol")
+            if key and isinstance(protocol, dict):
+                protocols_by_key[str(key)] = protocol
+        for entry in (bindings.get("resume_divergent_bindings") or []):
+            key = ((entry or {}).get("binding") or {}).get("binding_key")
+            protocol = (entry or {}).get("protocol")
+            if key and isinstance(protocol, dict):
+                protocols_by_key.setdefault(str(key), protocol)
+        for line in raw_path.read_text().splitlines():
+            if not line:
+                continue
+            row = json.loads(line)
+            digest = (identities.get(row.get("model")) or {}).get("digest")
+            if not digest:
+                continue
+            binding_key = row.get("benchmark_binding_key")
+            protocol = protocols_by_key.get(str(binding_key)) if binding_key else None
+            verdict = verify_recorded_aggregation_policy(
+                recorded_hash=str((protocol or {}).get("aggregation_policy_hash") or ""),
+                task_ids=list((protocol or {}).get("task_ids") or []),
+                requested_samples=filters.get("requested_samples"),
+                sample_mode=filters.get("sample_mode"),
+                judge_mode=filters.get("judge_mode"),
+                tasks_by_id=tasks_by_id,
+            )
+            slot = by_digest.setdefault(digest, {"verdict_counts": {}, "drift_reasons": set(), "override_runs": False})
+            slot["verdict_counts"][verdict.verdict] = slot["verdict_counts"].get(verdict.verdict, 0) + 1
+            if verdict.reason:
+                slot["drift_reasons"].add(verdict.reason)
+            if override_active:
+                slot["override_runs"] = True
+    return {
+        digest: {
+            "verdict_counts": dict(sorted(slot["verdict_counts"].items())),
+            "drift_reasons": sorted(slot["drift_reasons"]),
+            "override_runs": slot["override_runs"],
+            "note": "advisory; drifted rows surfaced, not excluded from the dossier composite",
+        }
+        for digest, slot in by_digest.items()
+    }
+
 def cmd_dossier(args, cfg):
     from .coverage import load_ledger
     from .dossier import DEFAULT_CATEGORY_WEIGHTS, composite_score, validate_weights
@@ -1758,8 +1829,12 @@ def cmd_dossier(args, cfg):
     from .tasks import TASKS
     weights = parse_weight_overrides(args.weights, DEFAULT_CATEGORY_WEIGHTS) if args.weights else DEFAULT_CATEGORY_WEIGHTS
     validate_weights(weights); ledger = load_ledger(Path(args.ledger)); out = {}; quality_by_digest = _quality_by_digest_from_ledger(ledger)
+    aggregation_policy_by_digest = _aggregation_policy_by_digest_from_ledger(ledger)
     for digest, entry in ledger.items():
-        out[digest] = composite_score(digest, ledger, quality_by_digest.get(digest, {}), weights, TASKS) | {"names_seen": entry.get("names_seen", [])}
+        out[digest] = composite_score(digest, ledger, quality_by_digest.get(digest, {}), weights, TASKS) | {
+            "names_seen": entry.get("names_seen", []),
+            "aggregation_policy": aggregation_policy_by_digest.get(digest, {"verdict_counts": {}, "drift_reasons": [], "override_runs": False}),
+        }
     text=json.dumps(out, indent=2)
     if args.out: Path(args.out).write_text(text)
     if args.json or not args.out: print(text)

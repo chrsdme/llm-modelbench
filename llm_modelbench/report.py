@@ -168,6 +168,65 @@ def _load_runtime_fit_state(out_dir: Path) -> Dict[str, Any]:
     return {"status": str(value.get("status") or "available"), "advisory": True}
 
 
+def _aggregation_policy_provenance(out_dir: Path, rows: List[Dict[str, Any]], cfg, context: Dict[str, Any]) -> Dict[str, Any]:
+    """Surface, per model, whether each scored row's recorded aggregation
+    policy still matches today's canonical policy.
+
+    This is a per-run scorecard, not a cross-run comparability input to
+    ``rankings`` (which reads ``raw_results.jsonl`` directly, never this
+    report's ``summary.json``), so drifted rows are reported here, never
+    excluded -- exclusion is the canonical-ranking rule only. When the
+    report is scored with a ``--weights`` override the verdict cannot be
+    read as a canonical endorsement, so ``override_active`` is recorded and
+    no ``verified`` claim is made.
+    """
+    from .benchmark_policy import verify_recorded_aggregation_policy
+    from .tasks import TASKS
+
+    tasks_by_id = {t.id: t for t in TASKS}
+    filters = context.get("filters") or {}
+    override_active = bool(getattr(cfg, "weight_override_spec", None))
+    bindings = _load_json(out_dir / "benchmark_bindings.json")
+    protocols_by_key: Dict[str, Dict[str, Any]] = {}
+    for entry in (bindings.get("bindings") or {}).values():
+        key = ((entry or {}).get("binding") or {}).get("binding_key")
+        protocol = (entry or {}).get("protocol")
+        if key and isinstance(protocol, dict):
+            protocols_by_key[str(key)] = protocol
+    for entry in (bindings.get("resume_divergent_bindings") or []):
+        key = ((entry or {}).get("binding") or {}).get("binding_key")
+        protocol = (entry or {}).get("protocol")
+        if key and isinstance(protocol, dict):
+            protocols_by_key.setdefault(str(key), protocol)
+
+    verdict_counts: Dict[str, int] = {}
+    drift_reasons: set = set()
+    for row in rows:
+        binding_key = row.get("benchmark_binding_key")
+        protocol = protocols_by_key.get(str(binding_key)) if binding_key else None
+        verdict = verify_recorded_aggregation_policy(
+            recorded_hash=str((protocol or {}).get("aggregation_policy_hash") or ""),
+            task_ids=list((protocol or {}).get("task_ids") or []),
+            requested_samples=filters.get("requested_samples"),
+            sample_mode=context.get("sample_mode"),
+            judge_mode=context.get("judge_mode"),
+            tasks_by_id=tasks_by_id,
+        )
+        verdict_counts[verdict.verdict] = verdict_counts.get(verdict.verdict, 0) + 1
+        if verdict.reason:
+            drift_reasons.add(verdict.reason)
+    return {
+        "verdict_counts": dict(sorted(verdict_counts.items())),
+        "drift_reasons": sorted(drift_reasons),
+        "override_active": override_active,
+        "canonical_scorecard": not override_active,
+        "note": (
+            "aggregation-policy verdicts are advisory in a per-run report; "
+            "drifted rows are surfaced, not excluded"
+        ),
+    }
+
+
 def build(out_dir: Path, cfg) -> None:
     raw_rows = _load(out_dir)
     rows, duplicate_rows = _dedupe_report_rows(raw_rows)
@@ -197,6 +256,7 @@ def build(out_dir: Path, cfg) -> None:
     (out_dir / "summary.json").write_text(json.dumps(lb, indent=2))
     _retrieval_diagnostics(out_dir, rows)
     meta = _metadata(out_dir, rows, cfg, context)
+    meta["aggregation_policy"] = _aggregation_policy_provenance(out_dir, rows, cfg, context)
     meta["runtime_provenance"] = {"runtime_variant_count": sum(item.get("runtime_variant_count", 0) for item in lb), "runtime_variant_counts_by_model": {str(item.get("model")): item.get("runtime_variant_count", 0) for item in lb}, "runtime_backends": sorted({value for item in lb for value in item.get("runtime_backends", [])}), "runtime_profiles": sorted({value for item in lb for value in item.get("runtime_profiles", [])}), "legacy_identity_row_count": sum(1 for row in rows if not row.get("runtime_identity_hash")), "identity_bearing_row_count": sum(1 for row in rows if row.get("runtime_identity_hash")), "runtime_identity_artifact": _load_runtime_identity_artifact_summary(out_dir), "runtime_telemetry_state": (context.get("runtime_telemetry") or {}).get("status", "unavailable"), "runtime_fit_state": _load_runtime_fit_state(out_dir)}
     (out_dir / "summary_meta.json").write_text(json.dumps(meta, indent=2))
     _regression(out_dir, lb, meta)
