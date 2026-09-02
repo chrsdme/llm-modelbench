@@ -25,7 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 
 def _stable_hash(*parts: Any) -> str:
@@ -125,6 +125,73 @@ class RuntimeProfileIdentity:
             self.gpu_policy,
             sorted(self.feature_flags),
         )
+
+
+# Anvil Stage 3.2D-1: the frozen 3.2B GPU-placement policy descriptor.
+# It names the *policy* (primary GPU / GPU0 first, minimum-prefix multi-GPU
+# fallback -- topology_budget.placement_order), never concrete GPU UUIDs or a
+# device count, which are per-environment execution facts (§8) and belong to
+# RuntimeInstanceIdentity.gpu_uuid_assignment / execution evidence.
+GPU_PLACEMENT_POLICY = "primary_gpu_first_minimum_multi_gpu"
+
+# Settings that materially distinguish the reusable runtime *recipe*. A value
+# that is not set becomes an explicit sentinel rather than being dropped, so
+# "unset" and "set to X" never collide.
+_RUNTIME_RECIPE_SETTINGS: Tuple[str, ...] = (
+    "strategy",
+    "context_size",
+    "batch_size",
+    "micro_batch_size",
+    "kv_cache_type",
+    "parallel_sequences",
+    "offload_layers",
+)
+_RUNTIME_SETTING_UNSET = "unset"
+
+
+def resolve_runtime_profile_identity(
+    *,
+    backend: str,
+    backend_version: Optional[str] = None,
+    execution_settings: Any = None,
+    protocol_version: Optional[str] = None,
+    template_hash: Optional[str] = None,
+    feature_flags: Tuple[str, ...] = (),
+) -> "RuntimeProfileIdentity":
+    """Deterministic stable :class:`RuntimeProfileIdentity` from normalized
+    resolved runtime configuration (Anvil Stage 3.2D-1).
+
+    This is the identity used for :class:`BenchmarkRuntimeBinding`'s
+    ``runtime_profile_identity_key`` -- a *reusable configuration* identity,
+    not the concrete-instance hash from ``runtime_identity.RuntimeIdentity``.
+
+    ``execution_settings`` is any object exposing the
+    :class:`runtime_identity.RuntimeExecutionSettings` attribute surface. Its
+    ``allocation_weights`` are deliberately **excluded** -- they are keyed by
+    physical GPU UUID (an environment fact, §8); ``strategy`` carries the
+    recipe-level split choice. ``allow_cpu_spill`` is also **excluded**: it is
+    an execution-time operator permission, already identity-bearing in
+    ``RuntimeIdentity.identity_hash`` (Stage 3.2C-2b), and replicating a
+    per-invocation CLI flag into reusable-recipe identity would be wrong (§9).
+
+    ``protocol_version``/``template_hash``/``feature_flags`` stay ``None``/
+    empty unless a real source is supplied -- ``backend.py`` already declares
+    template-hash derivation as later-stage work; nothing is invented here.
+    """
+    recipe: Dict[str, Any] = {}
+    for name in _RUNTIME_RECIPE_SETTINGS:
+        value = getattr(execution_settings, name, None) if execution_settings is not None else None
+        recipe[name] = _RUNTIME_SETTING_UNSET if value is None else value
+    runtime_configuration_hash = _stable_hash("runtime_recipe_v1", recipe)
+    return RuntimeProfileIdentity(
+        backend=backend,
+        backend_version=backend_version,
+        protocol_version=protocol_version,
+        template_hash=template_hash,
+        runtime_configuration_hash=runtime_configuration_hash,
+        gpu_policy=GPU_PLACEMENT_POLICY,
+        feature_flags=tuple(feature_flags),
+    )
 
 
 @dataclass(frozen=True)
