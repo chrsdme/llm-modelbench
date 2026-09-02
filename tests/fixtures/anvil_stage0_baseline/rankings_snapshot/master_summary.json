@@ -1,5 +1,13 @@
 [
   {
+    "aggregation_policy": {
+      "drift_reasons": [],
+      "excluded_from_canonical": 0,
+      "heterogeneous": false,
+      "verdict_counts": {
+        "verified": 31
+      }
+    },
     "architecture_family": null,
     "capability_limited": false,
     "capability_measured_failure": false,
@@ -3160,6 +3168,14 @@
     "total_wall_seconds": "<WALL_CLOCK>"
   },
   {
+    "aggregation_policy": {
+      "drift_reasons": [],
+      "excluded_from_canonical": 0,
+      "heterogeneous": false,
+      "verdict_counts": {
+        "verified": 30
+      }
+    },
     "architecture_family": null,
     "capability_limited": false,
     "capability_measured_failure": false,

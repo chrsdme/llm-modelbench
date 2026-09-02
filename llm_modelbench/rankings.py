@@ -98,6 +98,61 @@ def imported_run_ids(accumulated: List[Dict[str, Any]]) -> Dict[str, str]:
     return out
 
 
+def _binding_protocols_by_key(run_dir: Path) -> Dict[str, Dict[str, Any]]:
+    """Map every resolvable ``benchmark_binding_key`` in a run's
+    ``benchmark_bindings.json`` to its persisted ``protocol`` dict.
+
+    Covers both the immutable model-keyed ``bindings`` map and the additive
+    ``resume_divergent_bindings`` list (Anvil Stage 3.2E) -- a resumed run
+    directory can legitimately carry row-local references to more than one
+    binding, so every non-null ``benchmark_binding_key`` on a row must be
+    resolvable, not just ``bindings[model]``.
+    """
+    data = _read_json(run_dir / "benchmark_bindings.json") or {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for entry in (data.get("bindings") or {}).values():
+        key = ((entry or {}).get("binding") or {}).get("binding_key")
+        protocol = (entry or {}).get("protocol")
+        if key and isinstance(protocol, dict):
+            out[str(key)] = protocol
+    for entry in (data.get("resume_divergent_bindings") or []):
+        key = ((entry or {}).get("binding") or {}).get("binding_key")
+        protocol = (entry or {}).get("protocol")
+        if key and isinstance(protocol, dict):
+            out.setdefault(str(key), protocol)
+    return out
+
+
+def _aggregation_policy_verdict_for_row(
+    row: Dict[str, Any],
+    protocols_by_key: Dict[str, Dict[str, Any]],
+    run_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Resolve one row's recorded aggregation policy (via its
+    ``benchmark_binding_key``) and classify it against the policy the same
+    task selection would produce under today's canonical constants.
+
+    Legacy rows (no ``benchmark_binding_key``, or a key that does not resolve
+    in this run's bindings) get ``unverified_legacy`` -- canonical ranking
+    still proceeds for them and no current policy is ever attributed to them.
+    """
+    from .benchmark_policy import verify_recorded_aggregation_policy
+
+    binding_key = row.get("benchmark_binding_key")
+    protocol = protocols_by_key.get(str(binding_key)) if binding_key else None
+    recorded_hash = str((protocol or {}).get("aggregation_policy_hash") or "")
+    task_ids = list((protocol or {}).get("task_ids") or [])
+    verdict = verify_recorded_aggregation_policy(
+        recorded_hash=recorded_hash,
+        task_ids=task_ids,
+        requested_samples=run_config.get("requested_samples"),
+        sample_mode=run_config.get("sample_mode"),
+        judge_mode=run_config.get("judge_mode"),
+        tasks_by_id=_TASKS,
+    )
+    return verdict.as_dict()
+
+
 def _run_configuration(run_dir: Path) -> Dict[str, Any]:
     filters = _read_json(run_dir / "filters.json") or {}
     config = _read_json(run_dir / "config.json") or {}
@@ -154,6 +209,7 @@ def import_new_runs(
         identities = _read_json(run_dir / "model_identities.json") or {}
         capabilities = _read_json(run_dir / "capability_report.json") or {}
         run_config = _run_configuration(run_dir)
+        binding_protocols = _binding_protocols_by_key(run_dir)
         raw_rows = _read_jsonl(run_dir / "raw_results.jsonl")
         if (run_dir / "judge_results.jsonl").exists():
             from .judge_dumps import apply_judgements
@@ -175,6 +231,9 @@ def import_new_runs(
             candidate["_source_signature"] = signature
             candidate["_source_row_index"] = row_index
             candidate["run_configuration"] = run_config
+            candidate["aggregation_policy_verdict"] = _aggregation_policy_verdict_for_row(
+                row, binding_protocols, run_config
+            )
             candidate["ranking_scope"] = run_scope
             candidate["canonical_rankings"] = bool(scope_info.get("canonical_rankings", run_scope == SCOPE_CANONICAL))
             if model in capabilities:
@@ -499,6 +558,54 @@ def _read_json_safe(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _summarize_aggregation_policy(
+    scoring_rows: List[Dict[str, Any]],
+) -> Tuple[Dict[str, Any], set]:
+    """Classify a digest's canonical rows by their recorded aggregation policy
+    (resolved at import time, ``row["aggregation_policy_verdict"]``) and decide
+    which rows the canonical composite must exclude.
+
+    Returns ``(disposition, drifted_row_indices)``:
+
+    * ``disposition`` -- an operator-readable summary: per-verdict counts, the
+      distinct drift reasons, whether the rows aggregated here came from runs
+      with *differing* verdicts (``heterogeneous``), and whether any row was
+      excluded from the canonical composite.
+    * ``drifted_row_indices`` -- indices into ``scoring_rows`` whose run's
+      canonical aggregation policy has provably drifted from today's; excluded
+      from the canonical composite, never silently homogenized.
+    """
+    counts: Counter = Counter()
+    drift_reasons: set = set()
+    drifted_indices: set = set()
+    for index, row in enumerate(scoring_rows):
+        verdict_obj = row.get("aggregation_policy_verdict") or {}
+        verdict = str(verdict_obj.get("verdict") or "unverified_legacy")
+        counts[verdict] += 1
+        if verdict == "policy_drift":
+            drifted_indices.add(index)
+            reason = str(verdict_obj.get("reason") or "").strip()
+            if reason:
+                drift_reasons.add(reason)
+    observed = set(counts)
+    # "Heterogeneous" = the rows being aggregated for this model did not all
+    # agree on their aggregation-policy verdict -- e.g. one run verified, an
+    # older run drifted, or a resume produced divergent bindings. Flagged so a
+    # reader never assumes one model == one aggregation policy.
+    heterogeneous = len(observed - {"unverified_legacy", "unverified_incomplete"}) > 1 or (
+        "policy_drift" in observed and len(observed) > 1
+    )
+    return (
+        {
+            "verdict_counts": {k: counts[k] for k in sorted(counts)},
+            "drift_reasons": sorted(drift_reasons),
+            "heterogeneous": heterogeneous,
+            "excluded_from_canonical": len(drifted_indices),
+        },
+        drifted_indices,
+    )
+
+
 def build_summary(
     ranked_rows: List[Dict[str, Any]],
     history_rows: Optional[List[Dict[str, Any]]] = None,
@@ -552,7 +659,19 @@ def build_summary(
                 adjusted["terminal_failure_kind"] = "capability_measured_failure"
                 adjusted["reason"] = (str(adjusted.get("reason") or "") + "; capability-gated scored task measured zero quality").strip("; ")
             scoring_rows.append(adjusted)
-        canonical_rows = [{**row, "model": digest} for row in scoring_rows]
+
+        # Anvil Stage 3.3A: canonical aggregation reads the live DEFAULT_WEIGHTS
+        # / Task.difficulty / sample-policy constants. A row whose run recorded
+        # an aggregation_policy_hash that no longer matches what those constants
+        # produce ("policy_drift") must NOT be silently folded in as if it were
+        # comparable -- it is excluded from the canonical composite here, with
+        # an operator-readable disposition on the entry. Legacy / unverified
+        # rows still count (no policy is retrospectively attributed to them).
+        aggregation_policy_disposition, drifted_indices = _summarize_aggregation_policy(scoring_rows)
+        eligible_scoring_rows = [
+            row for index, row in enumerate(scoring_rows) if index not in drifted_indices
+        ]
+        canonical_rows = [{**row, "model": digest} for row in eligible_scoring_rows]
         leaderboard, per_cat = aggregate(canonical_rows, DEFAULT_WEIGHTS, _TASK_DIFFICULTY)
         aggregate_row = leaderboard[0] if leaderboard else {}
         overall = aggregate_row.get("quality")
@@ -852,6 +971,7 @@ def build_summary(
             "fully_tested": fully_tested,
             "quality_status": quality_status,
             "quality_status_reasons": status_reasons,
+            "aggregation_policy": aggregation_policy_disposition,
             "overall_mean_score": overall,
             "quality_blended": aggregate_row.get("quality_blended"),
             "coverage_ratio": coverage_ratio,

@@ -294,3 +294,163 @@ def test_legacy_protocol_without_aggregation_hash_stays_constructible():
     # and it has a different identity from a current one (intended -- 3.2E moved it)
     current = build_benchmark_protocol([_task("a", scorer="exact")], _cfg())
     assert legacy.identity_key() != current.identity_key()
+
+
+# --- Anvil Stage 3.3A: canonical ranking aggregation-policy verifier --------
+
+from llm_modelbench.benchmark_policy import (  # noqa: E402
+    AGG_VERDICT_POLICY_DRIFT, AGG_VERDICT_UNVERIFIED_INCOMPLETE,
+    AGG_VERDICT_UNVERIFIED_LEGACY, AGG_VERDICT_VERIFIED,
+    recompute_aggregation_policy_hash, verify_recorded_aggregation_policy,
+)
+
+
+def _recorded_hash(tasks, *, samples=1, sample_mode="smart", judge_mode="single"):
+    """The aggregation_policy_hash build_benchmark_protocol would record for
+    this exact task set / sample policy under the current constants."""
+    return build_benchmark_protocol(
+        tasks, _cfg(samples=samples), sample_mode=sample_mode, judge_mode=judge_mode
+    ).aggregation_policy_hash
+
+
+def test_verifier_matching_policy_is_verified():
+    tasks = [_task("a", category="coding_python", difficulty=1.0),
+             _task("b", category="coding_python", difficulty=0.0)]
+    by_id = {t.id: t for t in tasks}
+    recorded = _recorded_hash(tasks)
+    v = verify_recorded_aggregation_policy(
+        recorded_hash=recorded, task_ids=["a", "b"],
+        requested_samples=1, sample_mode="smart", judge_mode="single",
+        tasks_by_id=by_id,
+    )
+    assert v.verdict == AGG_VERDICT_VERIFIED
+    assert v.compatible is True
+    assert v.recomputed_hash == recorded
+
+
+def test_verifier_difficulty_drift_is_detected():
+    # Run bound when 'a' had difficulty 1.0; today the suite says 2.0.
+    bound_tasks = [_task("a", category="coding_python", difficulty=1.0)]
+    recorded = _recorded_hash(bound_tasks)
+    current = {"a": _task("a", category="coding_python", difficulty=2.0)}
+    v = verify_recorded_aggregation_policy(
+        recorded_hash=recorded, task_ids=["a"],
+        requested_samples=1, sample_mode="smart", judge_mode="single",
+        tasks_by_id=current,
+    )
+    assert v.verdict == AGG_VERDICT_POLICY_DRIFT
+    assert v.compatible is False
+    assert v.recorded_hash == recorded and v.recomputed_hash != recorded
+    assert "difficulty" in v.reason or "current canonical" in v.reason
+
+
+def test_verifier_participating_category_weight_drift_is_detected():
+    import llm_modelbench.benchmark_policy as bp
+    task = _task("a", category="coding_python", difficulty=1.0)
+    recorded = _recorded_hash([task])
+    original = dict(bp.DEFAULT_WEIGHTS)
+    try:
+        bp.DEFAULT_WEIGHTS = dict(original, coding_python=original["coding_python"] + 0.05)
+        v = verify_recorded_aggregation_policy(
+            recorded_hash=recorded, task_ids=["a"],
+            requested_samples=1, sample_mode="smart", judge_mode="single",
+            tasks_by_id={"a": task},
+        )
+    finally:
+        bp.DEFAULT_WEIGHTS = original
+    assert v.verdict == AGG_VERDICT_POLICY_DRIFT
+
+
+def test_verifier_non_participating_category_weight_change_is_not_a_mismatch():
+    import llm_modelbench.benchmark_policy as bp
+    task = _task("a", category="coding_python", difficulty=1.0)  # 'ocr' absent
+    recorded = _recorded_hash([task])
+    original = dict(bp.DEFAULT_WEIGHTS)
+    try:
+        bp.DEFAULT_WEIGHTS = dict(original, ocr=original.get("ocr", 0.0) + 0.05)
+        v = verify_recorded_aggregation_policy(
+            recorded_hash=recorded, task_ids=["a"],
+            requested_samples=1, sample_mode="smart", judge_mode="single",
+            tasks_by_id={"a": task},
+        )
+        # and a participating change on the SAME setup IS caught (non-vacuous)
+        bp.DEFAULT_WEIGHTS = dict(original, coding_python=original["coding_python"] + 0.05)
+        v_part = verify_recorded_aggregation_policy(
+            recorded_hash=recorded, task_ids=["a"],
+            requested_samples=1, sample_mode="smart", judge_mode="single",
+            tasks_by_id={"a": task},
+        )
+    finally:
+        bp.DEFAULT_WEIGHTS = original
+    assert v.verdict == AGG_VERDICT_VERIFIED
+    assert v_part.verdict == AGG_VERDICT_POLICY_DRIFT
+
+
+def test_verifier_sample_policy_drift_is_detected():
+    # subjective task, judging on: draw count follows requested_samples.
+    subj = _task("s", category="coding_python", scorer="subjective", difficulty=1.0)
+    recorded = _recorded_hash([subj], samples=2, sample_mode="all", judge_mode="single")
+    v = verify_recorded_aggregation_policy(
+        recorded_hash=recorded, task_ids=["s"],
+        requested_samples=5, sample_mode="all", judge_mode="single",
+        tasks_by_id={"s": subj},
+    )
+    assert v.verdict == AGG_VERDICT_POLICY_DRIFT
+    # sanity: same as recorded reproduces verified
+    v_ok = verify_recorded_aggregation_policy(
+        recorded_hash=recorded, task_ids=["s"],
+        requested_samples=2, sample_mode="all", judge_mode="single",
+        tasks_by_id={"s": subj},
+    )
+    assert v_ok.verdict == AGG_VERDICT_VERIFIED
+
+
+def test_verifier_legacy_row_without_recorded_hash():
+    v = verify_recorded_aggregation_policy(
+        recorded_hash="", task_ids=[],
+        requested_samples=1, sample_mode="smart", judge_mode="single",
+        tasks_by_id={},
+    )
+    assert v.verdict == AGG_VERDICT_UNVERIFIED_LEGACY
+    assert v.compatible is False
+    assert v.recorded_hash == ""
+
+
+def test_verifier_incomplete_run_config_is_not_a_drift_claim():
+    task = _task("a", category="coding_python", difficulty=1.0)
+    recorded = _recorded_hash([task])
+    v = verify_recorded_aggregation_policy(
+        recorded_hash=recorded, task_ids=["a"],
+        requested_samples=None, sample_mode=None, judge_mode=None,
+        tasks_by_id={"a": task},
+    )
+    assert v.verdict == AGG_VERDICT_UNVERIFIED_INCOMPLETE
+    assert v.compatible is False
+
+
+def test_verifier_unknown_task_is_incomplete_not_drift():
+    task = _task("a", category="coding_python", difficulty=1.0)
+    recorded = _recorded_hash([task])
+    v = verify_recorded_aggregation_policy(
+        recorded_hash=recorded, task_ids=["a", "gone_from_suite"],
+        requested_samples=1, sample_mode="smart", judge_mode="single",
+        tasks_by_id={"a": task},
+    )
+    assert v.verdict == AGG_VERDICT_UNVERIFIED_INCOMPLETE
+
+
+def test_recompute_reuses_the_protocol_builder_hash_exactly():
+    # The verifier's recompute must equal what build_benchmark_protocol records
+    # for the same inputs -- i.e. it reuses build_aggregation_policy_manifest +
+    # the "aggregation_policy_v1" _stable_hash idiom, not a parallel formula.
+    tasks = [_task("a", category="coding_python", difficulty=1.5),
+             _task("b", category="git", difficulty=0.0)]
+    by_id = {t.id: t for t in tasks}
+    via_protocol = build_benchmark_protocol(
+        tasks, _cfg(samples=1), sample_mode="smart", judge_mode="single"
+    ).aggregation_policy_hash
+    via_verifier = recompute_aggregation_policy_hash(
+        ["a", "b"], requested_samples=1, sample_mode="smart",
+        judge_mode="single", tasks_by_id=by_id,
+    )
+    assert via_protocol == via_verifier

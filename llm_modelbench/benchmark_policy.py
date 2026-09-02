@@ -29,7 +29,8 @@ No production call site is wired here -- see Stage 3.2D-2.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Mapping, Tuple
+from types import SimpleNamespace
+from typing import Any, Dict, Iterable, List, Mapping, Tuple
 
 from .benchmark_protocol import BenchmarkProtocol, _stable_hash
 from .config import DEFAULT_WEIGHTS, Config
@@ -316,4 +317,169 @@ def build_benchmark_protocol(
         scorer_versions=resolve_scorer_versions(tasks),
         allowed_adaptations=ALLOWED_ADAPTATIONS,
         aggregation_policy_hash=aggregation_policy_hash,
+    )
+
+
+# --- canonical ranking aggregation-policy verifier (Anvil Stage 3.3A) --------
+#
+# Stage 3.2E made ``BenchmarkProtocol.aggregation_policy_hash`` identity-bearing
+# and recorded it per bound run. It is NOT self-enforcing: canonical ranking
+# (``rankings.aggregate(canonical_rows, DEFAULT_WEIGHTS, _TASK_DIFFICULTY)``)
+# reads the live ``DEFAULT_WEIGHTS`` / ``Task.difficulty`` / sample-policy
+# constants and never checks them against any run's recorded hash. Editing a
+# ``Task.difficulty`` value or a ``DEFAULT_WEIGHTS`` entry therefore silently
+# rewrites every recomputed canonical ranking.
+#
+# This verifier recomputes the aggregation-policy hash a run WOULD get today --
+# same task selection, same sample policy, but the CURRENT module constants --
+# and compares it to what the run recorded. It reuses
+# ``build_aggregation_policy_manifest`` verbatim (one source of aggregation
+# semantics) and the one ``_stable_hash("aggregation_policy_v1", ...)`` idiom
+# from ``build_benchmark_protocol`` -- it does not rebuild any of the policy.
+
+# Verdict vocabulary. Kept as plain strings (persisted into master_raw.jsonl
+# and the ranking summary), never an Enum -- mirrors the rest of the evidence
+# schema.
+AGG_VERDICT_VERIFIED = "verified"
+AGG_VERDICT_POLICY_DRIFT = "policy_drift"
+AGG_VERDICT_UNVERIFIED_LEGACY = "unverified_legacy"
+AGG_VERDICT_UNVERIFIED_INCOMPLETE = "unverified_incomplete"
+
+
+class AggregationPolicyVerdict:
+    """Result of checking one run's recorded aggregation-policy hash against
+    the hash the same task selection would produce under today's constants."""
+
+    __slots__ = ("verdict", "recorded_hash", "recomputed_hash", "reason", "task_ids")
+
+    def __init__(
+        self,
+        verdict: str,
+        *,
+        recorded_hash: str = "",
+        recomputed_hash: str = "",
+        reason: str = "",
+        task_ids: Tuple[str, ...] = (),
+    ) -> None:
+        self.verdict = verdict
+        self.recorded_hash = recorded_hash
+        self.recomputed_hash = recomputed_hash
+        self.reason = reason
+        self.task_ids = task_ids
+
+    @property
+    def compatible(self) -> bool:
+        """True only when the recorded policy provably matches today's."""
+        return self.verdict == AGG_VERDICT_VERIFIED
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "verdict": self.verdict,
+            "recorded_aggregation_policy_hash": self.recorded_hash,
+            "recomputed_aggregation_policy_hash": self.recomputed_hash,
+            "reason": self.reason,
+        }
+
+
+def recompute_aggregation_policy_hash(
+    task_ids: Iterable[str],
+    *,
+    requested_samples: int,
+    sample_mode: str,
+    judge_mode: str,
+    tasks_by_id: Mapping[str, Task],
+) -> str:
+    """The ``aggregation_policy_hash`` the given task selection would get under
+    the CURRENT ``DEFAULT_WEIGHTS`` / ``Task.difficulty`` / sample-policy
+    constants. Raises :class:`BenchmarkPolicyError` if any task id is unknown
+    to the current suite (the recompute would otherwise silently drop it and
+    produce a hash that cannot be compared honestly).
+    """
+    ordered: List[Task] = []
+    for tid in task_ids:
+        task = tasks_by_id.get(tid)
+        if task is None:
+            raise BenchmarkPolicyError(
+                f"cannot recompute aggregation policy: task {tid!r} is not in the "
+                "current task suite"
+            )
+        ordered.append(task)
+    if not ordered:
+        raise BenchmarkPolicyError(
+            "cannot recompute aggregation policy: empty task selection"
+        )
+    cfg_shim = SimpleNamespace(samples=max(1, int(requested_samples or 1)))
+    manifest = build_aggregation_policy_manifest(
+        ordered, cfg_shim, sample_mode=str(sample_mode), judge_mode=str(judge_mode)
+    )
+    return _stable_hash("aggregation_policy_v1", manifest)
+
+
+def verify_recorded_aggregation_policy(
+    *,
+    recorded_hash: str,
+    task_ids: Iterable[str],
+    requested_samples: Any,
+    sample_mode: Any,
+    judge_mode: Any,
+    tasks_by_id: Mapping[str, Task],
+) -> AggregationPolicyVerdict:
+    """Classify one run's recorded aggregation-policy hash.
+
+    * no ``recorded_hash`` -> ``unverified_legacy`` (a pre-Stage-3.2E run, or a
+      run whose bindings were not resolved). Canonical ranking still proceeds
+      for such rows; a policy is never retrospectively attributed to them.
+    * missing ``sample_mode`` / ``judge_mode`` / ``requested_samples``, unknown
+      task, or empty selection -> ``unverified_incomplete`` (cannot honestly
+      recompute; treated like legacy -- not a drift claim).
+    * recorded == recomputed -> ``verified``.
+    * recorded != recomputed -> ``policy_drift`` (the live canonical
+      aggregation constants have moved since this run was bound).
+    """
+    task_ids = tuple(task_ids)
+    if not recorded_hash:
+        return AggregationPolicyVerdict(
+            AGG_VERDICT_UNVERIFIED_LEGACY,
+            reason="no recorded aggregation_policy_hash (pre-Stage-3.2E run or unresolved binding)",
+            task_ids=task_ids,
+        )
+    if sample_mode in (None, "") or judge_mode in (None, "") or requested_samples in (None, ""):
+        return AggregationPolicyVerdict(
+            AGG_VERDICT_UNVERIFIED_INCOMPLETE,
+            recorded_hash=recorded_hash,
+            reason="run configuration missing sample_mode / judge_mode / requested_samples; cannot recompute",
+            task_ids=task_ids,
+        )
+    try:
+        recomputed = recompute_aggregation_policy_hash(
+            task_ids,
+            requested_samples=requested_samples,
+            sample_mode=sample_mode,
+            judge_mode=judge_mode,
+            tasks_by_id=tasks_by_id,
+        )
+    except BenchmarkPolicyError as exc:
+        return AggregationPolicyVerdict(
+            AGG_VERDICT_UNVERIFIED_INCOMPLETE,
+            recorded_hash=recorded_hash,
+            reason=str(exc),
+            task_ids=task_ids,
+        )
+    if recomputed == recorded_hash:
+        return AggregationPolicyVerdict(
+            AGG_VERDICT_VERIFIED,
+            recorded_hash=recorded_hash,
+            recomputed_hash=recomputed,
+            task_ids=task_ids,
+        )
+    return AggregationPolicyVerdict(
+        AGG_VERDICT_POLICY_DRIFT,
+        recorded_hash=recorded_hash,
+        recomputed_hash=recomputed,
+        reason=(
+            "recorded aggregation_policy_hash does not match the hash this task "
+            "selection produces under the current canonical weights / task "
+            "difficulty / sample policy"
+        ),
+        task_ids=task_ids,
     )
