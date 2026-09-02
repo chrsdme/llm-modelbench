@@ -1759,8 +1759,10 @@ def _aggregation_policy_by_digest_from_ledger(ledger: dict) -> dict:
     surfaces (never excludes) rows whose recorded ``aggregation_policy_hash``
     no longer matches -- exclusion would be a new owner comparability rule,
     which Stage 3.3 does not grant for anything but the canonical ranking.
-    A ``--weights`` override run is flagged ``override_active`` so a
-    ``verified`` count cannot be read as a canonical endorsement.
+    A run whose own scoring used a weights override (recorded in its
+    ``summary_meta.json``) sets ``override_runs`` so a ``verified`` count
+    is not read as a canonical endorsement; ``cmd_dossier`` adds
+    ``dossier_weights_overridden`` for its own ``--weights``.
     """
     from .benchmark_policy import verify_recorded_aggregation_policy
     from .tasks import TASKS
