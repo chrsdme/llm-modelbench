@@ -24,17 +24,40 @@ def test_unequal_physical_inventory_and_policy_aggregate_are_uuid_keyed():
     topology = _topology()
     assert [item.uuid for item in topology.devices] == [U5060, U3060]
     assert [item.installed_capacity_bytes // MIB for item in topology.devices] == [16311, 12288]
-    assert [item.effective_now_bytes // MIB for item in topology.devices] == [15872, 11776]
-    assert topology.aggregate_effective_bytes // MIB == 27648
+    # effective_now is clamped by the fixed §4 safety ceiling (SAFE_VRAM_FRACTION
+    # of installed) -- here it is below both the policy ceiling and live-free,
+    # so it dominates: 16311*0.88 and 12288*0.88.
+    assert [item.effective_now_bytes // MIB for item in topology.devices] == [14353, 10813]
+    assert topology.aggregate_effective_bytes // MIB == 25167
 
 
 def test_policy_and_live_free_clamp_without_a_display_penalty():
     topology = _topology(free_5060=16000, free_3060=11000)
     first, second = topology.devices
-    assert first.effective_now_bytes // MIB == 15872
-    assert second.effective_now_bytes // MIB == 11000
+    # U5060: min(policy 15872, live-free 16000, safe 14353) -> safe wins.
+    assert first.effective_now_bytes // MIB == 14353
+    # U3060: min(policy 11776, live-free 11000, safe 10813) -> safe wins.
+    assert second.effective_now_bytes // MIB == 10813
+    # Display activity is still not a tax: the only reason effective drops below
+    # live-free here is the safety ceiling, not the active display.
     display = topology_from_inventory(_inventory(), live_by_uuid_mib={U5060: {"free": 15000, "display_active": True}})
-    assert display.devices[0].effective_now_bytes // MIB == 15000
+    assert display.devices[0].effective_now_bytes // MIB == 14353
+
+
+def test_safe_vram_fraction_is_a_single_fixed_constant_in_the_frozen_window():
+    from llm_modelbench.topology_budget import GPUMemoryBudget, SAFE_VRAM_FRACTION
+
+    assert 0.85 <= SAFE_VRAM_FRACTION <= 0.90
+    # No other evidence: effective_now is exactly physical * fraction, never the
+    # full installed capacity.
+    bare = GPUMemoryBudget(U5060, "00000000:01:00.0", 16311 * MIB)
+    assert bare.safe_capacity_bytes == int(16311 * MIB * SAFE_VRAM_FRACTION)
+    assert bare.effective_now_bytes == bare.safe_capacity_bytes
+    # A live-free reading below the safety ceiling still wins (min of the two).
+    tighter = GPUMemoryBudget(U5060, "00000000:01:00.0", 16311 * MIB, live_free_bytes=8000 * MIB)
+    assert tighter.effective_now_bytes == 8000 * MIB
+    # Unknown installed capacity -> no safety ceiling to apply.
+    assert GPUMemoryBudget(U5060, "00000000:01:00.0", None).safe_capacity_bytes is None
 
 
 def test_selected_runtime_can_reclaim_but_unrelated_cuda_memory_never_can():

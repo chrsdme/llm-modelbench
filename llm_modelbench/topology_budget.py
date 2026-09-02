@@ -14,6 +14,12 @@ from .hardware import GPUDevice
 MIB = 1024 * 1024
 FIT_LABELS = {"single_gpu_fit", "candidate_single_gpu_fit", "multi_gpu_conditional_fit", "cpu_spill_required", "confirmed_no_fit", "unknown"}
 
+# Single fixed conservative VRAM safety ceiling (amendment §4), never an
+# adaptive formula.  Physical VRAM is never handed out in full: CUDA/runtime
+# allocations, temporary buffers, fragmentation and backend workspace need the
+# remainder.  0.88 sits mid-range of the frozen 85–90% window.
+SAFE_VRAM_FRACTION = 0.88
+
 
 def _bytes_from_mib(value: Optional[float]) -> Optional[int]:
     return None if value is None else max(0, int(float(value) * MIB))
@@ -48,9 +54,28 @@ class GPUMemoryBudget:
                 raise ValueError(f"{field} must be a non-negative byte count")
 
     @property
+    def safe_capacity_bytes(self) -> Optional[int]:
+        """Physical VRAM after the fixed §4 safety ceiling; None when unknown.
+
+        This is ``physical_vram * SAFE_VRAM_FRACTION`` -- the headroom reserve
+        the amendment requires before any scored benchmark.  It is not applied
+        to explicit operator/backend caps (``policy_ceiling_bytes`` /
+        ``backend_usable_limit_bytes``): those are already deliberate limits and
+        discounting them again would double-count the reserve.
+        """
+        if self.installed_capacity_bytes is None:
+            return None
+        return int(self.installed_capacity_bytes * SAFE_VRAM_FRACTION)
+
+    @property
     def effective_now_bytes(self) -> Optional[int]:
-        """Immediately allocatable capacity; display activity is evidence, not a tax."""
-        candidates = [value for value in (self.policy_ceiling_bytes, self.live_free_bytes, self.backend_usable_limit_bytes) if value is not None]
+        """Immediately allocatable capacity; display activity is evidence, not a tax.
+
+        ``safe_vram = min(live_free_vram, physical_vram * fixed_safe_fraction)``
+        (amendment §4), further clamped by any explicit policy/backend ceiling.
+        """
+        candidates = [value for value in (self.policy_ceiling_bytes, self.live_free_bytes,
+                                          self.backend_usable_limit_bytes, self.safe_capacity_bytes) if value is not None]
         if not candidates:
             return self.installed_capacity_bytes
         return min(candidates)
@@ -71,7 +96,8 @@ class GPUMemoryBudget:
                 "live_used_bytes": self.live_used_bytes, "live_free_bytes": self.live_free_bytes,
                 "policy_ceiling_bytes": self.policy_ceiling_bytes, "runtime_reclaimable_bytes": self.runtime_reclaimable_bytes,
                 "unrelated_nonreclaimable_bytes": self.unrelated_nonreclaimable_bytes,
-                "backend_usable_limit_bytes": self.backend_usable_limit_bytes, "effective_now_bytes": self.effective_now_bytes,
+                "backend_usable_limit_bytes": self.backend_usable_limit_bytes, "safe_capacity_bytes": self.safe_capacity_bytes,
+                "effective_now_bytes": self.effective_now_bytes,
                 "effective_after_reclaim_bytes": self.effective_after_reclaim_bytes, "display_active": self.display_active,
                 "physical_index": self.physical_index}
 
