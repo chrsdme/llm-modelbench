@@ -377,16 +377,18 @@ def _run_dossier(cli, ledger_path, weights, capsys):
 
 
 def test_canonical_dossier_composite_uses_verified_rows_only(tmp_path, monkeypatch, capsys):
-    # A digest whose contributing rows come from two runs: one bound at a
-    # sample_mode whose recorded policy still matches today's, one bound at a
-    # sample_mode that has drifted. The canonical composite must be built from
-    # the verified rows only; the drifted rows stay visible in the advisory
-    # surface (verdict_counts + drift_reasons).
+    # A digest whose contributing rows come from two runs bound to tasks in
+    # *different categories*: py_* (verified) and js_debounce (coding_js). Then
+    # js_debounce's difficulty drifts, so only the coding_js run's recorded
+    # aggregation-policy hash stops matching. The canonical quality composite
+    # must be built from the verified (py_*) rows only -- the coding_js quality
+    # must NOT appear in _quality_by_digest_from_ledger -- while the drifted
+    # rows stay visible in the advisory surface (verdict_counts + drift_reasons).
     from llm_modelbench import cli
     runs_dir = tmp_path / "runs"
     cfg = _cfg(samples=1)
     verified_tasks = ["py_anagram", "py_dedupe"]
-    drift_tasks = ["py_csv"]
+    drift_tasks = ["js_debounce"]
     entry_ok = _binding_entry("m", verified_tasks, cfg=cfg)
     entry_drift = _binding_entry("m", drift_tasks, cfg=cfg)
     run_ok = _write_run(runs_dir, "ok", model="m", digest="d1",
@@ -396,9 +398,9 @@ def test_canonical_dossier_composite_uses_verified_rows_only(tmp_path, monkeypat
     ledger_path = tmp_path / "ledger.json"
     ledger_path.write_text(json.dumps({"d1": {"names_seen": ["m"], "categories": {
         "coding_python": {"out_dir": str(run_ok), "quality": 90.0},
-        "coding_python_b": {"out_dir": str(run_drift), "quality": 90.0}}}}))
+        "coding_js": {"out_dir": str(run_drift), "quality": 90.0}}}}))
 
-    # drift py_csv difficulty -> only run_drift's recorded hash stops matching
+    # drift js_debounce difficulty -> only run_drift's recorded hash stops matching
     drifted = [dataclasses.replace(t, difficulty=t.difficulty + 5.0) if t.id in drift_tasks else t for t in TASKS]
     import llm_modelbench.tasks as tasks_mod
     monkeypatch.setattr(tasks_mod, "TASKS", drifted)
@@ -410,9 +412,13 @@ def test_canonical_dossier_composite_uses_verified_rows_only(tmp_path, monkeypat
     assert policy["drift_reasons"]  # drifted rows still visible in provenance
     assert policy["canonical_composite"] is True
     assert "canonical_composite_unavailable_reason" not in policy
-    # the drifted run's category quality was NOT folded into the composite
+    # discriminating assertion: the verified py_* run's quality is present, the
+    # drifted coding_js run's quality is dropped from the canonical composite.
+    # Fails immediately if the drift filter is removed from
+    # _quality_by_digest_from_ledger.
     qbd = cli._quality_by_digest_from_ledger(json.loads(ledger_path.read_text()))
-    assert "d1" in qbd  # verified rows still produced quality
+    assert "coding_python" in qbd["d1"]
+    assert "coding_js" not in qbd["d1"]
 
 
 def test_canonical_dossier_composite_unavailable_when_all_rows_drift(tmp_path, monkeypatch, capsys):
@@ -431,11 +437,18 @@ def test_canonical_dossier_composite_unavailable_when_all_rows_drift(tmp_path, m
     result = _run_dossier(cli, ledger_path, None, capsys)
     policy = result["aggregation_policy"]
     assert policy["excluded_from_canonical_composite"] == 3
+    assert policy["all_rows_excluded_as_drift"] is True
     # not a live-policy number over incompatible rows -- honestly unavailable
     assert result["composite"] is None
     assert policy["canonical_composite_unavailable_reason"] == (
         "all comparable rows excluded as policy_drift"
     )
+    # discriminating assertion: every row was drift-excluded, so the digest
+    # produces no canonical quality at all. Fails if the drift filter is
+    # removed from _quality_by_digest_from_ledger (the drifted rows would then
+    # aggregate to a live-policy quality under today's constants).
+    qbd = cli._quality_by_digest_from_ledger(json.loads(ledger_path.read_text()))
+    assert qbd.get("d1", {}) == {}
 
 
 def test_dossier_own_weights_override_marks_composite_noncanonical(tmp_path, monkeypatch, capsys):
