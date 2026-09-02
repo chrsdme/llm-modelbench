@@ -12,6 +12,7 @@ from typing import Any, Dict, List
 
 from . import __version__
 from .hardware import detect_gpu, detect_gpus, live_snapshot
+from .runtime_profiles import discover_backend_executables
 
 
 def _run(cmd: List[str], timeout: int = 5) -> str:
@@ -69,6 +70,10 @@ def collect(cfg: Any) -> Dict[str, Any]:
         "gpus": [device.__dict__ for device in gpus],
         "hardware_live": hw,
         "runtime_telemetry": runtime_telemetry,
+        # Stage 3B.1C: read-only "is the launch executable installed?" -- never
+        # spawns anything; a later stage uses this to decide whether it *could*
+        # start an ephemeral llama-server here.
+        "backend_executables": [item.to_dict() for item in discover_backend_executables()],
         "disk_free_gb": round(disk.free / 1024**3, 1),
         "disk_total_gb": round(disk.total / 1024**3, 1),
     }
@@ -143,6 +148,14 @@ def render(data: Dict[str, Any]) -> str:
             f"compute-query={query_state} "
             f"socket-evidence={'complete' if socket_complete else 'partial'} schema={schema_state}"
         )
+    executables = data.get("backend_executables")
+    if executables:
+        lines.append("")
+        lines.append("Backend executables:")
+        for item in executables:
+            path = item.get("executable_path")
+            suffix = f" ({path})" if path else ""
+            lines.append(f"  {item.get('backend')}: {item.get('state')}{suffix}")
     lines += [
         "",
         f"Disk free:         {data.get('disk_free_gb')}GB / {data.get('disk_total_gb')}GB",

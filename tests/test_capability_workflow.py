@@ -218,3 +218,31 @@ def test_transient_capability_probe_is_withheld_not_marked_unavailable(monkeypat
     assert "vision" not in profile["supported_families"]
     assert "vision" in profile["unverified_families"]
     assert "vision" not in profile["confirmed_unavailable_families"]
+
+
+def test_interrogate_without_functional_runs_no_inference():
+    """Stage 3B.1C read-only proof: metadata-only interrogation (the default,
+    the path plain discovery uses) never calls an inference method. ``--auto``
+    is the only door to real probing."""
+    inference_calls = []
+
+    class RecordingClient:
+        def capability_hints(self, model):
+            return ["completion", "vision", "tools"]
+
+        def _record(self, name):
+            def _method(*args, **kwargs):
+                inference_calls.append(name)
+                return {"ok": True, "text": "SHOULD_NOT_BE_CALLED"}
+            return _method
+
+        def __getattr__(self, name):
+            if name in {"chat", "chat_tools", "embed", "generate_suffix", "generate"}:
+                return self._record(name)
+            raise AttributeError(name)
+
+    profile = interrogate_model(RecordingClient(), "some-model", functional=False)
+
+    assert inference_calls == []
+    assert profile["functional_probes_enabled"] is False
+    assert profile["routing_policy"] == "metadata_only"

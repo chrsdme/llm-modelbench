@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import tempfile
 import urllib.error
 import urllib.parse
@@ -177,6 +178,76 @@ def delete_profile(name: str, *, path: Optional[Path] = None) -> None:
 
 def implicit_ollama_profile(cfg: Any) -> RuntimeProfile:
     return RuntimeProfile("legacy-ollama", "ollama", str(cfg.ollama_url), provenance="legacy-default")
+
+
+# Stage 3B.1C -- the executable each backend needs on PATH for ModelBench to
+# be able to *launch* an ephemeral runtime later.  Ollama also serves via an
+# always-on daemon; llama.cpp only exists as a process ModelBench would spawn,
+# so its availability here is what a later stage checks before deciding it
+# *could* start an ephemeral ``llama-server``.  Discovery never runs any of
+# these -- it only asks whether they are installed.
+_BACKEND_EXECUTABLES: Tuple[Tuple[str, str], ...] = (
+    ("ollama", "ollama"),
+    ("llama_cpp", "llama-server"),
+)
+
+
+@dataclass(frozen=True)
+class BackendExecutable:
+    """Read-only fact: is a backend's launch executable installed on this host?
+
+    ``executable_available`` never implies the backend is reachable, healthy,
+    or that any model is loaded -- only that the binary exists.  ``state`` is
+    one of ``installed`` / ``not_installed`` / ``not_configured`` (an explicit
+    configured path that does not exist).
+    """
+
+    backend: str
+    executable_available: bool
+    executable_path: Optional[str]
+    state: str
+    source: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "backend": self.backend,
+            "executable_available": self.executable_available,
+            "executable_path": self.executable_path,
+            "state": self.state,
+            "source": self.source,
+        }
+
+
+def discover_backend_executables(
+    *,
+    which_fn: Callable[[str], Optional[str]] = shutil.which,
+    configured_paths: Optional[Dict[str, str]] = None,
+    path_exists: Callable[[str], bool] = os.path.exists,
+) -> List[BackendExecutable]:
+    """Read-only discovery of which backend launch executables are installed.
+
+    Pure PATH / filesystem-existence lookups: no subprocess, no endpoint I/O,
+    no mutation.  An explicit ``configured_paths[backend]`` entry is checked
+    for existence and takes precedence over the PATH lookup; a configured
+    path that is absent yields ``not_configured`` rather than silently
+    falling back.  Results keep ``_BACKEND_EXECUTABLES`` order.
+    """
+    configured = configured_paths or {}
+    results: List[BackendExecutable] = []
+    for backend, executable_name in _BACKEND_EXECUTABLES:
+        explicit = configured.get(backend)
+        if explicit:
+            if path_exists(explicit):
+                results.append(BackendExecutable(backend, True, explicit, "installed", "configured"))
+            else:
+                results.append(BackendExecutable(backend, False, None, "not_configured", "configured"))
+            continue
+        found = which_fn(executable_name)
+        if found:
+            results.append(BackendExecutable(backend, True, found, "installed", "path"))
+        else:
+            results.append(BackendExecutable(backend, False, None, "not_installed", "path"))
+    return results
 
 
 def _is_local(endpoint: str) -> bool:
