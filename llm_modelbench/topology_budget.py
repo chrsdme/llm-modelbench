@@ -87,7 +87,10 @@ class GPUMemoryBudget:
             return None
         # Only explicitly selected-runtime residency is reclaimable.  In
         # particular, unrelated CUDA processes never enter this calculation.
-        ceiling = min(value for value in (self.policy_ceiling_bytes, self.backend_usable_limit_bytes) if value is not None) if any(value is not None for value in (self.policy_ceiling_bytes, self.backend_usable_limit_bytes)) else None
+        # Reclaim can raise capacity back toward -- but never past -- the fixed
+        # §4 safety ceiling or any explicit operator/backend cap.
+        caps = [value for value in (self.policy_ceiling_bytes, self.backend_usable_limit_bytes, self.safe_capacity_bytes) if value is not None]
+        ceiling = min(caps) if caps else None
         value = now + self.runtime_reclaimable_bytes
         return min(value, ceiling) if ceiling is not None else value
 
@@ -222,8 +225,19 @@ def evaluate_workload_fit(topology: TopologyBudget, *, weight_bytes: Optional[in
                 break
         ordered = tuple(item.uuid for item in subset)
         return WorkloadFit("multi_gpu_conditional_fit", ordered, required, unknown or ("per_device_overhead_distribution",), "no single GPU fits; layer split is conditional")
-    if allow_cpu_spill:
-        return WorkloadFit("cpu_spill_required", (), required, unknown, "GPU topology cannot safely fit the workload without CPU/RAM spill")
-    if eligible and known_total > aggregate:
+    # A no-fit is only "proven" when every eligible device reported real
+    # capacity: the known workload lower bound (unknown components excluded)
+    # still exceeds the pool.  Unknown capacity is never a no-fit.
+    every_capacity_known = bool(eligible) and all(item.effective_now_bytes is not None for item in eligible)
+    proven_no_fit = every_capacity_known and known_total > aggregate
+    if allow_cpu_spill and proven_no_fit:
+        # §11: the configured GPU pool holds the resident portion; only the
+        # overflow spills to host RAM.  Never spill while leaving usable GPU
+        # capacity idle, and never spill merely because capacity is unknown --
+        # that would let RAM spill silently enable itself (§6).
+        resident = tuple(item.uuid for item in eligible)
+        return WorkloadFit("cpu_spill_required", resident, required, unknown,
+                           "workload exceeds the configured GPU pool; overflow requires explicit host-RAM spill")
+    if proven_no_fit:
         return WorkloadFit("confirmed_no_fit", (), required, (), "known complete workload exceeds eligible GPU capacity")
     return WorkloadFit("unknown", (), required, unknown or ("no_eligible_gpu_capacity",), "topology capacity is unavailable or workload is incomplete")

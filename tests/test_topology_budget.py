@@ -38,10 +38,10 @@ def test_policy_and_live_free_clamp_without_a_display_penalty():
     assert first.effective_now_bytes // MIB == 14353
     # U3060: min(policy 11776, live-free 11000, safe 10813) -> safe wins.
     assert second.effective_now_bytes // MIB == 10813
-    # Display activity is still not a tax: the only reason effective drops below
-    # live-free here is the safety ceiling, not the active display.
-    display = topology_from_inventory(_inventory(), live_by_uuid_mib={U5060: {"free": 15000, "display_active": True}})
-    assert display.devices[0].effective_now_bytes // MIB == 14353
+    # Display activity is still not a tax: a live-free reading below the safety
+    # ceiling is honoured as-is, whether or not the display is active.
+    display = topology_from_inventory(_inventory(), live_by_uuid_mib={U5060: {"free": 12000, "display_active": True}})
+    assert display.devices[0].effective_now_bytes // MIB == 12000
 
 
 def test_safe_vram_fraction_is_a_single_fixed_constant_in_the_frozen_window():
@@ -142,6 +142,36 @@ def test_infeasible_pool_is_no_fit_not_a_silent_ram_spill():
     fit = evaluate_workload_fit(topology, weight_bytes=40 * 1024**3)
     assert fit.classification == "confirmed_no_fit"
     assert fit.selected_gpu_uuids == ()
+
+
+def test_ram_spill_selects_the_whole_gpu_pool_never_leaves_capacity_idle():
+    # Workload exceeds the combined pool; with spill explicitly permitted the
+    # resident portion still occupies every configured GPU (§11), the overflow
+    # is what spills.
+    topology = _topology()
+    fit = evaluate_workload_fit(topology, weight_bytes=40 * 1024**3, allow_cpu_spill=True)
+    assert fit.classification == "cpu_spill_required"
+    assert set(fit.selected_gpu_uuids) == {U5060, U3060}
+
+
+def test_ram_spill_never_fires_on_unknown_gpu_capacity():
+    from llm_modelbench.topology_budget import GPUMemoryBudget, TopologyBudget
+
+    # No installed capacity, no live-free: capacity is simply unknown.  Spill
+    # must not silently enable itself (§6) -- the answer is "unknown", not
+    # "cpu_spill_required".
+    blind = TopologyBudget((
+        GPUMemoryBudget(U5060, "00000000:01:00.0", None, physical_index=0),
+        GPUMemoryBudget(U3060, "00000000:09:00.0", None, physical_index=1),
+    ))
+    fit = evaluate_workload_fit(blind, weight_bytes=40 * 1024**3, allow_cpu_spill=True)
+    assert fit.classification == "unknown"
+    assert fit.selected_gpu_uuids == ()
+
+
+def test_ram_spill_off_by_default_even_when_the_pool_cannot_fit():
+    topology = _topology()
+    assert evaluate_workload_fit(topology, weight_bytes=40 * 1024**3).classification == "confirmed_no_fit"
 
 
 def test_aggregate_override_and_legacy_cap_are_operator_only():
