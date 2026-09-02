@@ -22,9 +22,12 @@ single named upstream:
   skipped depths are never counted). This module reads that field, it
   does not recompute the prefix.
 * fastest observed -- ``tps`` on prior benchmark rows, scoped to a single
-  ``benchmark_binding_key`` (a cross-binding / cross-protocol speed
-  ranking is explicitly disallowed). Resolved by a separate helper that
-  never reads binding artifacts.
+  ``BenchmarkProtocol`` identity (the comparability boundary -- a
+  cross-protocol speed ranking is explicitly disallowed). The winning row
+  keeps its own ``benchmark_binding_key`` / ``task``, so a fast run under
+  a different runtime profile than the canonical one is surfaced as
+  history -- never substituted for the canonical runtime. Resolved by a
+  separate helper that never reads binding artifacts.
 * lowest VRAM observed -- **unavailable**. ``vram_peak_mb`` is recorded
   only on needle / context-profile probe rows, keyed by context depth and
   not bound to a ``benchmark_binding_key``; it is context-depth telemetry,
@@ -267,26 +270,32 @@ def _fastest_observed(
     model: str,
     runs_dir: Optional[Path],
     *,
-    binding_key: Optional[str],
+    protocol_identity_key: Optional[str],
 ) -> Dict[str, Any]:
     """Highest ``tps`` on a prior benchmark row for this model, scoped to a
-    single ``benchmark_binding_key``. This helper never reads binding
-    artifacts -- it is deliberately disjoint from
-    :func:`_prior_canonical_runtime` (section 20).
+    single ``BenchmarkProtocol`` identity (the comparability boundary --
+    section 8), NOT to the canonical binding. The winning row keeps its own
+    ``benchmark_binding_key`` / ``task``, so a fastest observation under a
+    *different* runtime profile than the canonical one is surfaced as
+    exactly that -- history under a comparable protocol -- and is never
+    conflated with, or substituted for, the canonical runtime (section 20).
 
-    Without a resolvable ``binding_key`` the scope for a comparable speed
-    number is undefined, so the result is ``unavailable`` rather than a
-    blind cross-configuration maximum (section 8).
+    This helper never reads ``benchmark_bindings.json`` -- it is
+    deliberately disjoint from :func:`_prior_canonical_runtime`.
+
+    Without a resolvable protocol identity the comparability scope is
+    undefined, so the result is ``unavailable`` rather than a blind
+    cross-protocol maximum.
     """
-    if not binding_key:
-        return {"status": _UNAVAILABLE, "reason": "no_binding_scope_for_comparable_throughput"}
+    if not protocol_identity_key:
+        return {"status": _UNAVAILABLE, "reason": "no_protocol_scope_for_comparable_throughput"}
     best_tps: Optional[float] = None
     best_row: Optional[Dict[str, Any]] = None
     for run_dir in _iter_run_dirs(runs_dir):
         for row in _read_jsonl(run_dir / "raw_results.jsonl"):
             if row.get("model") != model:
                 continue
-            if row.get("benchmark_binding_key") != binding_key:
+            if row.get("benchmark_protocol_identity_key") != protocol_identity_key:
                 continue
             if row.get("error_kind"):
                 continue
@@ -299,12 +308,13 @@ def _fastest_observed(
                     "run_id": run_dir.name,
                     "task": row.get("task"),
                     "tps": float(tps),
-                    "benchmark_binding_key": binding_key,
+                    "benchmark_binding_key": row.get("benchmark_binding_key"),
+                    "benchmark_protocol_identity_key": protocol_identity_key,
                     "benchmark_protocol_id": row.get("benchmark_protocol_id"),
                     "benchmark_protocol_version": row.get("benchmark_protocol_version"),
                 }
     if best_row is None:
-        return {"status": _UNAVAILABLE, "reason": "no_throughput_rows_for_binding"}
+        return {"status": _UNAVAILABLE, "reason": "no_throughput_rows_for_protocol"}
     best_row["status"] = "resolved"
     return best_row
 
@@ -424,22 +434,18 @@ def build_model_selection_context(
             active_protocol.get("benchmark_protocol_identity_key")
             if active_protocol else None
         )
-        active_binding_key = (
-            active_protocol.get("active_binding_key") if active_protocol else None
-        )
 
         canonical = _prior_canonical_runtime(
             model, runs_dir, active_protocol_identity_key=active_proto_key
         )
         largest_ctx = _largest_verified_context(model, runs_dir)
-        # Fastest is scoped to the canonical binding when one resolved,
-        # else to the active binding, else unavailable.
-        speed_binding_key = None
-        if canonical.get("status") == "resolved":
-            speed_binding_key = canonical.get("binding_key")
-        elif active_binding_key:
-            speed_binding_key = active_binding_key
-        fastest = _fastest_observed(model, runs_dir, binding_key=speed_binding_key)
+        # Fastest is scoped to the *protocol* (the comparability boundary),
+        # NOT to the canonical binding -- so a fast historical run under a
+        # non-canonical runtime profile is still surfaced as history and is
+        # never conflated with the canonical runtime (section 20).
+        fastest = _fastest_observed(
+            model, runs_dir, protocol_identity_key=active_proto_key
+        )
         lowest_vram = _lowest_vram_observed(model)
 
         families = list(entry.get("families") or [])
@@ -512,32 +518,55 @@ def _coerce_trust_class(value: Any) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
-def render_model_selection_context(context: ModelSelectionContext, *, max_models: int = 40) -> str:
+def render_model_selection_context(context: Any, *, max_models: int = 40) -> str:
     """Concise operator-facing block for the pre-run plan. Stable
     identifiers are included for diagnostics; full internal hashes are not
-    dumped."""
-    if not context.observations:
+    dumped.
+
+    Accepts either a :class:`ModelSelectionContext` or its ``to_dict()``
+    payload -- ``planner.render_plan`` reads the plan dict back, so taking
+    the dict directly avoids a field-by-field dataclass reconstruction
+    that would silently drop any newly added field.
+    """
+    if isinstance(context, ModelSelectionContext):
+        payload = context.to_dict()
+    elif isinstance(context, Mapping):
+        payload = context
+    else:
+        return ""
+    observations = list(payload.get("observations") or [])
+    if not observations:
         return ""
     lines = ["", "Prior model knowledge", "---------------------"]
-    for obs in context.observations[:max_models]:
-        lines.append(f"{obs.model}  [{'known' if obs.known else 'new / unmeasured'}]")
-        fams = ", ".join(obs.measured_capability_families) or "unmeasured"
+    for obs in observations[:max_models]:
+        known = bool(obs.get("known"))
+        lines.append(f"{obs.get('model')}  [{'known' if known else 'new / unmeasured'}]")
+        fams = ", ".join(obs.get("measured_capability_families") or []) or "unmeasured"
         lines.append(f"  measured capabilities: {fams}")
-        if obs.evidence_trust_class:
-            lines.append(f"  evidence trust: {obs.evidence_trust_class}")
-        lines.append(f"  canonical benchmark runtime: {_render_canonical(obs.canonical_benchmark_runtime)}")
-        if obs.active_protocol_identity:
-            proto = obs.active_protocol_identity
+        if obs.get("evidence_trust_class"):
+            lines.append(f"  evidence trust: {obs.get('evidence_trust_class')}")
+        lines.append(
+            f"  canonical benchmark runtime: "
+            f"{_render_canonical(obs.get('canonical_benchmark_runtime') or {})}"
+        )
+        proto = obs.get("active_protocol_identity")
+        if proto:
             lines.append(
                 f"  active protocol: {proto.get('protocol_id')} v{proto.get('version')}"
             )
-        lines.append(f"  largest verified context: {_render_largest_ctx(obs.largest_verified_context)}")
-        lines.append(f"  fastest observed: {_render_fastest(obs.fastest_observed)}")
-        lines.append(f"  lowest VRAM observed: unavailable ({obs.lowest_vram_observed.get('reason')})")
-        for warning in obs.warnings:
+        lines.append(
+            f"  largest verified context: "
+            f"{_render_largest_ctx(obs.get('largest_verified_context') or {})}"
+        )
+        lines.append(f"  fastest observed: {_render_fastest(obs.get('fastest_observed') or {})}")
+        lines.append(
+            f"  lowest VRAM observed: unavailable "
+            f"({(obs.get('lowest_vram_observed') or {}).get('reason')})"
+        )
+        for warning in obs.get("warnings") or []:
             lines.append(f"  WARN: {warning}")
-    if len(context.observations) > max_models:
-        lines.append(f"... {len(context.observations) - max_models} more models")
+    if len(observations) > max_models:
+        lines.append(f"... {len(observations) - max_models} more models")
     return "\n".join(lines)
 
 

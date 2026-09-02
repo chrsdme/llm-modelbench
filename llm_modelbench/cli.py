@@ -1104,7 +1104,20 @@ def cmd_campaign(args, cfg):
         try:
             client = _client(args, cfg)
             selected = _resolve_model_selection(args, client)
-            accepted_plan = _plan_for_args(args, cfg, client, selected_models=selected)
+            # Anvil Stage 3.6: thread runtime identities so the accepted
+            # campaign plan resolves the active protocol and canonical
+            # benchmark runtime instead of deferring it (section 30). When
+            # no explicit selection filter is given, the campaign manifest
+            # is the model set.
+            _identity_models = selected or list(manifest.models)
+            _run_identities = (
+                _campaign_runtime_identities(args, cfg, _identity_models, client)
+                if _identity_models else {}
+            )
+            accepted_plan = _plan_for_args(
+                args, cfg, client, selected_models=selected,
+                runtime_identities=_run_identities,
+            )
             campaign.write_campaign_plan(paths, accepted_plan, inventory=client.tags(), capabilities=accepted_plan.get("capability_profiles") or {}, configuration={"level": args.level, "models": args.models, "judge_policy": getattr(args, "judge", "off"), "samples": args.samples, "think": args.think, "ctx": args.ctx, "num_predict": args.num_predict})
             args._accepted_plan = accepted_plan
             args._selected_models = selected
@@ -1522,12 +1535,20 @@ def cmd_wizard(args, cfg):
     if getattr(args, "judge_model", None):
         cfg.judge_model = args.judge_model
     client = _client(args, cfg)
+
+    def _wizard_runtime_identities(selected_models):
+        # Anvil Stage 3.6: bounded metadata only (same helper the run/
+        # campaign paths use); lets the wizard's plan resolve the active
+        # protocol / canonical benchmark runtime instead of deferring it.
+        return _campaign_runtime_identities(args, cfg, list(selected_models), client)
+
     plan, options = wizard.interactive_plan(
         client, cfg,
         initial_level=args.level,
         judge_mode=args.judge,
         initial_categories=_categories(args),
         initial_task_ids=_task_ids(args),
+        runtime_identity_resolver=_wizard_runtime_identities,
         plan_kwargs={
             "include": args.include_regex,
             "exclude": args.exclude_regex,

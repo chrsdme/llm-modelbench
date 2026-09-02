@@ -33,8 +33,18 @@ def interactive_plan(
     initial_categories: Optional[List[str]] = None,
     initial_task_ids: Optional[List[str]] = None,
     plan_kwargs: Optional[Dict[str, Any]] = None,
+    runtime_identity_resolver: Optional[Any] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Return an accepted plan and the options used to construct it."""
+    """Return an accepted plan and the options used to construct it.
+
+    ``runtime_identity_resolver``, when supplied, is called with the
+    current model selection each time the plan is rebuilt and must return
+    a ``{model: RuntimeIdentity}`` map. It lets ``build_plan`` resolve the
+    active BenchmarkProtocol / canonical benchmark runtime for the Stage
+    3.6 prior-knowledge surface instead of deferring it (section 30). A
+    resolver failure is non-fatal -- the plan is built without identities
+    and canonical runtime is surfaced as deferred.
+    """
     _require_tty()
     installed = [row.get("name") for row in client.tags() if row.get("name")]
     if not installed:
@@ -50,6 +60,12 @@ def interactive_plan(
     fixed = dict(plan_kwargs or {})
 
     while True:
+        run_identities: Dict[str, Any] = {}
+        if runtime_identity_resolver is not None:
+            try:
+                run_identities = dict(runtime_identity_resolver(selected) or {})
+            except Exception:
+                run_identities = {}
         plan = build_plan(
             client,
             cfg,
@@ -61,6 +77,7 @@ def interactive_plan(
             selected_models=selected,
             auto_probe=True,
             capability_profiles=profiles,
+            runtime_identities=run_identities,
         )
         print("\n" + render_plan(plan))
         print("\nWizard actions:")

@@ -278,38 +278,12 @@ def render_plan(plan: Dict[str, Any], *, max_models: int = 80, max_skips: int = 
     # Anvil Stage 3.6: prior-model knowledge, surfaced before finalization.
     selection_context = plan.get("model_selection_context")
     if selection_context:
-        from .model_selection_context import (
-            ModelSelectionContext,
-            ModelObservation,
-            render_model_selection_context,
-        )
+        from .model_selection_context import render_model_selection_context
 
-        observations = [
-            ModelObservation(
-                model=str(obs.get("model")),
-                known=bool(obs.get("known")),
-                measured_capability_families=list(obs.get("measured_capability_families") or []),
-                capability_warnings=list(obs.get("capability_warnings") or []),
-                capability_evidence_hash=obs.get("capability_evidence_hash"),
-                native_legacy_capability_disagreements=list(
-                    obs.get("native_legacy_capability_disagreements") or []
-                ),
-                evidence_trust_class=obs.get("evidence_trust_class"),
-                active_protocol_identity=obs.get("active_protocol_identity"),
-                canonical_benchmark_runtime=dict(obs.get("canonical_benchmark_runtime") or {}),
-                largest_verified_context=dict(obs.get("largest_verified_context") or {}),
-                fastest_observed=dict(obs.get("fastest_observed") or {}),
-                lowest_vram_observed=dict(obs.get("lowest_vram_observed") or {}),
-                warnings=list(obs.get("warnings") or []),
-            )
-            for obs in selection_context.get("observations") or []
-        ]
-        rendered = render_model_selection_context(
-            ModelSelectionContext(
-                schema_version=int(selection_context.get("schema_version") or 1),
-                observations=observations,
-            )
-        )
+        # render_model_selection_context takes the plan-dict payload
+        # directly -- no dataclass reconstruction, so a new observation
+        # field can never be silently dropped on the way to the operator.
+        rendered = render_model_selection_context(selection_context)
         if rendered:
             lines.append(rendered)
     return "\n".join(lines)

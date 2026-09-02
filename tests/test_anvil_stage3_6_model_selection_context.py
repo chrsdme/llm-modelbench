@@ -61,10 +61,12 @@ def _binding_entry(*, binding_key: str, proto_key: str, profile_key: str,
 
 
 def _bench_row(model: str, *, task: str, tps: float, binding_key: str,
+               proto_key: str = "proto-v1-key",
                protocol_id: str = "llm-modelbench-core", version: str = "1") -> dict:
     return {
         "model": model, "task": task, "tps": tps, "error_kind": None,
         "benchmark_binding_key": binding_key,
+        "benchmark_protocol_identity_key": proto_key,
         "benchmark_protocol_id": protocol_id, "benchmark_protocol_version": version,
     }
 
@@ -227,7 +229,8 @@ def test_canonical_is_not_substituted_by_a_faster_other_profile(tmp_path):
     )
 
     # canonical resolves to the most recent binding artifact; force run_canonical newer
-    import os, time
+    import os
+    import time
     newer = runs / "run_canonical" / "benchmark_bindings.json"
     os.utime(newer, (time.time() + 100, time.time() + 100))
 
@@ -236,13 +239,16 @@ def test_canonical_is_not_substituted_by_a_faster_other_profile(tmp_path):
     assert canonical["status"] == "resolved"
     assert canonical["binding_key"] == "bk-A"
 
-    # fastest is a SEPARATE helper, scoped to the canonical binding -- it
-    # reports the A number (20.0), NOT the faster B number (99.0), and B is
-    # never promoted to canonical.
-    fastest = _fastest_observed("m", runs, binding_key=canonical["binding_key"])
+    # fastest is a SEPARATE helper scoped to the *protocol*, not the
+    # canonical binding. It surfaces the genuinely fastest observation
+    # (99.0 under bk-B) AS HISTORY, tagged with B's own binding key -- so
+    # the two facts are disjoint and visible: canonical is bk-A, and the
+    # fastest run happened under bk-B. B is never promoted to canonical.
+    fastest = _fastest_observed("m", runs, protocol_identity_key=proto_key)
     assert fastest["status"] == "resolved"
-    assert fastest["tps"] == 20.0
-    assert fastest["benchmark_binding_key"] == "bk-A"
+    assert fastest["tps"] == 99.0
+    assert fastest["benchmark_binding_key"] == "bk-B"
+    assert fastest["benchmark_binding_key"] != canonical["binding_key"]
 
     # and through the full builder with a pinned active protocol
     monkeypatch_proto = {
@@ -260,19 +266,21 @@ def test_canonical_is_not_substituted_by_a_faster_other_profile(tmp_path):
     finally:
         msc_mod._active_protocol_identity = orig
     obs = ctx.by_model["m"]
+    # canonical stays bk-A; fastest is surfaced separately as the bk-B run
     assert obs.canonical_benchmark_runtime["binding_key"] == "bk-A"
-    assert obs.fastest_observed["tps"] == 20.0
+    assert obs.fastest_observed["tps"] == 99.0
+    assert obs.fastest_observed["benchmark_binding_key"] == "bk-B"
 
 
 def test_fastest_helper_never_reads_binding_artifacts(tmp_path):
-    """Structural: _fastest_observed only takes a binding_key string."""
+    """Structural: _fastest_observed only takes a protocol identity key."""
     runs = tmp_path / "runs"
     _write_run(runs, "r", rows=[_bench_row("m", task="t", tps=10.0, binding_key="bk")])
     # no benchmark_bindings.json written at all
-    out = _fastest_observed("m", runs, binding_key="bk")
+    out = _fastest_observed("m", runs, protocol_identity_key="proto-v1-key")
     assert out["status"] == "resolved" and out["tps"] == 10.0
     # and with no scope -> unavailable, not a blind max
-    assert _fastest_observed("m", runs, binding_key=None)["status"] == "unavailable"
+    assert _fastest_observed("m", runs, protocol_identity_key=None)["status"] == "unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +392,7 @@ def test_canonical_deferred_when_active_protocol_unknown(tmp_path):
 def test_building_context_does_not_mutate_prior_run_evidence(tmp_path):
     runs = tmp_path / "runs"
     proto_key = "pk"
-    run = _write_run(
+    _write_run(
         runs, "run_a",
         bindings={"m": _binding_entry(binding_key="bk", proto_key=proto_key, profile_key="rp")},
         rows=[
@@ -392,11 +400,20 @@ def test_building_context_does_not_mutate_prior_run_evidence(tmp_path):
             _needle_row("m", max_verified_ctx=32768),
         ],
     )
-    before = {
-        p.name: p.read_bytes()
-        for p in run.iterdir() if p.is_file()
-    }
-    mtimes = {p.name: p.stat().st_mtime_ns for p in run.iterdir() if p.is_file()}
+    # Snapshot the WHOLE runs_dir tree (not just one run dir) so a new file
+    # appearing anywhere under it -- including an EvidenceLedger -- is caught.
+    def _tree():
+        return {
+            str(p.relative_to(runs)): p.read_bytes()
+            for p in sorted(runs.rglob("*")) if p.is_file()
+        }
+    def _tree_mtimes():
+        return {
+            str(p.relative_to(runs)): p.stat().st_mtime_ns
+            for p in sorted(runs.rglob("*")) if p.is_file()
+        }
+
+    before, mtimes = _tree(), _tree_mtimes()
 
     for _ in range(3):
         build_model_selection_context(
@@ -405,9 +422,11 @@ def test_building_context_does_not_mutate_prior_run_evidence(tmp_path):
             models_rows={"m": {"name": "m"}},
         )
 
-    after = {p.name: p.read_bytes() for p in run.iterdir() if p.is_file()}
-    assert after == before
-    assert {p.name: p.stat().st_mtime_ns for p in run.iterdir() if p.is_file()} == mtimes
+    assert _tree() == before
+    assert _tree_mtimes() == mtimes
+    # explicitly: no EvidenceLedger was created under runs_dir
+    from llm_modelbench.capability_reprobe_execute import default_ledger_path
+    assert not Path(default_ledger_path(runs)).exists()
 
 
 def test_corrupt_prior_evidence_is_fail_soft(tmp_path):
@@ -462,6 +481,63 @@ def test_context_rides_the_plan_dict_via_build_plan(tmp_path):
     assert "Prior model knowledge" in text
 
 
+def test_confirm_plan_route_renders_context_for_a_pre_accepted_plan(tmp_path):
+    """Section 14: the wizard / campaign-run route sets ``args._accepted_plan``
+    and never rebuilds the plan; ``_confirm_plan`` -> ``render_plan`` must
+    still surface the prior-knowledge block from the persisted dict."""
+    from llm_modelbench.config import Config
+    from llm_modelbench.ollama import MockClient
+    from llm_modelbench.planner import build_plan
+    from llm_modelbench import cli
+
+    cfg = Config()
+    cfg.vram_budget_gb = 12.0
+    plan = build_plan(
+        MockClient(), cfg, level="smoke", sample_mode="smart", auto_probe=True,
+        runs_dir=tmp_path / "runs",
+    )
+    assert "model_selection_context" in plan
+
+    import io
+    import contextlib
+
+    class _Args:
+        yes = True
+        plan_json = None
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cli._confirm_plan(_Args(), plan)
+    assert "Prior model knowledge" in buf.getvalue()
+
+
+def test_render_drops_no_field_when_observation_schema_grows():
+    """Section 14 regression guard: the renderer takes the plan dict
+    directly, so adding an observation field cannot silently vanish before
+    it reaches the operator."""
+    from llm_modelbench.model_selection_context import render_model_selection_context
+
+    payload = {
+        "schema_version": 1,
+        "observations": [{
+            "model": "m", "known": True,
+            "measured_capability_families": ["text"],
+            "evidence_trust_class": "historical_valid",
+            "canonical_benchmark_runtime": {"status": "deferred_pending_protocol_resolution"},
+            "largest_verified_context": {"status": "resolved", "max_verified_ctx": 8192, "run_id": "r"},
+            "fastest_observed": {"status": "unavailable", "reason": "x"},
+            "lowest_vram_observed": {"status": "unavailable", "reason": "y"},
+            "warnings": ["a warning line"],
+            "a_future_field_the_dataclass_does_not_have": 123,
+        }],
+    }
+    text = render_model_selection_context(payload)
+    assert "m  [known]" in text
+    assert "8192 tokens" in text
+    assert "a warning line" in text
+    assert "historical_valid" in text
+
+
 def test_end_to_end_real_protocol_resolution_matches_real_binding(tmp_path):
     """No monkeypatch: build a real BenchmarkRuntimeBinding for the active
     run, write a prior run whose binding artifact carries the SAME real
@@ -495,7 +571,8 @@ def test_end_to_end_real_protocol_resolution_matches_real_binding(tmp_path):
         }},
     }))
     (run / "raw_results.jsonl").write_text(
-        json.dumps(_bench_row("m", task="rag", tps=33.0, binding_key=real_binding_key)) + "\n"
+        json.dumps(_bench_row("m", task="rag", tps=33.0, binding_key=real_binding_key,
+                              proto_key=real_proto_key)) + "\n"
         + json.dumps(_needle_row("m", max_verified_ctx=65536)) + "\n"
     )
 
