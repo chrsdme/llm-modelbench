@@ -16,7 +16,7 @@ from .backend import (
     BackendCapabilities, BackendCapability, BackendCapabilityError,
     BackendIdentity, CapabilityStatus,
 )
-from .identity import RuntimeProfileIdentity
+from .identity import RuntimeProfileIdentity, resolve_runtime_profile_identity
 
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_ERROR_BYTES = 8192
@@ -597,8 +597,18 @@ class LlamaCppBackendAdapter:
             return False
 
     def runtime_profile_identity(self) -> RuntimeProfileIdentity:
+        # Anvil Stage 3.4B: supply the two known facts (backend + version) to
+        # the shared identity.resolve_runtime_profile_identity factory rather
+        # than minting a RuntimeProfileIdentity with adapter-local semantics
+        # (§2, §11). No resolved RuntimeExecutionSettings recipe exists at
+        # this layer -> execution_settings=None -> runtime_configuration_hash
+        # / gpu_policy honestly left None.
         try:
             backend_version = self.client.version()
         except Exception:
             backend_version = None
-        return RuntimeProfileIdentity(backend="llama_cpp", backend_version=backend_version)
+        return resolve_runtime_profile_identity(
+            backend="llama_cpp",
+            backend_version=backend_version,
+            execution_settings=None,
+        )

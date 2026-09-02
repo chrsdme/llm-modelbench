@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Mapping, Optional, Protocol, runtime_checkable
 
-from .identity import RuntimeProfileIdentity
+from .identity import RuntimeProfileIdentity, resolve_runtime_profile_identity
 
 
 class CapabilityStatus(str, Enum):
@@ -235,15 +235,25 @@ class OllamaBackendAdapter:
             return False
 
     def runtime_profile_identity(self) -> RuntimeProfileIdentity:
-        """Best-effort today: only backend + version are actually known at
-        this layer. template_hash/protocol_version/gpu_policy population is
-        real Stage 2+ work (capability probing needs to happen first to
-        derive a template hash), not invented here."""
+        """Only backend + version are known at this adapter layer. Anvil
+        Stage 3.4B: this supplies those two facts to the shared
+        ``identity.resolve_runtime_profile_identity`` factory rather than
+        constructing a ``RuntimeProfileIdentity`` with its own semantics --
+        one derivation, several fact-suppliers (§2, §11). No resolved
+        ``RuntimeExecutionSettings`` recipe exists here, so
+        ``execution_settings`` is ``None`` and the factory leaves
+        ``runtime_configuration_hash`` / ``gpu_policy`` honestly ``None``.
+        template_hash/protocol_version population is real later-stage work
+        (capability probing must run first to derive a template hash)."""
         try:
             backend_version = self.client.version()
         except Exception:
             backend_version = None
-        return RuntimeProfileIdentity(backend=self.backend_identity().backend, backend_version=backend_version)
+        return resolve_runtime_profile_identity(
+            backend=self.backend_identity().backend,
+            backend_version=backend_version,
+            execution_settings=None,
+        )
 
 
 class MockBackendAdapter(OllamaBackendAdapter):

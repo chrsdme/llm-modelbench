@@ -177,19 +177,36 @@ def resolve_runtime_profile_identity(
     ``protocol_version``/``template_hash``/``feature_flags`` stay ``None``/
     empty unless a real source is supplied -- ``backend.py`` already declares
     template-hash derivation as later-stage work; nothing is invented here.
+
+    ``execution_settings=None`` (Anvil Stage 3.4B): the caller has **no
+    resolved runtime recipe** -- e.g. the capability-evidence path, where
+    ``interrogate_model`` never receives one. In that case
+    ``runtime_configuration_hash`` and ``gpu_policy`` are left ``None`` rather
+    than fabricated. Hashing seven ``"unset"`` sentinels would mint a
+    *concrete-looking* recipe hash that no run measured, and -- worse --
+    every recipe-less caller would share that one hash, so a minimal identity
+    could collide with (or be mistaken for) a genuinely rich one whose recipe
+    fields all happened to be unset. A recipe-less identity is honestly
+    distinguished by ``runtime_configuration_hash is None`` /
+    ``gpu_policy is None`` in the canonical serialization (§7, §14).
     """
-    recipe: Dict[str, Any] = {}
-    for name in _RUNTIME_RECIPE_SETTINGS:
-        value = getattr(execution_settings, name, None) if execution_settings is not None else None
-        recipe[name] = _RUNTIME_SETTING_UNSET if value is None else value
-    runtime_configuration_hash = _stable_hash("runtime_recipe_v1", recipe)
+    if execution_settings is None:
+        runtime_configuration_hash = None
+        gpu_policy = None
+    else:
+        recipe: Dict[str, Any] = {}
+        for name in _RUNTIME_RECIPE_SETTINGS:
+            value = getattr(execution_settings, name, None)
+            recipe[name] = _RUNTIME_SETTING_UNSET if value is None else value
+        runtime_configuration_hash = _stable_hash("runtime_recipe_v1", recipe)
+        gpu_policy = GPU_PLACEMENT_POLICY
     return RuntimeProfileIdentity(
         backend=backend,
         backend_version=backend_version,
         protocol_version=protocol_version,
         template_hash=template_hash,
         runtime_configuration_hash=runtime_configuration_hash,
-        gpu_policy=GPU_PLACEMENT_POLICY,
+        gpu_policy=gpu_policy,
         feature_flags=tuple(feature_flags),
     )
 

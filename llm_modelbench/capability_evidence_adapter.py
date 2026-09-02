@@ -123,7 +123,7 @@ from .capability_projection import (
 )
 from .classify import FAMILY_ORDER
 from .evidence import EvidenceLedger
-from .identity import ModelArtifactIdentity, RuntimeProfileIdentity
+from .identity import ModelArtifactIdentity, RuntimeProfileIdentity, resolve_runtime_profile_identity
 
 __all__ = [
     "TypedLegacyIdentity",
@@ -203,8 +203,20 @@ def typed_identity_from_capability_identity(
         template_hash = _stable_hash(template_config)
     else:
         template_hash = None
-    runtime_profile_identity = RuntimeProfileIdentity(
+    # Anvil Stage 3.4B: derive the identity through the shared
+    # ``identity.resolve_runtime_profile_identity`` factory rather than a
+    # hand-rolled constructor, so the capability and benchmark-binding paths
+    # converge on one derivation (§2). The capability probe path has no
+    # resolved ``RuntimeExecutionSettings`` recipe -- ``interrogate_model``
+    # never receives one -- so ``execution_settings`` is ``None`` and the
+    # factory honestly leaves ``runtime_configuration_hash`` / ``gpu_policy``
+    # ``None`` (§7). ``backend`` / ``protocol_version`` / ``template_hash``
+    # are the three fields the probe path genuinely knows. The resulting
+    # identity is byte-identical to the previous hand-built one (same fields,
+    # same ``stable_key()``), so no stored ledger row or fixture changes.
+    runtime_profile_identity = resolve_runtime_profile_identity(
         backend=str(backend_info.get("backend") or "unknown"),
+        execution_settings=None,
         protocol_version=resolved_protocol_version,
         template_hash=template_hash,
     )
