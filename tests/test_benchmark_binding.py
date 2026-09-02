@@ -221,7 +221,10 @@ def test_fresh_run_writes_the_immutable_model_keyed_artifact(tmp_path):
     assert art["schema_version"] == 1
     assert set(art["bindings"]) == {"m1"}
     assert "resume_divergent_bindings" not in art
-    # A fresh (non-resume) write is unconditional even if a file is already there.
+    # A fresh (non-resume) write is unconditional even if a file is already
+    # there, and re-deriving the same bindings yields byte-identical output
+    # (binding_to_dict is deterministic). The immutability guarantee proper --
+    # `bindings` never being rewritten -- lives on the resume=True branch.
     before = (tmp_path / "benchmark_bindings.json").read_text()
     _persist_benchmark_bindings(tmp_path, bindings, resume=False)
     assert (tmp_path / "benchmark_bindings.json").read_text() == before
