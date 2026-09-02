@@ -386,7 +386,17 @@ def collect_runtime_identity(*, client: object, profile: object, model_name: str
     if selected:
         uuids = selected
         pci = tuple(item for item in pci if item[0] in set(selected))
-    settings = execution or RuntimeExecutionSettings(context_size=getattr(config, "ctx_override", None))
+    # Anvil Stage 3.2C-2b: the resolved RAM-spill *permission* (not the actual
+    # resulting placement) is identity-bearing -- a campaign resumed with spill
+    # newly permitted is not automatically equivalent to its original execution
+    # (amendment §6; runtime-identity `spill_policy_changed`).  Only an explicit
+    # grant is recorded: an absent/false permission stays None, identical to the
+    # historical default, so ordinary runs keep a stable identity hash.
+    _spill_permitted = bool(getattr(config, "allow_ram_spill", False))
+    settings = execution or RuntimeExecutionSettings(
+        context_size=getattr(config, "ctx_override", None),
+        allow_cpu_spill=True if _spill_permitted else None,
+    )
     return RuntimeIdentity(
         backend=backend, adapter_identity=type(client).__name__, endpoint=endpoint,
         profile_name=profile_name, profile_provenance=provenance, profile_schema_version=1,

@@ -25,8 +25,8 @@ usage: llm-modelbench campaign run [-h] --campaign-id CAMPAIGN_ID
                                    [--resume] [--no-resume] [--yes]
                                    [--status-interval STATUS_INTERVAL]
                                    [--live-ui {off,compact,full,graph,log}]
-                                   [--strict-harness] [--unattended-safe]
-                                   [--unattended]
+                                   [--strict-harness] [--allow-ram-spill]
+                                   [--unattended-safe] [--unattended]
 
 options:
   -h, --help            show this help message and exit
@@ -99,6 +99,10 @@ options:
   --status-interval STATUS_INTERVAL
   --live-ui {off,compact,full,graph,log}
   --strict-harness
+  --allow-ram-spill     permit physical-RAM fallback only after GPU capacity
+                        is proven insufficient; conservative host-RAM
+                        preflight still gates it. No other authority is
+                        implied. Default: off
   --unattended-safe     write terminal readiness and review package without
                         host mutation
   --unattended          use the unattended decision policy: complete without

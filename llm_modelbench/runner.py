@@ -385,21 +385,62 @@ def _needle_kv_estimate(
     # The long-context gate shares runner/planner topology logic.  The legacy
     # scalar remains in the evidence for backward-compatible reports only.
     from .placement import model_placement_fit, topology_for_config
+    # Anvil Stage 3.2C-2b: RAM spill is an explicit operator override, off by
+    # default and never self-enabling (amendment §6).  It is a *fallback* after
+    # the frozen 3.2B GPU-placement decision -- it never changes which GPUs are
+    # selected when the workload already fits GPU memory (§5).
+    allow_ram_spill = bool(getattr(cfg, "allow_ram_spill", False))
+    topology = topology_for_config(cfg, inventory=gpu_inventory)
     row = {"size": model_size} if model_size is not None else {"size": None}
-    fit = model_placement_fit(row, cfg, inventory=gpu_inventory)
+    kv_cache_bytes = None
+    fit = model_placement_fit(row, cfg, inventory=gpu_inventory, allow_cpu_spill=allow_ram_spill)
     if metadata_bpt:
         from .topology_budget import evaluate_workload_fit
-        fit = evaluate_workload_fit(topology_for_config(cfg, inventory=gpu_inventory), weight_bytes=model_size,
-                                    kv_cache_bytes=int(metadata_bpt * int(wanted_ctx)))
+        kv_cache_bytes = int(metadata_bpt * int(wanted_ctx))
+        fit = evaluate_workload_fit(topology, weight_bytes=model_size,
+                                    kv_cache_bytes=kv_cache_bytes, allow_cpu_spill=allow_ram_spill)
     out["topology_fit_classification"] = fit.classification
     out["topology_fit_selected_gpu_uuids"] = list(fit.selected_gpu_uuids)
-    if fit.classification == "unknown" and budget_gb > 0 and not topology_for_config(cfg, inventory=gpu_inventory).devices:
+
+    # Host-RAM spill preflight (§7): compose the GPU fit with a conservative
+    # physical-RAM check.  The selected-pool safe capacity is derived here from
+    # the authoritative topology and passed to the preflight as a scalar -- the
+    # preflight never re-derives GPU placement.
+    from .ram_spill_preflight import resolve_spill_preflight
+    _selected = set(fit.selected_gpu_uuids)
+    _pool = [d for d in topology.devices if d.uuid in _selected]
+    _pool_caps = [d.safe_capacity_bytes for d in _pool]
+    safe_pool_capacity = (
+        sum(int(c) for c in _pool_caps) if _pool and all(c is not None for c in _pool_caps) else None
+    )
+    _known_workload = None
+    if model_size is not None:
+        _known_workload = int(model_size) + int(kv_cache_bytes or 0)
+    preflight = resolve_spill_preflight(
+        fit,
+        safe_selected_gpu_capacity_bytes=safe_pool_capacity,
+        allow_ram_spill=allow_ram_spill,
+        host_meminfo=host_memory_snapshot() or {},
+        known_workload_bytes=_known_workload,
+    )
+    out["ram_spill_allowed"] = allow_ram_spill
+    out["placement_resolution"] = preflight.resolution
+    out["placement_feasible"] = preflight.feasible
+    out["ram_spill_preflight"] = preflight.to_dict()
+
+    if fit.classification == "unknown" and budget_gb > 0 and not topology.devices:
         # Preserve the old single-GPU/manual-cap behavior where physical
         # inventory is unavailable; never use this scalar fallback on a
         # topology-bearing multi-GPU host.
         out["kv_exceeds_budget"] = bool(out.get("estimated_total_gb") and float(out["estimated_total_gb"]) > budget_gb)
     else:
-        out["kv_exceeds_budget"] = fit.classification == "confirmed_no_fit"
+        # A resolved RAM-spill placement (feasible True) is *not* "exceeds
+        # budget": the depth can run with explicitly-authorized host RAM.  A
+        # proven infeasible environment is.  Gating on the resolved preflight
+        # rather than the raw classification keeps §5/§23 intact -- spill
+        # permission must not silently un-skip a depth, and an environment
+        # no-fit must not become a needle/model failure.
+        out["kv_exceeds_budget"] = preflight.feasible is False
     return out
 
 def _needle_environment_skip(kv: Dict[str, Any], wanted_ctx: int, safe_floor: int = 32768) -> Optional[Dict[str, Any]]:

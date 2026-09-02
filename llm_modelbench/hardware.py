@@ -393,6 +393,10 @@ def _read_proc_meminfo() -> dict:
         'ram_used_pct': round((total - available) / total * 100.0, 1) if total and available is not None else None,
         'swap_total_mb': round(swap_total, 1) if swap_total is not None else None,
         'swap_used_mb': round(swap_total - swap_free, 1) if swap_total is not None and swap_free is not None else None,
+        # SwapFree is surfaced for the RAM-spill preflight (Anvil Stage 3.2C-2b),
+        # which records it as telemetry but never counts it as spill capacity
+        # (amendment §8/§12: swap contributes 0 bytes).
+        'swap_free_mb': round(swap_free, 1) if swap_free is not None else None,
     }
 
 

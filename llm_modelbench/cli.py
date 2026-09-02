@@ -555,6 +555,13 @@ def cmd_run(args, cfg):
         cfg.fingerprint = bool(args.fingerprint)
     if getattr(args, "judge_model", None):
         cfg.judge_model = args.judge_model
+    # Anvil Stage 3.2C-2b: RAM spill is an execution-time operator permission,
+    # never a persisted config field (a config file must not silently enable
+    # spill -- amendment §6).  Set it only from the explicit CLI flag; a
+    # config-file `allow_ram_spill` key is rejected by Config.load() as unknown.
+    # `campaign run` routes through cmd_run, so this is the single propagation
+    # point for both surfaces (§19).
+    cfg.allow_ram_spill = bool(getattr(args, "allow_ram_spill", False))
     # Anvil Stage 1.3: detect GPU inventory exactly once for this invocation
     # and thread it through both backend selection and runtime-identity
     # collection below, rather than letting each independently re-detect.
@@ -2011,6 +2018,9 @@ def build_parser():
     camp_run.add_argument("--status-interval", type=float, default=5.0)
     camp_run.add_argument("--live-ui", choices=["off", "compact", "full", "graph", "log"], default="compact")
     camp_run.add_argument("--strict-harness", action="store_true")
+    camp_run.add_argument("--allow-ram-spill", action="store_true",
+                          help="permit physical-RAM fallback only after GPU capacity is proven insufficient; "
+                               "conservative host-RAM preflight still gates it. No other authority is implied. Default: off")
     camp_run.add_argument("--unattended-safe", action="store_true", help="write terminal readiness and review package without host mutation")
     camp_run.add_argument("--unattended", action="store_true",
                           help="use the unattended decision policy: complete without interactive stdin where a decision "
@@ -2047,6 +2057,9 @@ def build_parser():
     r.add_argument("--strict-harness", action="store_true",
                    help="exit nonzero if any selected task ends in a harness/resource/configuration error")
     r.add_argument("--separate-ranking", action="store_true", help="write evidence and generate an isolated rankings-separate/<run-id> report instead of touching canonical rankings")
+    r.add_argument("--allow-ram-spill", action="store_true",
+                   help="permit physical-RAM fallback only after GPU capacity is proven insufficient; "
+                        "conservative host-RAM preflight still gates it. No other authority is implied. Default: off")
     r.add_argument("--unattended", action="store_true",
                    help="use the unattended decision policy: complete without interactive stdin where a decision "
                         "is explicitly safe to make automatically (e.g. a decisive backend recommendation), "

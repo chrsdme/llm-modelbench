@@ -21,7 +21,7 @@ usage: llm-modelbench run [-h] [--runtime-profile RUNTIME_PROFILE]
                           [--live-ui {off,compact,full,graph,log}]
                           [--rankings-out RANKINGS_OUT] [--no-ranking-update]
                           [--strict-harness] [--separate-ranking]
-                          [--unattended]
+                          [--allow-ram-spill] [--unattended]
 
 options:
   -h, --help            show this help message and exit
@@ -111,6 +111,10 @@ options:
   --separate-ranking    write evidence and generate an isolated rankings-
                         separate/<run-id> report instead of touching canonical
                         rankings
+  --allow-ram-spill     permit physical-RAM fallback only after GPU capacity
+                        is proven insufficient; conservative host-RAM
+                        preflight still gates it. No other authority is
+                        implied. Default: off
   --unattended          use the unattended decision policy: complete without
                         interactive stdin where a decision is explicitly safe
                         to make automatically (e.g. a decisive backend

@@ -22,12 +22,12 @@ def topology_for_config(cfg: Any, inventory: Optional[Iterable[GPUDevice]] = Non
 
 
 def model_placement_fit(model_row: dict, cfg: Any, *, inventory: Optional[Iterable[GPUDevice]] = None,
-                        selected_gpu_uuid: Optional[str] = None) -> WorkloadFit:
+                        selected_gpu_uuid: Optional[str] = None, allow_cpu_spill: bool = False) -> WorkloadFit:
     """A conservative shared decision: model weight is known; runtime/KV are not."""
     size = model_row.get("size")
     weight = int(size) if isinstance(size, (int, float)) and not isinstance(size, bool) and size >= 0 else None
     return evaluate_workload_fit(topology_for_config(cfg, inventory), weight_bytes=weight,
-                                 selected_gpu_uuid=selected_gpu_uuid)
+                                 selected_gpu_uuid=selected_gpu_uuid, allow_cpu_spill=allow_cpu_spill)
 
 
 def skip_offload_allowed(model_row: dict, cfg: Any, *, inventory: Optional[Iterable[GPUDevice]] = None) -> bool:
