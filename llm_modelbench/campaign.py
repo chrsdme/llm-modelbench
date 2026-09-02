@@ -611,11 +611,20 @@ def write_campaign_plan(paths: CampaignPaths, plan: Dict[str, Any], *, inventory
 
 
 def campaign_plan_equivalent(existing: Dict[str, Any], proposed: Dict[str, Any]) -> bool:
-    """Compare campaign plan contracts while ignoring volatile write time."""
+    """Compare campaign plan contracts while ignoring volatile write time.
+
+    ``model_selection_context`` (Anvil Stage 3.6) is a zero-authority
+    display/provenance projection over prior-run evidence, not part of the
+    plan contract -- like ``created_at`` it is excluded from equivalence so
+    that re-running ``campaign plan`` on an unchanged campaign is still a
+    no-op even if unrelated prior runs have since been written.
+    """
     left = dict(existing)
     right = dict(proposed)
     left.pop("created_at", None)
     right.pop("created_at", None)
+    left.pop("model_selection_context", None)
+    right.pop("model_selection_context", None)
     return left == right
 
 

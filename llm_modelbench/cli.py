@@ -496,7 +496,7 @@ def _require_host_code_opt_in(args, plan) -> None:
         )
 
 
-def _plan_for_args(args, cfg, client, *, selected_models=None, capability_profiles=None):
+def _plan_for_args(args, cfg, client, *, selected_models=None, capability_profiles=None, runtime_identities=None):
     from . import planner
     return planner.build_plan(
         client, cfg,
@@ -516,6 +516,7 @@ def _plan_for_args(args, cfg, client, *, selected_models=None, capability_profil
         auto_probe=bool(getattr(args, "auto", False)),
         capability_profiles=capability_profiles,
         runs_dir=Path(getattr(args, "runs_dir", None) or getattr(args, "out", None) or "runs"),
+        runtime_identities=runtime_identities,
     )
 
 
@@ -593,7 +594,8 @@ def cmd_run(args, cfg):
     _write_run_ranking_scope(out_dir, args, rankings_dir=rankings_dir)
     capability_profiles = getattr(args, "_capability_profiles", None)
     plan = getattr(args, "_accepted_plan", None) or _plan_for_args(
-        args, cfg, client, selected_models=selected_models, capability_profiles=capability_profiles
+        args, cfg, client, selected_models=selected_models, capability_profiles=capability_profiles,
+        runtime_identities=current_runtime_identities,
     )
     _require_host_code_opt_in(args, plan)
     _confirm_plan(args, plan)
@@ -1061,7 +1063,7 @@ def cmd_campaign(args, cfg):
         client = _client(args, cfg, gpu_inventory=inventory)
         selected = _resolve_model_selection(args, client) or []
         identities=_campaign_runtime_identities(args,cfg,selected,client,gpu_inventory=inventory)
-        plan = _plan_for_args(args, cfg, client, selected_models=selected)
+        plan = _plan_for_args(args, cfg, client, selected_models=selected, runtime_identities=identities)
         configuration = {"level": args.level, "models": args.models, "judge_policy": getattr(args, "judge", "off"), "samples": args.samples, "think": args.think, "ctx": args.ctx, "num_predict": args.num_predict}
         if manifest.state == "planned":
             if not paths.plan_json.exists():

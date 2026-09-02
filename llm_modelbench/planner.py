@@ -54,6 +54,7 @@ def build_plan(
     auto_probe: bool = False,
     capability_profiles: Optional[Dict[str, Dict[str, Any]]] = None,
     runs_dir: Optional[Path] = None,
+    runtime_identities: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     import re
 
@@ -124,6 +125,7 @@ def build_plan(
 
     task_source_level = "full" if context_only else level
     active: List[Dict[str, Any]] = []
+    tasks_by_model: Dict[str, List[Any]] = {}
     for model in models:
         profile = profiles[model]
         compatibility = capability_identity_compatibility(profile, current_identities.get(model))
@@ -143,6 +145,7 @@ def build_plan(
             skipped.append({"model": model, "reason": "no_tasks_after_filter"})
             continue
         samples_total = sum(_samples_for_task(t, cfg, sample_mode, judge_mode) for t in ts)
+        tasks_by_model[model] = list(ts)
         active.append({
             "model": model,
             "class": classify_model(model, profile.get("declared_capabilities"), fams),
@@ -171,6 +174,25 @@ def build_plan(
     reasons: Dict[str, int] = {}
     for item in skipped:
         reasons[item["reason"]] = reasons.get(item["reason"], 0) + 1
+
+    # Anvil Stage 3.6: a zero-authority prior-knowledge projection over the
+    # active models, surfaced by render_plan/plan JSON before the operator
+    # finalizes the run. Every read is fail-soft -- a corrupt prior-run
+    # file yields "unavailable" for that observation, never a refusal.
+    from .model_selection_context import build_model_selection_context
+
+    selection_context = build_model_selection_context(
+        active,
+        runs_dir=Path(runs_dir) if runs_dir is not None else None,
+        runtime_identities=runtime_identities or {},
+        models_rows=models_rows,
+        cfg=cfg,
+        capability_profiles={m: profiles[m] for m in models if m in profiles},
+        sample_mode=sample_mode,
+        judge_mode=judge_mode,
+        tasks_by_model=tasks_by_model,
+    )
+
     return {
         "level": level,
         "sample_mode": sample_mode,
@@ -199,6 +221,7 @@ def build_plan(
         "skipped_models": skipped,
         "skip_reasons": reasons,
         "capability_profiles": {m: profiles[m] for m in models if m in profiles},
+        "model_selection_context": selection_context.to_dict(),
     }
 
 
@@ -251,6 +274,44 @@ def render_plan(plan: Dict[str, Any], *, max_models: int = 80, max_skips: int = 
         lines.extend(f"- {model}: {warning}" for model, warning in warnings[:20])
         if len(warnings) > 20:
             lines.append(f"... {len(warnings) - 20} more warnings; see plan JSON/capability report")
+
+    # Anvil Stage 3.6: prior-model knowledge, surfaced before finalization.
+    selection_context = plan.get("model_selection_context")
+    if selection_context:
+        from .model_selection_context import (
+            ModelSelectionContext,
+            ModelObservation,
+            render_model_selection_context,
+        )
+
+        observations = [
+            ModelObservation(
+                model=str(obs.get("model")),
+                known=bool(obs.get("known")),
+                measured_capability_families=list(obs.get("measured_capability_families") or []),
+                capability_warnings=list(obs.get("capability_warnings") or []),
+                capability_evidence_hash=obs.get("capability_evidence_hash"),
+                native_legacy_capability_disagreements=list(
+                    obs.get("native_legacy_capability_disagreements") or []
+                ),
+                evidence_trust_class=obs.get("evidence_trust_class"),
+                active_protocol_identity=obs.get("active_protocol_identity"),
+                canonical_benchmark_runtime=dict(obs.get("canonical_benchmark_runtime") or {}),
+                largest_verified_context=dict(obs.get("largest_verified_context") or {}),
+                fastest_observed=dict(obs.get("fastest_observed") or {}),
+                lowest_vram_observed=dict(obs.get("lowest_vram_observed") or {}),
+                warnings=list(obs.get("warnings") or []),
+            )
+            for obs in selection_context.get("observations") or []
+        ]
+        rendered = render_model_selection_context(
+            ModelSelectionContext(
+                schema_version=int(selection_context.get("schema_version") or 1),
+                observations=observations,
+            )
+        )
+        if rendered:
+            lines.append(rendered)
     return "\n".join(lines)
 
 
