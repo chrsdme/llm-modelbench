@@ -155,6 +155,25 @@ def test_mock_run_writes_a_binding_artifact_and_row_references(tmp_path):
             assert r["benchmark_binding_key"] == by_model[r["model"]]["benchmark_binding_key"]
 
 
+def test_unmapped_scorer_fails_closed_as_an_operator_refusal():
+    # AGENTS.md section 4 rule 3: an unknown scorer must fail closed at
+    # canonical protocol construction. build_model_binding is the only live
+    # entry point (runner.run, before any row is written). The failure must
+    # reach the operator as `run refused: ...`, not a traceback -- which it
+    # does because BenchmarkPolicyError subclasses ValueError and cli.py's
+    # `cmd_run` wraps runner.run in `except ValueError -> SystemExit("run
+    # refused: ...")`.
+    from llm_modelbench.benchmark_policy import BenchmarkPolicyError
+
+    assert issubclass(BenchmarkPolicyError, ValueError)
+    with pytest.raises(BenchmarkPolicyError, match="no explicit contract version"):
+        build_model_binding(
+            model_artifact_identity=_art(),
+            selected_tasks=[_task("nope", scorer="totally_unmapped_scorer")],
+            cfg=_cfg(), backend="llama_cpp", backend_version="b4000",
+        )
+
+
 def test_legacy_rows_without_a_binding_reference_remain_readable(tmp_path):
     # A row dict lacking the binding keys is structurally valid -- the runner
     # adds them under an `if model in benchmark_bindings` guard, exactly like
