@@ -110,14 +110,14 @@ def test_difficulty_drift_excludes_rows_from_canonical_with_reason(tmp_path, mon
     _write_run(runs_dir, "r1", model="m", digest="d1", task_ids=_SELECTED,
                bound_entry=entry)
 
-    # Now the live suite disagrees: py_anagram difficulty moved.
+    # Now the live suite disagrees: py_anagram difficulty moved. Patch ONLY
+    # rankings._TASKS -- the dict the verifier reads Task.difficulty from --
+    # and deliberately leave rankings._TASK_DIFFICULTY (which only aggregate()
+    # consumes) alone, to prove the verifier's drift source is the Task
+    # objects, i.e. what a real tasks.py edit actually moves.
     bumped = dataclasses.replace(_TASKS_BY_ID["py_anagram"], difficulty=9.9)
     patched = dict(_TASKS_BY_ID, py_anagram=bumped)
     monkeypatch.setattr(rankings, "_TASKS", patched)
-    monkeypatch.setattr(
-        rankings, "_TASK_DIFFICULTY",
-        {k: v.difficulty for k, v in patched.items()},
-    )
 
     out = tmp_path / "rankings"
     rankings.write_rankings(runs_dir, out)
@@ -139,6 +139,30 @@ def test_legacy_run_without_bindings_stays_unverified_and_still_ranks(tmp_path):
     summary = {row["digest"]: row for row in json.loads((out / "master_summary.json").read_text())}
     disp = _entry_for(summary, "d1")
     assert disp["verdict_counts"] == {"unverified_legacy": 3}
+    assert disp["excluded_from_canonical"] == 0
+    assert summary["d1"]["overall_mean_score"] is not None
+
+
+def test_verified_alongside_legacy_rows_is_heterogeneous(tmp_path):
+    # A digest whose selected canonical rows come partly from a bound run
+    # (verified) and partly from a legacy run (no recorded policy) is a
+    # genuine policy mix -- an operator should see it. Neither is excluded
+    # from the canonical composite (legacy rows still count).
+    runs_dir = tmp_path / "runs"
+    cfg = _cfg(samples=1)
+    bound = _binding_entry("m", ["py_anagram", "py_dedupe"], cfg=cfg)
+    # bound run: full level -> its rows win selection for those two tasks
+    _write_run(runs_dir, "bound", model="m", digest="d1",
+               task_ids=["py_anagram", "py_dedupe"], bound_entry=bound, level="full")
+    # legacy run: adds py_csv only, no bindings
+    _write_run(runs_dir, "legacy", model="m", digest="d1",
+               task_ids=["py_csv"], bound_entry=None, level="full")
+    out = tmp_path / "rankings"
+    rankings.write_rankings(runs_dir, out)
+    summary = {row["digest"]: row for row in json.loads((out / "master_summary.json").read_text())}
+    disp = _entry_for(summary, "d1")
+    assert disp["verdict_counts"] == {"verified": 2, "unverified_legacy": 1}
+    assert disp["heterogeneous"] is True
     assert disp["excluded_from_canonical"] == 0
     assert summary["d1"]["overall_mean_score"] is not None
 

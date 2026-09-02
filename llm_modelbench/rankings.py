@@ -587,14 +587,13 @@ def _summarize_aggregation_policy(
             reason = str(verdict_obj.get("reason") or "").strip()
             if reason:
                 drift_reasons.add(reason)
-    observed = set(counts)
     # "Heterogeneous" = the rows being aggregated for this model did not all
-    # agree on their aggregation-policy verdict -- e.g. one run verified, an
-    # older run drifted, or a resume produced divergent bindings. Flagged so a
-    # reader never assumes one model == one aggregation policy.
-    heterogeneous = len(observed - {"unverified_legacy", "unverified_incomplete"}) > 1 or (
-        "policy_drift" in observed and len(observed) > 1
-    )
+    # carry the same aggregation-policy verdict -- one run verified while an
+    # older run drifted, a resume produced divergent bindings, or verified
+    # rows sit alongside legacy rows that carry no recorded policy at all.
+    # Any such split is surfaced so a reader never assumes one model == one
+    # aggregation policy; the per-verdict counts below say which mix it is.
+    heterogeneous = len(counts) > 1
     return (
         {
             "verdict_counts": {k: counts[k] for k in sorted(counts)},
