@@ -185,9 +185,10 @@ def _entry_anchor_semantics_are_current(entry: Dict[str, Any]) -> bool:
       identical current evidence (§8 -- drift cannot masquerade as current).
 
     Only scoring semantics are gated here. Structural-capability facts
-    (whether a judge 415s) are unaffected by anchors, so
-    ``_matching_exhausted_execution_entry`` / ``_prior_structural_failure``
-    are deliberately left untouched.
+    (whether a judge 415s) and not-yet-scored states are unaffected by
+    anchors, so ``_matching_exhausted_execution_entry`` /
+    ``_prior_structural_failure`` / ``_matching_pending_entry`` are
+    deliberately left untouched.
     """
     recorded = entry.get("judge_anchor_policy_hash")
     if recorded is None:

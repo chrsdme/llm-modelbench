@@ -227,8 +227,15 @@ def test_rejudging_after_a_material_anchor_change_does_not_skip_the_row(tmp_path
     )
     # Both entries now recorded; the newest carries the new anchor identity.
     entries = [json.loads(line) for line in (run / "judge_results.jsonl").read_text().splitlines()]
-    hashes = {e["judge_anchor_policy_hash"] for e in entries if e.get("status") == "judged"}
+    judged = [e for e in entries if e.get("status") == "judged"]
+    hashes = {e["judge_anchor_policy_hash"] for e in judged}
     assert len(hashes) == 2
+    # And the downstream overlay (reports / rankings) picks the newest
+    # judgement (latest_judge_sidecars is last-wins by applied_at), so the
+    # current-anchor score is what reaches a report -- not the drifted one.
+    latest = judge_dumps.latest_judge_sidecars(run)
+    (overlay,) = latest.values()
+    assert overlay["judge_anchor_policy_hash"] == judge_mod.JUDGE_ANCHOR_POLICY_HASH
 
 
 def test_rejudging_with_unchanged_anchors_still_skips_the_row(tmp_path: Path):
@@ -242,6 +249,46 @@ def test_rejudging_with_unchanged_anchors_still_skips_the_row(tmp_path: Path):
     assert second["judged"] == 0
     assert any(
         s.get("reason") == "already_judged_by_resolved_independent_judge"
+        for s in second.get("skipped", [])
+    )
+
+
+def test_rejudging_a_judge_error_row_after_an_anchor_change_does_not_skip_it(tmp_path: Path, monkeypatch):
+    # The fix is wired into _matching_judge_error_entry too: a prior
+    # judge_error entry with a drifted anchor hash must be re-attempted, not
+    # skipped as already_judge_error_for_resolved_judge.
+    run, first = _judge_a_run(tmp_path, failures={"preferred": "timeout_exception"})
+    assert first["judged"] == 0
+    err_entries = [
+        json.loads(line) for line in (run / "judge_results.jsonl").read_text().splitlines()
+    ]
+    assert any(e.get("status") == "judge_error" for e in err_entries)
+
+    monkeypatch.setattr(judge_mod, "ANCHORS", judge_mod.ANCHORS + "\n- 40 = weak.")
+    monkeypatch.setattr(judge_mod, "JUDGE_ANCHOR_POLICY_HASH", judge_mod._judge_anchor_policy_hash())
+
+    pool = [_qualified("preferred", "digest-preferred")]
+    # No failure this time -> if the row is reconsidered it now judges.
+    second = judge_dumps.judge_run(
+        RecordingJudgeClient(), run, judge_model="preferred", qualified_judges=pool, judge_mode="single",
+    )
+    assert second["judged"] == 1
+    assert not any(
+        s.get("reason") == "already_judge_error_for_resolved_judge"
+        for s in second.get("skipped", [])
+    )
+
+
+def test_rejudging_a_judge_error_row_with_unchanged_anchors_still_skips_it(tmp_path: Path):
+    run, first = _judge_a_run(tmp_path, failures={"preferred": "timeout_exception"})
+    assert first["judged"] == 0
+    pool = [_qualified("preferred", "digest-preferred")]
+    second = judge_dumps.judge_run(
+        RecordingJudgeClient(failures={"preferred": "timeout_exception"}),
+        run, judge_model="preferred", qualified_judges=pool, judge_mode="single",
+    )
+    assert any(
+        s.get("reason") == "already_judge_error_for_resolved_judge"
         for s in second.get("skipped", [])
     )
 
