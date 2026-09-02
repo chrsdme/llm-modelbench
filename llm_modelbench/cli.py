@@ -1728,21 +1728,102 @@ def cfg_weights_for(run: Path) -> dict:
             return meta["category_weights"]
     return {}
 
+def _ledger_run_dirs(ledger: dict) -> set:
+    return {entry.get("out_dir") for ledger_entry in ledger.values()
+            for entry in ledger_entry.get("categories", {}).values() if entry.get("out_dir")}
+
+
+def _run_row_aggregation_verdicts(run: Path) -> tuple[list, bool]:
+    """For one ledger-referenced run dir, classify every scored row against
+    today's canonical aggregation policy.
+
+    Returns ``(row_verdicts, override_active)`` where ``row_verdicts`` is a list
+    of ``(row, digest, AggregationPolicyVerdict)`` -- one per raw row that
+    resolves to a digest -- and ``override_active`` is True when this run's own
+    scoring used a weights override (recorded in ``summary_meta.json``).
+
+    This is the single per-run policy-resolution path shared by the dossier's
+    quality composite and its advisory surface; it reuses
+    :func:`verify_recorded_aggregation_policy` (the one aggregation-policy
+    authority, also used by canonical ranking) and does not rebuild any policy.
+    """
+    from .benchmark_policy import verify_recorded_aggregation_policy
+    from .tasks import TASKS
+
+    tasks_by_id = {task.id: task for task in TASKS}
+    raw_path, identities_path = run / "raw_results.jsonl", run / "model_identities.json"
+    if not raw_path.exists() or not identities_path.exists():
+        return [], False
+    identities = json.loads(identities_path.read_text())
+    filters = json.loads((run / "filters.json").read_text()) if (run / "filters.json").exists() else {}
+    bindings = json.loads((run / "benchmark_bindings.json").read_text()) if (run / "benchmark_bindings.json").exists() else {}
+    run_meta = json.loads((run / "summary_meta.json").read_text()) if (run / "summary_meta.json").exists() else {}
+    # per-run scoring override: report.py:_metadata records it here, and
+    # cfg_weights_for() reads category_weights from the same file
+    override_active = bool(run_meta.get("weight_override") or run_meta.get("category_weights"))
+    protocols_by_key: dict = {}
+    for entry in (bindings.get("bindings") or {}).values():
+        key = ((entry or {}).get("binding") or {}).get("binding_key")
+        protocol = (entry or {}).get("protocol")
+        if key and isinstance(protocol, dict):
+            protocols_by_key[str(key)] = protocol
+    for entry in (bindings.get("resume_divergent_bindings") or []):
+        key = ((entry or {}).get("binding") or {}).get("binding_key")
+        protocol = (entry or {}).get("protocol")
+        if key and isinstance(protocol, dict):
+            protocols_by_key.setdefault(str(key), protocol)
+    row_verdicts = []
+    for line in raw_path.read_text().splitlines():
+        if not line:
+            continue
+        row = json.loads(line)
+        digest = (identities.get(row.get("model")) or {}).get("digest")
+        if not digest:
+            continue
+        binding_key = row.get("benchmark_binding_key")
+        protocol = protocols_by_key.get(str(binding_key)) if binding_key else None
+        verdict = verify_recorded_aggregation_policy(
+            recorded_hash=str((protocol or {}).get("aggregation_policy_hash") or ""),
+            task_ids=list((protocol or {}).get("task_ids") or []),
+            requested_samples=filters.get("requested_samples"),
+            sample_mode=filters.get("sample_mode"),
+            judge_mode=filters.get("judge_mode"),
+            tasks_by_id=tasks_by_id,
+        )
+        row_verdicts.append((row, digest, verdict))
+    return row_verdicts, override_active
+
+
 def _quality_by_digest_from_ledger(ledger: dict) -> dict:
-    """Load each ledger-referenced run and map aggregate category quality by digest."""
+    """Load each ledger-referenced run and map aggregate category quality by
+    digest.
+
+    Anvil Stage 3.3C owner resolution: a canonical cross-run dossier composite
+    must not combine evidence with provably incompatible aggregation semantics.
+    Rows whose run's recorded aggregation policy has *drifted* from today's
+    canonical policy (``policy_drift``) are dropped before ``aggregate()`` --
+    exactly the canonical-ranking rule, one level up. ``unverified_legacy`` /
+    ``unverified_incomplete`` rows are kept (no policy is retrospectively
+    attributed to them); the per-run report never excludes anything.
+    """
     from .aggregate import aggregate
+    from .benchmark_policy import AGG_VERDICT_POLICY_DRIFT
     from .tasks import TASKS
     difficulty = {task.id: task.difficulty for task in TASKS}
-    run_dirs = {entry.get("out_dir") for ledger_entry in ledger.values()
-                for entry in ledger_entry.get("categories", {}).values() if entry.get("out_dir")}
     quality_by_digest = {}
-    for out_dir in run_dirs:
+    for out_dir in _ledger_run_dirs(ledger):
         run = Path(out_dir)
-        raw_path, identities_path = run / "raw_results.jsonl", run / "model_identities.json"
-        if not raw_path.exists() or not identities_path.exists():
+        identities_path = run / "model_identities.json"
+        if not (run / "raw_results.jsonl").exists() or not identities_path.exists():
             continue
-        rows = [json.loads(line) for line in raw_path.read_text().splitlines() if line]
+        row_verdicts, _ = _run_row_aggregation_verdicts(run)
         identities = json.loads(identities_path.read_text())
+        rows = [
+            row for row, _digest, verdict in row_verdicts
+            if verdict.verdict != AGG_VERDICT_POLICY_DRIFT
+        ]
+        if not rows:
+            continue
         _, per_cat = aggregate(rows, cfg_weights_for(run), difficulty)
         for category, ranked in per_cat.items():
             for model_name, quality in ranked:
@@ -1755,64 +1836,33 @@ def _aggregation_policy_by_digest_from_ledger(ledger: dict) -> dict:
     """Per digest, count how each contributing ledger run's scored rows
     compare against today's canonical aggregation policy.
 
-    The dossier composite is a cross-run aggregate on live constants; this
-    surfaces (never excludes) rows whose recorded ``aggregation_policy_hash``
-    no longer matches -- exclusion would be a new owner comparability rule,
-    which Stage 3.3 does not grant for anything but the canonical ranking.
-    A run whose own scoring used a weights override (recorded in its
-    ``summary_meta.json``) sets ``override_runs`` so a ``verified`` count
-    is not read as a canonical endorsement; ``cmd_dossier`` adds
-    ``dossier_weights_overridden`` for its own ``--weights``.
+    Advisory surface for ``cmd_dossier``. Anvil Stage 3.3C owner resolution:
+    ``policy_drift`` rows ARE excluded from the canonical cross-run composite
+    (see :func:`_quality_by_digest_from_ledger`); this surface reports how many
+    were excluded per digest and keeps them fully visible in
+    ``verdict_counts`` / ``drift_reasons`` so the exclusion is never silent.
+    ``unverified_legacy`` / ``unverified_incomplete`` rows are not excluded and
+    keep their existing treatment. A run whose own scoring used a weights
+    override (recorded in its ``summary_meta.json``) sets ``override_runs`` so a
+    ``verified`` count is not read as a canonical endorsement; ``cmd_dossier``
+    adds ``dossier_weights_overridden`` for its own ``--weights``.
     """
-    from .benchmark_policy import verify_recorded_aggregation_policy
-    from .tasks import TASKS
+    from .benchmark_policy import AGG_VERDICT_POLICY_DRIFT
 
-    tasks_by_id = {task.id: task for task in TASKS}
-    run_dirs = {entry.get("out_dir") for ledger_entry in ledger.values()
-                for entry in ledger_entry.get("categories", {}).values() if entry.get("out_dir")}
     by_digest: dict = {}
-    for out_dir in run_dirs:
+    for out_dir in _ledger_run_dirs(ledger):
         run = Path(out_dir)
-        raw_path, identities_path = run / "raw_results.jsonl", run / "model_identities.json"
-        if not raw_path.exists() or not identities_path.exists():
-            continue
-        identities = json.loads(identities_path.read_text())
-        filters = json.loads((run / "filters.json").read_text()) if (run / "filters.json").exists() else {}
-        bindings = json.loads((run / "benchmark_bindings.json").read_text()) if (run / "benchmark_bindings.json").exists() else {}
-        run_meta = json.loads((run / "summary_meta.json").read_text()) if (run / "summary_meta.json").exists() else {}
-        # per-run scoring override: report.py:_metadata records it here, and
-        # cfg_weights_for() reads category_weights from the same file
-        override_active = bool(run_meta.get("weight_override") or run_meta.get("category_weights"))
-        protocols_by_key: dict = {}
-        for entry in (bindings.get("bindings") or {}).values():
-            key = ((entry or {}).get("binding") or {}).get("binding_key")
-            protocol = (entry or {}).get("protocol")
-            if key and isinstance(protocol, dict):
-                protocols_by_key[str(key)] = protocol
-        for entry in (bindings.get("resume_divergent_bindings") or []):
-            key = ((entry or {}).get("binding") or {}).get("binding_key")
-            protocol = (entry or {}).get("protocol")
-            if key and isinstance(protocol, dict):
-                protocols_by_key.setdefault(str(key), protocol)
-        for line in raw_path.read_text().splitlines():
-            if not line:
-                continue
-            row = json.loads(line)
-            digest = (identities.get(row.get("model")) or {}).get("digest")
-            if not digest:
-                continue
-            binding_key = row.get("benchmark_binding_key")
-            protocol = protocols_by_key.get(str(binding_key)) if binding_key else None
-            verdict = verify_recorded_aggregation_policy(
-                recorded_hash=str((protocol or {}).get("aggregation_policy_hash") or ""),
-                task_ids=list((protocol or {}).get("task_ids") or []),
-                requested_samples=filters.get("requested_samples"),
-                sample_mode=filters.get("sample_mode"),
-                judge_mode=filters.get("judge_mode"),
-                tasks_by_id=tasks_by_id,
+        row_verdicts, override_active = _run_row_aggregation_verdicts(run)
+        for _row, digest, verdict in row_verdicts:
+            slot = by_digest.setdefault(
+                digest,
+                {"verdict_counts": {}, "drift_reasons": set(), "override_runs": False,
+                 "excluded_from_canonical_composite": 0},
             )
-            slot = by_digest.setdefault(digest, {"verdict_counts": {}, "drift_reasons": set(), "override_runs": False})
             slot["verdict_counts"][verdict.verdict] = slot["verdict_counts"].get(verdict.verdict, 0) + 1
+            slot["total_rows"] = slot.get("total_rows", 0) + 1
+            if verdict.verdict == AGG_VERDICT_POLICY_DRIFT:
+                slot["excluded_from_canonical_composite"] += 1
             if verdict.reason:
                 slot["drift_reasons"].add(verdict.reason)
             if override_active:
@@ -1822,7 +1872,15 @@ def _aggregation_policy_by_digest_from_ledger(ledger: dict) -> dict:
             "verdict_counts": dict(sorted(slot["verdict_counts"].items())),
             "drift_reasons": sorted(slot["drift_reasons"]),
             "override_runs": slot["override_runs"],
-            "note": "advisory; drifted rows surfaced, not excluded from the dossier composite",
+            "excluded_from_canonical_composite": slot["excluded_from_canonical_composite"],
+            "all_rows_excluded_as_drift": (
+                slot["excluded_from_canonical_composite"] > 0
+                and slot["excluded_from_canonical_composite"] == slot.get("total_rows", 0)
+            ),
+            "note": (
+                "advisory; policy_drift rows are excluded from the canonical "
+                "dossier composite but remain counted here"
+            ),
         }
         for digest, slot in by_digest.items()
     }
@@ -1837,12 +1895,27 @@ def cmd_dossier(args, cfg):
     validate_weights(weights); ledger = load_ledger(Path(args.ledger)); out = {}; quality_by_digest = _quality_by_digest_from_ledger(ledger)
     aggregation_policy_by_digest = _aggregation_policy_by_digest_from_ledger(ledger)
     for digest, entry in ledger.items():
-        policy = dict(aggregation_policy_by_digest.get(digest, {"verdict_counts": {}, "drift_reasons": [], "override_runs": False}))
+        policy = dict(aggregation_policy_by_digest.get(
+            digest,
+            {"verdict_counts": {}, "drift_reasons": [], "override_runs": False,
+             "excluded_from_canonical_composite": 0, "all_rows_excluded_as_drift": False},
+        ))
         # the dossier's own --weights override also makes this composite
         # non-canonical, independent of any per-run override
         policy["dossier_weights_overridden"] = dossier_weights_overridden
         policy["canonical_composite"] = not dossier_weights_overridden and not policy.get("override_runs", False)
-        out[digest] = composite_score(digest, ledger, quality_by_digest.get(digest, {}), weights, TASKS) | {
+        composite = composite_score(digest, ledger, quality_by_digest.get(digest, {}), weights, TASKS)
+        # Stage 3.3C: policy_drift rows were dropped upstream. When *every*
+        # contributing row for this digest was excluded as drift, the composite
+        # is honestly unavailable rather than a live-policy number over
+        # incompatible rows -- flag the reason so it is not read as mere missing
+        # coverage. (A composite that is None only because of stale/absent
+        # ledger coverage keeps the existing, unflagged meaning.)
+        if policy.get("all_rows_excluded_as_drift") and composite.get("composite") is None:
+            policy["canonical_composite_unavailable_reason"] = (
+                "all comparable rows excluded as policy_drift"
+            )
+        out[digest] = composite | {
             "names_seen": entry.get("names_seen", []),
             "aggregation_policy": policy,
         }

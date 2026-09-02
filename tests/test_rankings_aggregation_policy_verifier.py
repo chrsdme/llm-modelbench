@@ -331,7 +331,7 @@ def test_campaign_overlay_path_carries_the_verdict(tmp_path):
     assert _entry_for(summary, "d1")["verdict_counts"] == {"verified": 3}
 
 
-def test_dossier_aggregation_policy_by_digest_surfaces_without_excluding(tmp_path, monkeypatch):
+def test_dossier_advisory_surface_counts_verdicts_and_records_exclusion(tmp_path, monkeypatch):
     from llm_modelbench import cli
     runs_dir = tmp_path / "runs"
     cfg = _cfg(samples=1)
@@ -343,40 +343,133 @@ def test_dossier_aggregation_policy_by_digest_surfaces_without_excluding(tmp_pat
     verdicts = cli._aggregation_policy_by_digest_from_ledger(ledger)
     assert verdicts["d1"]["verdict_counts"] == {"verified": 3}
     assert verdicts["d1"]["override_runs"] is False
+    assert verdicts["d1"]["excluded_from_canonical_composite"] == 0
 
     # a per-run scoring override recorded in summary_meta.json is detected
     (run / "summary_meta.json").write_text(json.dumps({"level": "full", "weight_override": "coding_python=2"}))
     assert cli._aggregation_policy_by_digest_from_ledger(ledger)["d1"]["override_runs"] is True
     (run / "summary_meta.json").write_text(json.dumps({"level": "full"}))
 
-    # difficulty drift on the live task table -> policy_drift, still surfaced
+    # difficulty drift on the live task table -> policy_drift: still counted +
+    # reasoned in the advisory surface, and now marked excluded from canonical
     drifted = [dataclasses.replace(t, difficulty=t.difficulty + 5.0) if t.id in _SELECTED else t for t in TASKS]
     import llm_modelbench.tasks as tasks_mod
     monkeypatch.setattr(tasks_mod, "TASKS", drifted)
     verdicts2 = cli._aggregation_policy_by_digest_from_ledger(ledger)
     assert set(verdicts2["d1"]["verdict_counts"]) == {"policy_drift"}
+    assert verdicts2["d1"]["verdict_counts"]["policy_drift"] == 3
     assert verdicts2["d1"]["drift_reasons"]
+    assert verdicts2["d1"]["excluded_from_canonical_composite"] == 3
 
 
-def test_dossier_own_weights_override_marks_composite_noncanonical(tmp_path, monkeypatch, capsys):
+def _dossier_ledger(tmp_path, run, quality=90.0):
+    ledger_path = tmp_path / "ledger.json"
+    ledger_path.write_text(json.dumps({"d1": {"names_seen": ["m"], "categories": {
+        "coding_python": {"out_dir": str(run), "quality": quality}}}}))
+    return ledger_path
+
+
+def _run_dossier(cli, ledger_path, weights, capsys):
     from types import SimpleNamespace
+    args = SimpleNamespace(ledger=str(ledger_path), weights=weights, out=None, json=True)
+    cli.cmd_dossier(args, _cfg())
+    return json.loads(capsys.readouterr().out)["d1"]
+
+
+def test_canonical_dossier_composite_uses_verified_rows_only(tmp_path, monkeypatch, capsys):
+    # A digest whose contributing rows come from two runs: one bound at a
+    # sample_mode whose recorded policy still matches today's, one bound at a
+    # sample_mode that has drifted. The canonical composite must be built from
+    # the verified rows only; the drifted rows stay visible in the advisory
+    # surface (verdict_counts + drift_reasons).
+    from llm_modelbench import cli
+    runs_dir = tmp_path / "runs"
+    cfg = _cfg(samples=1)
+    verified_tasks = ["py_anagram", "py_dedupe"]
+    drift_tasks = ["py_csv"]
+    entry_ok = _binding_entry("m", verified_tasks, cfg=cfg)
+    entry_drift = _binding_entry("m", drift_tasks, cfg=cfg)
+    run_ok = _write_run(runs_dir, "ok", model="m", digest="d1",
+                        task_ids=verified_tasks, bound_entry=entry_ok)
+    run_drift = _write_run(runs_dir, "drift", model="m", digest="d1",
+                           task_ids=drift_tasks, bound_entry=entry_drift)
+    ledger_path = tmp_path / "ledger.json"
+    ledger_path.write_text(json.dumps({"d1": {"names_seen": ["m"], "categories": {
+        "coding_python": {"out_dir": str(run_ok), "quality": 90.0},
+        "coding_python_b": {"out_dir": str(run_drift), "quality": 90.0}}}}))
+
+    # drift py_csv difficulty -> only run_drift's recorded hash stops matching
+    drifted = [dataclasses.replace(t, difficulty=t.difficulty + 5.0) if t.id in drift_tasks else t for t in TASKS]
+    import llm_modelbench.tasks as tasks_mod
+    monkeypatch.setattr(tasks_mod, "TASKS", drifted)
+
+    result = _run_dossier(cli, ledger_path, None, capsys)
+    policy = result["aggregation_policy"]
+    assert policy["verdict_counts"] == {"policy_drift": 1, "verified": 2}
+    assert policy["excluded_from_canonical_composite"] == 1
+    assert policy["drift_reasons"]  # drifted rows still visible in provenance
+    assert policy["canonical_composite"] is True
+    assert "canonical_composite_unavailable_reason" not in policy
+    # the drifted run's category quality was NOT folded into the composite
+    qbd = cli._quality_by_digest_from_ledger(json.loads(ledger_path.read_text()))
+    assert "d1" in qbd  # verified rows still produced quality
+
+
+def test_canonical_dossier_composite_unavailable_when_all_rows_drift(tmp_path, monkeypatch, capsys):
     from llm_modelbench import cli
     runs_dir = tmp_path / "runs"
     cfg = _cfg(samples=1)
     entry = _binding_entry("m", _SELECTED, cfg=cfg)
     run = _write_run(runs_dir, "r1", model="m", digest="d1",
                      task_ids=_SELECTED, bound_entry=entry)
-    ledger_path = tmp_path / "ledger.json"
-    ledger_path.write_text(json.dumps({"d1": {"names_seen": ["m"], "categories": {
-        "coding_python": {"out_dir": str(run), "quality": 90.0}}}}))
+    ledger_path = _dossier_ledger(tmp_path, run)
 
-    def _run(weights):
-        args = SimpleNamespace(ledger=str(ledger_path), weights=weights, out=None, json=True)
-        cli.cmd_dossier(args, _cfg())
-        return json.loads(capsys.readouterr().out)["d1"]["aggregation_policy"]
+    drifted = [dataclasses.replace(t, difficulty=t.difficulty + 5.0) if t.id in _SELECTED else t for t in TASKS]
+    import llm_modelbench.tasks as tasks_mod
+    monkeypatch.setattr(tasks_mod, "TASKS", drifted)
 
-    canonical = _run(None)
+    result = _run_dossier(cli, ledger_path, None, capsys)
+    policy = result["aggregation_policy"]
+    assert policy["excluded_from_canonical_composite"] == 3
+    # not a live-policy number over incompatible rows -- honestly unavailable
+    assert result["composite"] is None
+    assert policy["canonical_composite_unavailable_reason"] == (
+        "all comparable rows excluded as policy_drift"
+    )
+
+
+def test_dossier_own_weights_override_marks_composite_noncanonical(tmp_path, monkeypatch, capsys):
+    from llm_modelbench import cli
+    runs_dir = tmp_path / "runs"
+    cfg = _cfg(samples=1)
+    entry = _binding_entry("m", _SELECTED, cfg=cfg)
+    run = _write_run(runs_dir, "r1", model="m", digest="d1",
+                     task_ids=_SELECTED, bound_entry=entry)
+    ledger_path = _dossier_ledger(tmp_path, run)
+
+    canonical = _run_dossier(cli, ledger_path, None, capsys)["aggregation_policy"]
     # keep the sum at 1.0 (validate_weights is strict): shift 0.05 py->js
-    overridden = _run("coding_python=0.10,coding_js=0.15")
+    overridden = _run_dossier(cli, ledger_path, "coding_python=0.10,coding_js=0.15", capsys)["aggregation_policy"]
     assert canonical["dossier_weights_overridden"] is False and canonical["canonical_composite"] is True
     assert overridden["dossier_weights_overridden"] is True and overridden["canonical_composite"] is False
+    # policy verification does not make the override canonical
+    assert overridden["verdict_counts"] == {"verified": 3}
+
+
+def test_dossier_legacy_rows_are_not_excluded(tmp_path, capsys):
+    # A run with no bindings -> unverified_legacy rows. They keep contributing
+    # to the dossier composite; no retroactive policy attribution.
+    from llm_modelbench import cli
+    runs_dir = tmp_path / "runs"
+    run = _write_run(runs_dir, "legacy", model="m", digest="d1",
+                     task_ids=_SELECTED, bound_entry=None)
+    ledger_path = _dossier_ledger(tmp_path, run)
+    result = _run_dossier(cli, ledger_path, None, capsys)
+    policy = result["aggregation_policy"]
+    assert policy["verdict_counts"] == {"unverified_legacy": 3}
+    assert policy["excluded_from_canonical_composite"] == 0
+    assert "canonical_composite_unavailable_reason" not in policy
+    assert policy["canonical_composite"] is True
+    # legacy rows still feed the quality composite -- no retroactive exclusion
+    qbd = cli._quality_by_digest_from_ledger(json.loads(ledger_path.read_text()))
+    assert qbd.get("d1", {}).get("coding_python") == 90.0
