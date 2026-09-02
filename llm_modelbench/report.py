@@ -200,6 +200,7 @@ def _aggregation_policy_provenance(out_dir: Path, rows: List[Dict[str, Any]], cf
             protocols_by_key.setdefault(str(key), protocol)
 
     verdict_counts: Dict[str, int] = {}
+    counts_by_model: Dict[str, Dict[str, int]] = {}
     drift_reasons: set = set()
     for row in rows:
         binding_key = row.get("benchmark_binding_key")
@@ -213,10 +214,13 @@ def _aggregation_policy_provenance(out_dir: Path, rows: List[Dict[str, Any]], cf
             tasks_by_id=tasks_by_id,
         )
         verdict_counts[verdict.verdict] = verdict_counts.get(verdict.verdict, 0) + 1
+        model_slot = counts_by_model.setdefault(str(row.get("model")), {})
+        model_slot[verdict.verdict] = model_slot.get(verdict.verdict, 0) + 1
         if verdict.reason:
             drift_reasons.add(verdict.reason)
     return {
         "verdict_counts": dict(sorted(verdict_counts.items())),
+        "verdict_counts_by_model": {m: dict(sorted(c.items())) for m, c in sorted(counts_by_model.items())},
         "drift_reasons": sorted(drift_reasons),
         "override_active": override_active,
         "canonical_scorecard": not override_active,

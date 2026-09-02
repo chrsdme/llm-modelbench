@@ -1777,7 +1777,10 @@ def _aggregation_policy_by_digest_from_ledger(ledger: dict) -> dict:
         identities = json.loads(identities_path.read_text())
         filters = json.loads((run / "filters.json").read_text()) if (run / "filters.json").exists() else {}
         bindings = json.loads((run / "benchmark_bindings.json").read_text()) if (run / "benchmark_bindings.json").exists() else {}
-        override_active = bool(filters.get("weight_override_spec") or filters.get("weight_override"))
+        run_meta = json.loads((run / "summary_meta.json").read_text()) if (run / "summary_meta.json").exists() else {}
+        # per-run scoring override: report.py:_metadata records it here, and
+        # cfg_weights_for() reads category_weights from the same file
+        override_active = bool(run_meta.get("weight_override") or run_meta.get("category_weights"))
         protocols_by_key: dict = {}
         for entry in (bindings.get("bindings") or {}).values():
             key = ((entry or {}).get("binding") or {}).get("binding_key")
@@ -1827,13 +1830,19 @@ def cmd_dossier(args, cfg):
     from .dossier import DEFAULT_CATEGORY_WEIGHTS, composite_score, validate_weights
     from .weights_override import parse_weight_overrides
     from .tasks import TASKS
+    dossier_weights_overridden = bool(args.weights)
     weights = parse_weight_overrides(args.weights, DEFAULT_CATEGORY_WEIGHTS) if args.weights else DEFAULT_CATEGORY_WEIGHTS
     validate_weights(weights); ledger = load_ledger(Path(args.ledger)); out = {}; quality_by_digest = _quality_by_digest_from_ledger(ledger)
     aggregation_policy_by_digest = _aggregation_policy_by_digest_from_ledger(ledger)
     for digest, entry in ledger.items():
+        policy = dict(aggregation_policy_by_digest.get(digest, {"verdict_counts": {}, "drift_reasons": [], "override_runs": False}))
+        # the dossier's own --weights override also makes this composite
+        # non-canonical, independent of any per-run override
+        policy["dossier_weights_overridden"] = dossier_weights_overridden
+        policy["canonical_composite"] = not dossier_weights_overridden and not policy.get("override_runs", False)
         out[digest] = composite_score(digest, ledger, quality_by_digest.get(digest, {}), weights, TASKS) | {
             "names_seen": entry.get("names_seen", []),
-            "aggregation_policy": aggregation_policy_by_digest.get(digest, {"verdict_counts": {}, "drift_reasons": [], "override_runs": False}),
+            "aggregation_policy": policy,
         }
     text=json.dumps(out, indent=2)
     if args.out: Path(args.out).write_text(text)

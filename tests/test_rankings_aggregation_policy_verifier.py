@@ -344,6 +344,11 @@ def test_dossier_aggregation_policy_by_digest_surfaces_without_excluding(tmp_pat
     assert verdicts["d1"]["verdict_counts"] == {"verified": 3}
     assert verdicts["d1"]["override_runs"] is False
 
+    # a per-run scoring override recorded in summary_meta.json is detected
+    (run / "summary_meta.json").write_text(json.dumps({"level": "full", "weight_override": "coding_python=2"}))
+    assert cli._aggregation_policy_by_digest_from_ledger(ledger)["d1"]["override_runs"] is True
+    (run / "summary_meta.json").write_text(json.dumps({"level": "full"}))
+
     # difficulty drift on the live task table -> policy_drift, still surfaced
     drifted = [dataclasses.replace(t, difficulty=t.difficulty + 5.0) if t.id in _SELECTED else t for t in TASKS]
     import llm_modelbench.tasks as tasks_mod
@@ -351,3 +356,27 @@ def test_dossier_aggregation_policy_by_digest_surfaces_without_excluding(tmp_pat
     verdicts2 = cli._aggregation_policy_by_digest_from_ledger(ledger)
     assert set(verdicts2["d1"]["verdict_counts"]) == {"policy_drift"}
     assert verdicts2["d1"]["drift_reasons"]
+
+
+def test_dossier_own_weights_override_marks_composite_noncanonical(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+    from llm_modelbench import cli
+    runs_dir = tmp_path / "runs"
+    cfg = _cfg(samples=1)
+    entry = _binding_entry("m", _SELECTED, cfg=cfg)
+    run = _write_run(runs_dir, "r1", model="m", digest="d1",
+                     task_ids=_SELECTED, bound_entry=entry)
+    ledger_path = tmp_path / "ledger.json"
+    ledger_path.write_text(json.dumps({"d1": {"names_seen": ["m"], "categories": {
+        "coding_python": {"out_dir": str(run), "quality": 90.0}}}}))
+
+    def _run(weights):
+        args = SimpleNamespace(ledger=str(ledger_path), weights=weights, out=None, json=True)
+        cli.cmd_dossier(args, _cfg())
+        return json.loads(capsys.readouterr().out)["d1"]["aggregation_policy"]
+
+    canonical = _run(None)
+    # keep the sum at 1.0 (validate_weights is strict): shift 0.05 py->js
+    overridden = _run("coding_python=0.10,coding_js=0.15")
+    assert canonical["dossier_weights_overridden"] is False and canonical["canonical_composite"] is True
+    assert overridden["dossier_weights_overridden"] is True and overridden["canonical_composite"] is False
