@@ -341,6 +341,44 @@ def test_ledger_is_threaded_into_qualify_judge_single(tmp_path: Path, monkeypatc
     assert seen["ledger"] is ledger
 
 
+def test_ledger_is_threaded_into_the_structural_continuation_path(tmp_path: Path, monkeypatch):
+    # continue_qualification_after_runtime_structural_failure re-qualifies
+    # the Stage 1A tail after a runtime structural failure -- its qualify_judge
+    # call must also carry the ledger derived from the run being judged.
+    run_dir = tmp_path / "runs" / "primary"
+    run_dir.mkdir(parents=True)
+    ledger = EvidenceLedger(default_ledger_path(run_dir.parent))
+    append_capability_observation(
+        ledger, _native_observation(name="judge-b", digest="sha256:judge-b",
+                                    state=MeasuredCapabilityState.MEASURED_SUPPORTED)
+    )
+    selection = campaign.build_judge_selection(
+        [_judge_candidate(name="judge-b", digest="sha256:judge-b")],
+        [], _policy(requested_primary="judge-b"), ledger=ledger,
+    )
+    assert selection.final_eligible_order
+
+    seen = {}
+
+    def _spy_qualify(client, candidate, *, repeats=2, ledger=None):
+        seen["ledger"] = ledger
+        return {"model": candidate["name"], "digest": candidate["digest"], "qualified": True,
+                "aggregate_disposition": "qualified"}
+
+    monkeypatch.setattr(campaign, "qualify_judge", _spy_qualify)
+    source_rows = [{"model": "source-model", "digest": "digest-source"}]
+    structural_entries = [{
+        "source_row_hash": judge_dumps.source_row_hash(source_rows[0]),
+        "status": "judge_exhausted_unavailable",
+        "failure_disposition": "structural_incompatibility",
+        "judgement_attempts": [],
+    }]
+    campaign.continue_qualification_after_runtime_structural_failure(
+        object(), selection, [], [], source_rows, structural_entries, ledger=ledger,
+    )
+    assert seen.get("ledger") is ledger
+
+
 # --------------------------------------------------------------------------
 # 6. the manual --judge-model path -- its ONLY capability gate -- consumes
 #    the native ledger under the run being judged.
@@ -384,7 +422,7 @@ def test_manual_judge_pool_consumes_the_run_ledger(tmp_path: Path, monkeypatch):
     _patch_manual_candidate(monkeypatch, legacy_state=MeasuredCapabilityState.MEASURED_UNSUPPORTED)
     monkeypatch.setattr(
         campaign, "qualify_judge",
-        lambda client, candidate, **_kw: {"model": candidate["name"], "digest": candidate["digest"],
+        lambda client, candidate, *, ledger=None: {"model": candidate["name"], "digest": candidate["digest"],
                                           "qualified": True, "aggregate_disposition": "qualified"},
     )
 

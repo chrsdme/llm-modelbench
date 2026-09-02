@@ -346,7 +346,7 @@ def test_bounded_qualification_stops_when_independent_coverage_is_satisfied(monk
     ], [], _policy(configured_fallbacks=("self", "fallback", "extra")))
     calls = []
 
-    def fake_qualify(client, candidate, **_kw):
+    def fake_qualify(client, candidate, *, ledger=None):
         calls.append(candidate["name"])
         return {"model": candidate["name"], "digest": candidate["digest"], "qualified": True, "aggregate_disposition": "qualified"}
 
