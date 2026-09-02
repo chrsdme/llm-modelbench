@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from llm_modelbench.model_selection_context import (
     build_model_selection_context,
     render_model_selection_context,
@@ -620,50 +622,34 @@ def test_campaign_plan_payload_persists_context_and_equivalence_ignores_it():
     assert campaign.campaign_plan_equivalent(payload, other2) is False
 
 
-def test_campaign_run_identity_failure_never_refuses_the_run(monkeypatch):
-    """Section 30 / D7: the prior-knowledge surface must not introduce a
-    new 'run refused' failure. If runtime-identity collection for the
-    accepted campaign plan raises, cmd_campaign swallows it and the plan
-    is built with no identities (canonical -> deferred)."""
-    from llm_modelbench import cli
-
-    def _boom(*a, **k):
-        raise RuntimeError("tags() unavailable / model retagged since campaign creation")
-
-    monkeypatch.setattr(cli, "_campaign_runtime_identities", _boom)
-
-    # Exercise exactly the guarded block shape from cmd_campaign's run path.
-    selected = None
-    manifest_models = ["m-a", "m-b"]
-    _identity_models = selected or list(manifest_models)
-    try:
-        run_identities = (
-            cli._campaign_runtime_identities(None, None, _identity_models, None)
-            if _identity_models else {}
-        )
-    except Exception:
-        run_identities = {}
-    assert run_identities == {}
-
-
 def test_wizard_resolver_probes_gpus_once_and_memoizes(monkeypatch):
     """Section 31 cost guard: the wizard rebuilds the plan on every
-    keystroke; the runtime-identity resolver must reuse one GPU probe and
-    not re-collect identities for an unchanged selection."""
+    keystroke; the runtime-identity resolver must NOT trigger a fresh GPU
+    probe per rebuild and must not re-collect identities for an unchanged
+    selection.
+
+    `_campaign_runtime_identities` runs for real against a stub client so
+    the `detect_gpus` call count actually discriminates: without the
+    one-probe-per-session fix each `resolver(...)` call would probe again.
+    """
     from llm_modelbench import cli
 
     detect_calls = {"n": 0}
-    collect_calls = {"n": 0}
 
-    monkeypatch.setattr("llm_modelbench.hardware.detect_gpus",
-                        lambda *a, **k: (detect_calls.__setitem__("n", detect_calls["n"] + 1) or ()))
+    def _counting_detect(*a, **k):
+        detect_calls["n"] += 1
+        return ()
 
-    def _fake_campaign_identities(args, cfg, selected, client, *, gpu_inventory=None):
-        collect_calls["n"] += 1
-        assert gpu_inventory is not None  # the one probe is threaded through
-        return {m: object() for m in selected}
+    # patched in llm_modelbench.hardware -- both cmd_wizard and
+    # _campaign_runtime_identities do `from .hardware import detect_gpus`
+    monkeypatch.setattr("llm_modelbench.hardware.detect_gpus", _counting_detect)
 
-    monkeypatch.setattr(cli, "_campaign_runtime_identities", _fake_campaign_identities)
+    class _StubClient:
+        def tags(self):
+            return [{"name": "a"}, {"name": "b"}, {"name": "c"}]
+
+        def version(self):
+            return "0.1.0-stub"
 
     captured = {}
 
@@ -675,7 +661,7 @@ def test_wizard_resolver_probes_gpus_once_and_memoizes(monkeypatch):
         }
 
     monkeypatch.setattr("llm_modelbench.wizard.interactive_plan", _fake_interactive_plan)
-    monkeypatch.setattr(cli, "_client", lambda *a, **k: object())
+    monkeypatch.setattr(cli, "_client", lambda *a, **k: _StubClient())
     monkeypatch.setattr(cli, "cmd_run", lambda *a, **k: None)
 
     class _Args:
@@ -696,13 +682,44 @@ def test_wizard_resolver_probes_gpus_once_and_memoizes(monkeypatch):
 
     resolver = captured["resolver"]
     assert resolver is not None
-    resolver(["a", "b"])
-    resolver(["a", "b"])          # unchanged selection -> cache hit
-    resolver(["b", "a"])          # same set, different order -> cache hit
-    assert collect_calls["n"] == 1
-    resolver(["c"])               # changed selection -> one more collect
-    assert collect_calls["n"] == 2
-    assert detect_calls["n"] == 1  # GPU probe happened exactly once
+
+    id_ab_1 = resolver(["a", "b"])
+    id_ab_2 = resolver(["a", "b"])          # unchanged selection -> cache hit
+    id_ba = resolver(["b", "a"])            # same set, different order -> cache hit
+    assert id_ab_1 is id_ab_2 is id_ba      # memoized: the same object
+    assert set(id_ab_1) == {"a", "b"}
+    resolver(["c"])                          # changed selection -> recompute
+
+    # cmd_wizard probes once; the resolver -- called four times -- never
+    # probes again. Pre-fix this would be 1 + 4 == 5.
+    assert detect_calls["n"] == 1
+
+
+def test_campaign_run_identity_guard_swallows_failure():
+    """Section 30 / D7: `_campaign_runtime_identities` raising inside
+    cmd_campaign's run path must not propagate -- the run proceeds with
+    canonical deferred. The guard itself (the `try/except Exception -> {}`
+    around the call in `cli.cmd_campaign`'s run path) is verified by
+    inspection -- a full `campaign run` harness is out of proportion for
+    one line, and DEFECT 3.6-7 established that a vacuous test is worse
+    than an honest inspection note. This test pins only the companion
+    contract: the helper genuinely CAN raise on a stale manifest model,
+    so the guard is load-bearing rather than defensive-dead."""
+    from llm_modelbench import cli
+    from llm_modelbench.config import Config
+
+    class _TagsBoom:
+        def tags(self):
+            raise RuntimeError("ollama unavailable")
+
+        def version(self):
+            return None
+
+    class _A:
+        _runtime_profile = None
+
+    with pytest.raises(RuntimeError, match="ollama unavailable"):
+        cli._campaign_runtime_identities(_A(), Config(), ["stale-model"], _TagsBoom())
 
 
 def test_disagreements_and_trust_surface_as_warnings(tmp_path):
