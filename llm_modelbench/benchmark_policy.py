@@ -32,12 +32,27 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, Mapping, Tuple
 
 from .benchmark_protocol import BenchmarkProtocol, _stable_hash
-from .config import Config
+from .config import DEFAULT_WEIGHTS, Config
+from .sample_policy import (
+    SAMPLE_APPLICABILITY_POLICY_VERSION,
+    SAMPLE_COMBINATION,
+    samples_for_task,
+)
 from .tasks import Task
 
 PROTOCOL_ID = "llm-modelbench-core"
 PROTOCOL_VERSION = "1"
 ALLOWED_ADAPTATIONS: Tuple[str, ...] = ("context_size",)
+
+# Bump ONLY when the canonical aggregation algorithm itself
+# (aggregate.aggregate / outcome.category_score) changes comparability
+# semantics -- e.g. the coverage-must-be-1.0 rule, the difficulty-weighted
+# intra-category mean, the category-weight renormalization, the 2-dp
+# rounding, or the agentic_tool decision-score substitution -- while the
+# numeric constants (DEFAULT_WEIGHTS, Task.difficulty) stay put. A pure
+# numeric-constant change is already caught by the manifest below and needs
+# no bump here.
+AGGREGATION_CONTRACT_VERSION = 1
 
 
 class BenchmarkPolicyError(ValueError):
@@ -201,16 +216,96 @@ def build_output_budget_manifest(tasks: Iterable[Task], cfg: Config) -> Dict[str
     }
 
 
-def build_benchmark_protocol(selected_tasks: Iterable[Task], cfg: Config) -> BenchmarkProtocol:
+def build_aggregation_policy_manifest(
+    tasks: Iterable[Task], cfg: Config, *, sample_mode: str, judge_mode: str
+) -> Dict[str, Any]:
+    """Canonical aggregation policy: everything that can move the canonical
+    composite score / ranking from the *same* raw task outputs.
+
+    Category weights: only the categories that materially participate in this
+    concrete benchmark. ``aggregate()`` renormalizes the composite over
+    exactly the categories that produced a score, so a weight for a category
+    that cannot run here cannot change this result -- including all 15 would
+    make an unrelated reweight move this identity. This is the smallest
+    representation that still guarantees "a weight change capable of changing
+    *this* result changes this identity".
+
+    Task difficulty: the raw numeric value per selected task (it is the
+    intra-category weight in ``outcome.category_score``) AND the derived
+    gate/scored split (``difficulty <= 0`` -> pass/fail gate, contributes no
+    positive quality), recorded explicitly so a reader need not re-derive the
+    boundary.
+
+    Sample policy: the concrete per-task draw count under this run's
+    ``sample_mode`` / ``judge_mode`` (via the shared
+    :func:`sample_policy.samples_for_task` -- not reimplemented here), plus
+    the applicability-policy version and the numeric-combination contract
+    (``aggregate._avg_numeric``).
+
+    ``judge_mode`` is recorded verbatim rather than subsetted the way
+    ``category_weights`` is: judging changes scorer *semantics* for
+    subjective tasks (judge score vs raw-only), not only the draw count, so
+    a ``judge_mode`` change is comparability-relevant wherever a subjective
+    or judge task is present. For a task set with none, this is mildly
+    over-inclusive (the hash moves though the result cannot) -- accepted as
+    the smaller evil than trying to prove judge-irrelevance per task set.
+
+    NOT included -- downstream of the canonical score or comparison-only,
+    established by source map: ``regression()`` drop threshold, the
+    ``prune_recommendations`` q25/t25 quartiles, ``pareto_frontier``.
+    """
+    tasks = list(tasks)
+    participating = sorted({task.category for task in tasks if task.category})
+    category_weights = {c: float(DEFAULT_WEIGHTS.get(c, 0.0)) for c in participating}
+    task_difficulty = {task.id: float(task.difficulty) for task in tasks}
+    gate_task_ids = tuple(sorted(t.id for t in tasks if float(t.difficulty) <= 0.0))
+    sample_counts = {
+        task.id: int(samples_for_task(task, cfg, sample_mode, judge_mode)) for task in tasks
+    }
+    return {
+        "aggregation_contract_version": AGGREGATION_CONTRACT_VERSION,
+        "category_weights": _canonical(category_weights),
+        "task_difficulty": _canonical(task_difficulty),
+        "gate_task_ids": list(gate_task_ids),
+        "sample_policy": {
+            "sample_mode": str(sample_mode),
+            "judge_mode": str(judge_mode),
+            "requested_samples": max(1, int(getattr(cfg, "samples", 1) or 1)),
+            "applicability_policy_version": SAMPLE_APPLICABILITY_POLICY_VERSION,
+            "combination": SAMPLE_COMBINATION,
+            "per_task_samples": _canonical(sample_counts),
+        },
+    }
+
+
+def build_benchmark_protocol(
+    selected_tasks: Iterable[Task],
+    cfg: Config,
+    *,
+    sample_mode: str = "smart",
+    judge_mode: str = "single",
+) -> BenchmarkProtocol:
     """Deterministic production builder over the existing ``BenchmarkProtocol``.
 
     Same semantic inputs -> same identity key. No global protocol database:
     the protocol is derived for the concrete benchmark and persisted with
     evidence (Stage 3.2D-2).
+
+    ``sample_mode`` / ``judge_mode`` are ``runner.run`` parameters (not
+    ``Config`` fields); they are threaded here because they change the
+    canonical aggregation (how many draws a task gets, then averaged).
     """
     tasks = list(selected_tasks)
     if not tasks:
         raise BenchmarkPolicyError("build_benchmark_protocol requires at least one task")
+    aggregation_policy_hash = _stable_hash(
+        "aggregation_policy_v1",
+        build_aggregation_policy_manifest(
+            tasks, cfg, sample_mode=sample_mode, judge_mode=judge_mode
+        ),
+    )
+    if not aggregation_policy_hash:  # pragma: no cover - _stable_hash never empty
+        raise BenchmarkPolicyError("aggregation_policy_hash resolved empty")
     return BenchmarkProtocol(
         protocol_id=PROTOCOL_ID,
         version=PROTOCOL_VERSION,
@@ -220,4 +315,5 @@ def build_benchmark_protocol(selected_tasks: Iterable[Task], cfg: Config) -> Ben
         output_budget_policy_hash=_stable_hash("output_budget_policy_v1", build_output_budget_manifest(tasks, cfg)),
         scorer_versions=resolve_scorer_versions(tasks),
         allowed_adaptations=ALLOWED_ADAPTATIONS,
+        aggregation_policy_hash=aggregation_policy_hash,
     )

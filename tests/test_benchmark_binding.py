@@ -67,6 +67,30 @@ def test_backend_version_change_changes_the_binding():
     assert base.binding_key() != newer.binding_key()
 
 
+def test_aggregation_policy_change_changes_the_binding():
+    # Anvil Stage 3.2E: same model + same runtime profile, but a changed
+    # canonical aggregation policy (task difficulty) -> different protocol
+    # identity -> different BenchmarkRuntimeBinding. No binding-specific code
+    # needed beyond the existing composition.
+    from llm_modelbench.tasks import Task
+
+    easy = Task(id="a", category="demo", family="text", scorer="exact",
+                prompt="hi", meta={"expected": "hi"}, difficulty=1.0)
+    hard = Task(id="a", category="demo", family="text", scorer="exact",
+                prompt="hi", meta={"expected": "hi"}, difficulty=2.0)
+    _, base = _build(selected_tasks=[easy])
+    _, harder = _build(selected_tasks=[hard])
+    assert base.benchmark_protocol_identity_key != harder.benchmark_protocol_identity_key
+    assert base.binding_key() != harder.binding_key()
+
+
+def test_sample_mode_threads_into_the_binding():
+    _, smart = _build(selected_tasks=[_task("a")], sample_mode="smart", cfg=_cfg(samples=3))
+    _, every = _build(selected_tasks=[_task("a")], sample_mode="all", cfg=_cfg(samples=3))
+    assert smart.benchmark_protocol_identity_key != every.benchmark_protocol_identity_key
+    assert smart.binding_key() != every.binding_key()
+
+
 # --- allowed adaptations ---------------------------------------------------
 
 def test_context_override_is_recorded_as_a_used_adaptation():

@@ -90,6 +90,13 @@ class BenchmarkProtocol:
     output_budget_policy_hash: str
     scorer_versions: Tuple[Tuple[str, str], ...]
     allowed_adaptations: Tuple[str, ...] = ()
+    # Stage 3.2E: identity of the canonical aggregation policy (category
+    # weights, per-task difficulty + gate split, sample-count/combination
+    # policy, aggregation-algorithm contract version). Anything that can move
+    # the canonical composite score from the same raw outputs. Defaults to ""
+    # so a protocol serialized before Stage 3.2E stays readable; the canonical
+    # builder (benchmark_policy.build_benchmark_protocol) always populates it.
+    aggregation_policy_hash: str = ""
 
     def __post_init__(self) -> None:
         if not self.protocol_id:
@@ -127,7 +134,7 @@ class BenchmarkProtocol:
             self.protocol_id, self.version, self.task_ids,
             self.prompt_semantics_hash, self.sampling_policy_hash,
             self.output_budget_policy_hash, self.scorer_versions,
-            self.allowed_adaptations,
+            self.allowed_adaptations, self.aggregation_policy_hash,
         )
 
 

@@ -36,6 +36,7 @@ from .hardware import GPUDevice, Telemetry, ProbeTelemetry, detect_gpu, detect_g
 from .placement import model_placement_fit
 from .backend import BackendCapability, InferenceClient, supports_capability
 from .tasks import Task, tasks_for, make_needle_prompt, TASKS
+from .sample_policy import samples_for_task
 from .inline_ui import InlineUI
 
 
@@ -1305,12 +1306,10 @@ def _judge_subjective(client, cfg: Config, task: Task, output: str, mode: str) -
 
 
 def _samples_for_task(task: Task, cfg: Config, sample_mode: str, judge_mode: str = "single") -> int:
-    requested = max(1, int(getattr(cfg, "samples", 1) or 1))
-    if sample_mode == "all":
-        return requested
-    if judge_mode != "off" and (task.scorer == "subjective" or task.judge):
-        return requested
-    return 1
+    # Canonical policy lives in sample_policy so benchmark-protocol construction
+    # can share it without importing the runner (Stage 3.2E). Kept as a
+    # module-level name here because planner imports it from runner.
+    return samples_for_task(task, cfg, sample_mode, judge_mode)
 
 
 def _avg_numeric(samples: List[Dict[str, Any]], key: str) -> Optional[float]:
@@ -1667,6 +1666,8 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
                 cfg=cfg,
                 backend=rid.backend,
                 backend_version=rid.server_version,
+                sample_mode=sample_mode,
+                judge_mode=judge_mode,
             )
             benchmark_bindings[model] = {
                 "binding": binding_to_dict(binding),

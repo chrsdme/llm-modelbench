@@ -53,11 +53,20 @@ def build_model_binding(
     cfg: Config,
     backend: str,
     backend_version: Optional[str],
+    sample_mode: str = "smart",
+    judge_mode: str = "single",
 ) -> Tuple[BenchmarkProtocol, BenchmarkRuntimeBinding]:
     """Deterministic protocol + validated binding for one model's actual
-    (resume-independent) task set."""
+    (resume-independent) task set.
+
+    ``sample_mode`` / ``judge_mode`` are ``runner.run`` parameters that change
+    the canonical aggregation (draw count per task) -- passed through to
+    protocol construction so the aggregation-policy identity reflects them.
+    """
     tasks = list(selected_tasks)
-    protocol = build_benchmark_protocol(tasks, cfg)
+    protocol = build_benchmark_protocol(
+        tasks, cfg, sample_mode=sample_mode, judge_mode=judge_mode
+    )
     profile_identity = resolve_runtime_profile_identity(
         backend=backend,
         backend_version=backend_version,
@@ -84,6 +93,7 @@ def protocol_to_dict(protocol: BenchmarkProtocol) -> Dict[str, Any]:
         "output_budget_policy_hash": protocol.output_budget_policy_hash,
         "scorer_versions": [list(pair) for pair in protocol.scorer_versions],
         "allowed_adaptations": list(protocol.allowed_adaptations),
+        "aggregation_policy_hash": protocol.aggregation_policy_hash,
     }
 
 

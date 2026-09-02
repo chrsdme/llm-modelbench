@@ -3,17 +3,18 @@
     "llama3.1:8b": {
       "binding": {
         "allowed_adaptations_used": [],
-        "benchmark_protocol_identity_key": "59ba7273786d9ff7",
-        "binding_key": "c547599816fc3c3c",
+        "benchmark_protocol_identity_key": "a074a4aad20800ea",
+        "binding_key": "62001a73e7dc1579",
         "model_artifact_set_id": "mock-llama318b",
         "provenance": "anvil_stage3.2d_deterministic_resolution",
         "runtime_profile_identity_key": "abf029fc884f74a9"
       },
       "protocol": {
+        "aggregation_policy_hash": "79cedd2a168f4868",
         "allowed_adaptations": [
           "context_size"
         ],
-        "identity_key": "59ba7273786d9ff7",
+        "identity_key": "a074a4aad20800ea",
         "output_budget_policy_hash": "835d2ea5d3d0b6d0",
         "prompt_semantics_hash": "e0cd1cb1dd85328f",
         "protocol_id": "llm-modelbench-core",
@@ -175,26 +176,27 @@
         "version": "1"
       },
       "row_reference": {
-        "benchmark_binding_key": "c547599816fc3c3c",
+        "benchmark_binding_key": "62001a73e7dc1579",
         "benchmark_protocol_id": "llm-modelbench-core",
-        "benchmark_protocol_identity_key": "59ba7273786d9ff7",
+        "benchmark_protocol_identity_key": "a074a4aad20800ea",
         "benchmark_protocol_version": "1"
       }
     },
     "qwen2.5-coder:14b": {
       "binding": {
         "allowed_adaptations_used": [],
-        "benchmark_protocol_identity_key": "5351dd1a474d72e2",
-        "binding_key": "5169f792511decc6",
+        "benchmark_protocol_identity_key": "fccaca6849885ac9",
+        "binding_key": "d7b07909e96df31a",
         "model_artifact_set_id": "mock-qwen25coder14b",
         "provenance": "anvil_stage3.2d_deterministic_resolution",
         "runtime_profile_identity_key": "abf029fc884f74a9"
       },
       "protocol": {
+        "aggregation_policy_hash": "8630a55a178dfa5b",
         "allowed_adaptations": [
           "context_size"
         ],
-        "identity_key": "5351dd1a474d72e2",
+        "identity_key": "fccaca6849885ac9",
         "output_budget_policy_hash": "a027d099161f4b01",
         "prompt_semantics_hash": "1e5c3b69a44facc2",
         "protocol_id": "llm-modelbench-core",
@@ -361,9 +363,9 @@
         "version": "1"
       },
       "row_reference": {
-        "benchmark_binding_key": "5169f792511decc6",
+        "benchmark_binding_key": "d7b07909e96df31a",
         "benchmark_protocol_id": "llm-modelbench-core",
-        "benchmark_protocol_identity_key": "5351dd1a474d72e2",
+        "benchmark_protocol_identity_key": "fccaca6849885ac9",
         "benchmark_protocol_version": "1"
       }
     }
