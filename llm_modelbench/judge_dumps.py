@@ -170,8 +170,35 @@ def _resolve_manual_judge_pool(
     }]
 
 
+def _entry_anchor_semantics_are_current(entry: Dict[str, Any]) -> bool:
+    """Anvil Stage 3.5D fail-closed check: may a prior ``judge_results.jsonl``
+    entry be treated as *current* judged evidence for skip purposes?
+
+    - Field absent -> legacy entry (pre-3.5D). Preserve the existing
+      treatment: the entry counts as current (§7 -- historical evidence is
+      not retroactively invalidated, no current hash is invented for it).
+    - Field present and equal to ``judge.JUDGE_ANCHOR_POLICY_HASH`` -> the
+      scoring anchors / panel personas / request contract version that
+      produced it match the current judge semantics. Current.
+    - Field present and different -> proven judge-anchor drift. NOT current:
+      the row is re-judged rather than the drifted score standing in as
+      identical current evidence (§8 -- drift cannot masquerade as current).
+
+    Only scoring semantics are gated here. Structural-capability facts
+    (whether a judge 415s) are unaffected by anchors, so
+    ``_matching_exhausted_execution_entry`` / ``_prior_structural_failure``
+    are deliberately left untouched.
+    """
+    recorded = entry.get("judge_anchor_policy_hash")
+    if recorded is None:
+        return True
+    return recorded == judge_mod.JUDGE_ANCHOR_POLICY_HASH
+
+
 def _matching_judged_entry(entry: Dict[str, Any], resolution: Dict[str, Any], judge_mode: str) -> bool:
     if entry.get("status") != "judged" or entry.get("judge_mode") != judge_mode:
+        return False
+    if not _entry_anchor_semantics_are_current(entry):
         return False
     judge = resolution.get("judge") or {}
     expected = {
@@ -197,6 +224,8 @@ def _matching_pending_entry(entry: Dict[str, Any], pool_signature: str, judge_mo
 
 def _matching_judge_error_entry(entry: Dict[str, Any], resolution: Dict[str, Any], judge_mode_configuration: Dict[str, Any]) -> bool:
     if entry.get("status") != "judge_error":
+        return False
+    if not _entry_anchor_semantics_are_current(entry):
         return False
     judge = resolution.get("judge") or {}
     expected = _compatibility_fingerprint(judge, judge_mode_configuration)

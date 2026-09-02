@@ -201,6 +201,72 @@ def test_a_material_anchor_change_produces_non_comparable_recorded_identity(tmp_
 # --- 5. legacy compatibility ---------------------------------------------
 
 
+# --- 4b. fail-closed consumer: drift cannot masquerade as current (§8) ---
+
+
+def test_rejudging_after_a_material_anchor_change_does_not_skip_the_row(tmp_path: Path, monkeypatch):
+    # Judge a run, then change ANCHORS and re-judge the SAME run without
+    # force: the row must NOT be skipped as already-judged -- otherwise the
+    # stale-anchor score stands in as current judged evidence (§8 masquerade).
+    run, first = _judge_a_run(tmp_path)
+    assert first["judged"] == 1
+
+    monkeypatch.setattr(judge_mod, "ANCHORS", judge_mod.ANCHORS + "\n- 50 = borderline.")
+    monkeypatch.setattr(judge_mod, "JUDGE_ANCHOR_POLICY_HASH", judge_mod._judge_anchor_policy_hash())
+
+    pool = [_qualified("preferred", "digest-preferred")]
+    second = judge_dumps.judge_run(
+        judge_client := RecordingJudgeClient(), run,
+        judge_model="preferred", qualified_judges=pool, judge_mode="single",
+    )
+    del judge_client
+    assert second["judged"] == 1
+    assert not any(
+        s.get("reason") == "already_judged_by_resolved_independent_judge"
+        for s in second.get("skipped", [])
+    )
+    # Both entries now recorded; the newest carries the new anchor identity.
+    entries = [json.loads(line) for line in (run / "judge_results.jsonl").read_text().splitlines()]
+    hashes = {e["judge_anchor_policy_hash"] for e in entries if e.get("status") == "judged"}
+    assert len(hashes) == 2
+
+
+def test_rejudging_with_unchanged_anchors_still_skips_the_row(tmp_path: Path):
+    # The gate must not force redundant re-judging when anchors are unchanged.
+    run, first = _judge_a_run(tmp_path)
+    assert first["judged"] == 1
+    pool = [_qualified("preferred", "digest-preferred")]
+    second = judge_dumps.judge_run(
+        RecordingJudgeClient(), run, judge_model="preferred", qualified_judges=pool, judge_mode="single",
+    )
+    assert second["judged"] == 0
+    assert any(
+        s.get("reason") == "already_judged_by_resolved_independent_judge"
+        for s in second.get("skipped", [])
+    )
+
+
+def test_a_legacy_prior_entry_without_the_field_still_skips(tmp_path: Path):
+    # §7: a pre-3.5D entry lacking judge_anchor_policy_hash keeps its
+    # existing treatment -- it counts as current and the row is skipped.
+    run, first = _judge_a_run(tmp_path)
+    sidecar = run / "judge_results.jsonl"
+    entries = [json.loads(line) for line in sidecar.read_text().splitlines()]
+    for entry in entries:
+        entry.pop("judge_anchor_policy_hash", None)
+    sidecar.write_text("".join(json.dumps(e, sort_keys=True) + "\n" for e in entries))
+
+    pool = [_qualified("preferred", "digest-preferred")]
+    second = judge_dumps.judge_run(
+        RecordingJudgeClient(), run, judge_model="preferred", qualified_judges=pool, judge_mode="single",
+    )
+    assert second["judged"] == 0
+    assert any(
+        s.get("reason") == "already_judged_by_resolved_independent_judge"
+        for s in second.get("skipped", [])
+    )
+
+
 def test_legacy_judge_entry_without_the_field_still_reads(tmp_path: Path):
     # A pre-3.5D sidecar entry: readable, original fields intact, no current
     # hash invented for it.
@@ -226,21 +292,27 @@ def test_legacy_judge_entry_without_the_field_still_reads(tmp_path: Path):
     # It is not silently enriched on read.
 
 
-def test_the_anchor_hash_is_not_folded_into_the_judge_fingerprints():
+def test_the_anchor_hash_is_not_folded_into_the_judge_fingerprints(monkeypatch):
     # Regression guard for the advisor finding: the compatibility /
     # execution fingerprints (which drive prior-structural-failure and
-    # exhausted-execution reuse matching) must NOT depend on the anchor
-    # policy hash — otherwise every legacy sidecar entry stops matching and
-    # "legacy lacks anchor identity" is silently reclassified as drift.
+    # exhausted-execution reuse matching) must NOT depend on judge-anchor
+    # semantics — otherwise a material ANCHORS edit would make every prior
+    # structural-failure / exhausted-execution sidecar entry stop matching,
+    # silently reclassifying "legacy lacks anchor identity" as "proven
+    # drift" for facts (does the judge 415?) that anchors cannot affect.
+    #
     judge = _qualified("preferred", "digest-preferred")
     config = {"judge_mode": "single", "num_ctx": None, "think": "auto"}
     before = judge_dumps._compatibility_fingerprint(judge, config)
     before_exec = judge_dumps._execution_fingerprint([judge], config)
 
-    original = judge_mod.JUDGE_ANCHOR_POLICY_HASH
-    try:
-        judge_mod.JUDGE_ANCHOR_POLICY_HASH = "deadbeef" * 8
-        assert judge_dumps._compatibility_fingerprint(judge, config) == before
-        assert judge_dumps._execution_fingerprint([judge], config) == before_exec
-    finally:
-        judge_mod.JUDGE_ANCHOR_POLICY_HASH = original
+    # Mutate every anchor-semantics input — the constant, the ANCHORS
+    # string, and the personas the hash function reads; neither fingerprint
+    # may move. (Also covers a future regression where someone folds in
+    # judge_mod._judge_anchor_policy_hash() the function rather than the
+    # constant.)
+    monkeypatch.setattr(judge_mod, "JUDGE_ANCHOR_POLICY_HASH", "deadbeef" * 8)
+    monkeypatch.setattr(judge_mod, "ANCHORS", "totally different anchors")
+    monkeypatch.setattr(judge_mod, "JUDGE_PANEL_PERSONAS", ("only one persona",))
+    assert judge_dumps._compatibility_fingerprint(judge, config) == before
+    assert judge_dumps._execution_fingerprint([judge], config) == before_exec
