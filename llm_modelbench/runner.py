@@ -1404,6 +1404,68 @@ def _capture_runtime_telemetry(out_dir: Path, client: InferenceClient, factory, 
             "status": value.get("status") or "collected"}
 
 
+def _persist_benchmark_bindings(
+    out_dir: Path, benchmark_bindings: Dict[str, Any], *, resume: bool
+) -> None:
+    """Write the per-run benchmark binding artifact (Anvil Stage 3.2D-2), with
+    Stage 3.2E resume-divergence handling.
+
+    Fresh run: the immutable model-keyed ``{"schema_version", "bindings"}``
+    artifact, byte-identical to Stage 3.2D-2.
+
+    Resumed run: the runtime-identity resume gate does not cover ``--seed``,
+    ``--temperature`` or task-selection drift, so a resumed run can legitimately
+    compute a binding whose ``binding_key`` differs from the one already
+    recorded. The model-keyed ``bindings`` map is never rewritten (Stage 3.2D
+    immutability). Any genuinely new ``binding_key`` -- one a freshly written
+    row now references -- is appended, additively, under
+    ``resume_divergent_bindings`` so that every non-null
+    ``benchmark_binding_key`` on every row still resolves to a recorded binding.
+    """
+    if not benchmark_bindings:
+        return
+    path = out_dir / "benchmark_bindings.json"
+    prior = None
+    if resume and path.exists():
+        try:
+            prior = json.loads(path.read_text())
+        except (OSError, ValueError):
+            prior = None
+    if prior is None:
+        payload = {
+            "schema_version": 1,
+            "bindings": {m: benchmark_bindings[m] for m in sorted(benchmark_bindings)},
+        }
+        path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+        )
+        return
+    known: set = set()
+    for entry in (prior.get("bindings") or {}).values():
+        key = (entry.get("binding") or {}).get("binding_key")
+        if key:
+            known.add(key)
+    for entry in (prior.get("resume_divergent_bindings") or []):
+        key = (entry.get("binding") or {}).get("binding_key")
+        if key:
+            known.add(key)
+    appended = list(prior.get("resume_divergent_bindings") or [])
+    added = False
+    for model in sorted(benchmark_bindings):
+        entry = benchmark_bindings[model]
+        key = entry["binding"]["binding_key"]
+        if key in known:
+            continue
+        known.add(key)
+        appended.append({"model": model, **entry})
+        added = True
+    if added:
+        prior["resume_divergent_bindings"] = appended
+        path.write_text(
+            json.dumps(prior, indent=2, sort_keys=True, allow_nan=False) + "\n"
+        )
+
+
 def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
         include: Optional[str], exclude: Optional[str], skip_offload: bool,
         categories: Optional[List[str]], task_ids: Optional[List[str]] = None,
@@ -1632,15 +1694,8 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
     (out_dir / "skipped_models.json").write_text(json.dumps(skipped_models, indent=2))
     (out_dir / "model_identities.json").write_text(json.dumps(model_identities, indent=2))
     (out_dir / "capability_report.json").write_text(json.dumps({m: profiles[m] for m in active_models}, indent=2))
-    if benchmark_bindings and not (resume and (out_dir / "benchmark_bindings.json").exists()):
-        # Additive, immutable per run. Never rewrite a resume artifact.
-        _bindings_payload = {
-            "schema_version": 1,
-            "bindings": {m: benchmark_bindings[m] for m in sorted(benchmark_bindings)},
-        }
-        (out_dir / "benchmark_bindings.json").write_text(
-            json.dumps(_bindings_payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
-        )
+    if benchmark_bindings:
+        _persist_benchmark_bindings(out_dir, benchmark_bindings, resume=resume)
     status = progress.StatusWriter(out_dir, run_id=run_id, level=level, samples=max(1, cfg.samples),
                                    model_plan=model_plan, cfg=cfg, gpu=gpu,
                                    skipped_models=skipped_models, filters=filter_descriptions,

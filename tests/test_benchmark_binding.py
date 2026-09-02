@@ -195,3 +195,89 @@ def test_placement_evidence_stays_separately_visible(tmp_path):
     assert ri["identities"], "concrete runtime identity still recorded per model"
     assert (run_dir / "benchmark_bindings.json").exists()
     assert (run_dir / "runtime_identity.json").exists()  # both, side by side
+
+
+# --- Anvil Stage 3.2E: resume-divergent binding persistence -----------------
+
+def _model_binding_entry(**over):
+    """Build a real ``benchmark_bindings[model]`` entry the way runner.run does."""
+    from llm_modelbench.benchmark_binding import (
+        binding_to_dict, protocol_to_dict, row_binding_reference,
+    )
+    protocol, binding = _build(**over)
+    return {
+        "binding": binding_to_dict(binding),
+        "protocol": protocol_to_dict(protocol),
+        "row_reference": row_binding_reference(binding, protocol),
+    }
+
+
+def test_fresh_run_writes_the_immutable_model_keyed_artifact(tmp_path):
+    from llm_modelbench.runner import _persist_benchmark_bindings
+
+    bindings = {"m1": _model_binding_entry()}
+    _persist_benchmark_bindings(tmp_path, bindings, resume=False)
+    art = json.loads((tmp_path / "benchmark_bindings.json").read_text())
+    assert art["schema_version"] == 1
+    assert set(art["bindings"]) == {"m1"}
+    assert "resume_divergent_bindings" not in art
+    # A fresh (non-resume) write is unconditional even if a file is already there.
+    before = (tmp_path / "benchmark_bindings.json").read_text()
+    _persist_benchmark_bindings(tmp_path, bindings, resume=False)
+    assert (tmp_path / "benchmark_bindings.json").read_text() == before
+
+
+def test_resume_with_identical_binding_does_not_rewrite_the_artifact(tmp_path):
+    from llm_modelbench.runner import _persist_benchmark_bindings
+
+    bindings = {"m1": _model_binding_entry()}
+    _persist_benchmark_bindings(tmp_path, bindings, resume=False)
+    before = (tmp_path / "benchmark_bindings.json").read_text()
+    # Same protocol + runtime + artifact on resume -> same binding_key -> no-op.
+    _persist_benchmark_bindings(tmp_path, bindings, resume=True)
+    assert (tmp_path / "benchmark_bindings.json").read_text() == before
+
+
+def test_resume_with_a_divergent_binding_appends_it_so_every_row_key_resolves(tmp_path):
+    from llm_modelbench.runner import _persist_benchmark_bindings
+
+    original = {"m1": _model_binding_entry()}
+    _persist_benchmark_bindings(tmp_path, original, resume=False)
+    original_key = original["m1"]["binding"]["binding_key"]
+
+    # A resumed run under a drifted protocol (e.g. --seed / --temperature /
+    # task-selection change -- none gated by the runtime-identity resume check).
+    drifted = {"m1": _model_binding_entry(cfg=_cfg(seed=99, temperature=0.7))}
+    drifted_key = drifted["m1"]["binding"]["binding_key"]
+    assert drifted_key != original_key
+
+    _persist_benchmark_bindings(tmp_path, drifted, resume=True)
+    art = json.loads((tmp_path / "benchmark_bindings.json").read_text())
+
+    # The immutable model-keyed map is untouched...
+    assert art["bindings"]["m1"]["binding"]["binding_key"] == original_key
+    # ...and the divergent binding is recorded additively.
+    div = art["resume_divergent_bindings"]
+    assert [e["binding"]["binding_key"] for e in div] == [drifted_key]
+    assert div[0]["model"] == "m1"
+
+    # Every binding_key any row could carry (B1 from the first pass, B2 from the
+    # resumed pass) now resolves against the artifact -- Anvil amendment section 19.
+    resolvable = {art["bindings"]["m1"]["binding"]["binding_key"]}
+    resolvable |= {e["binding"]["binding_key"] for e in div}
+    assert {original_key, drifted_key} <= resolvable
+
+    # A second resume with the same drift is idempotent.
+    _persist_benchmark_bindings(tmp_path, drifted, resume=True)
+    art2 = json.loads((tmp_path / "benchmark_bindings.json").read_text())
+    assert [e["binding"]["binding_key"] for e in art2["resume_divergent_bindings"]] == [drifted_key]
+
+
+def test_unreadable_prior_artifact_on_resume_is_replaced_not_crashed(tmp_path):
+    from llm_modelbench.runner import _persist_benchmark_bindings
+
+    (tmp_path / "benchmark_bindings.json").write_text("{ not json")
+    bindings = {"m1": _model_binding_entry()}
+    _persist_benchmark_bindings(tmp_path, bindings, resume=True)
+    art = json.loads((tmp_path / "benchmark_bindings.json").read_text())
+    assert set(art["bindings"]) == {"m1"}
