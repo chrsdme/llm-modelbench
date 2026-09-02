@@ -472,6 +472,7 @@ def judge_run(
                     "qualified_judge_pool": pool_evidence,
                     "judge_mode_configuration": judge_mode_configuration,
                     "request_contract_version": judge_mod.JUDGE_REQUEST_CONTRACT_VERSION,
+                    "judge_anchor_policy_hash": judge_mod.JUDGE_ANCHOR_POLICY_HASH,
                     "judge_policy_version": campaign.JUDGE_POLICY_VERSION,
                     "model_role_policy_version": campaign.MODEL_ROLE_POLICY_VERSION,
                 }
@@ -621,6 +622,7 @@ def judge_run(
                         "qualified_judge_pool": pool_evidence,
                         "judge_mode_configuration": judge_mode_configuration,
                         "request_contract_version": judge_mod.JUDGE_REQUEST_CONTRACT_VERSION,
+                        "judge_anchor_policy_hash": judge_mod.JUDGE_ANCHOR_POLICY_HASH,
                         "judge_policy_version": campaign.JUDGE_POLICY_VERSION,
                         "model_role_policy_version": campaign.MODEL_ROLE_POLICY_VERSION,
                     }
@@ -678,6 +680,7 @@ def judge_run(
                 "qualified_judge_pool": pool_evidence,
                 "judge_mode_configuration": judge_mode_configuration,
                 "request_contract_version": judge_mod.JUDGE_REQUEST_CONTRACT_VERSION,
+                "judge_anchor_policy_hash": judge_mod.JUDGE_ANCHOR_POLICY_HASH,
                 "judge_policy_version": campaign.JUDGE_POLICY_VERSION,
                 "model_role_policy_version": campaign.MODEL_ROLE_POLICY_VERSION,
             }

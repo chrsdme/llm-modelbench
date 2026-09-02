@@ -6,12 +6,21 @@ and invalid judge output returns (None, "judge_error: ...") instead of a fake 50
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Optional, Tuple
 
 from .backend import InferenceClient
 from .scoring import strip_thinking
 
+# NOTE (Anvil Stage 3.5D): ANCHORS and JUDGE_PANEL_PERSONAS are judge-request
+# *scoring semantics* — they are embedded verbatim in every judge request and a
+# material edit shifts judged scores for the same model output. Any such edit
+# MUST be accompanied by a bump of JUDGE_REQUEST_CONTRACT_VERSION (the shared
+# algorithm/interpretation version), and is picked up automatically by
+# JUDGE_ANCHOR_POLICY_HASH below, which is recorded on every newly written
+# judge_results.jsonl entry as `judge_anchor_policy_hash`. Comments around these
+# constants are display-only and do not move the hash.
 ANCHORS = """
 Use these anchors:
 - 30 = incomplete, vague, wrong structure, or materially inaccurate.
@@ -19,7 +28,39 @@ Use these anchors:
 - 90 = accurate, structured, practical, concise, and follows all constraints.
 """.strip()
 
+# Panel-judge persona instructions — request material, same class as ANCHORS.
+# Hoisted from judge_panel_result so it is a hashable module constant.
+JUDGE_PANEL_PERSONAS = (
+    "strict correctness judge: penalize factual errors and missed constraints",
+    "pragmatic usefulness judge: reward usable, actionable, well-structured answers",
+    "clarity judge: reward concise, readable writing and clear organization",
+)
+
 JUDGE_REQUEST_CONTRACT_VERSION = "posthoc-judge-request-v1"
+
+
+def _judge_anchor_policy_hash() -> str:
+    """Deterministic canonical identity of the materially scoring-relevant judge
+    request semantics (Anvil Stage 3.5D).
+
+    Mixes the shared algorithm/interpretation version
+    (JUDGE_REQUEST_CONTRACT_VERSION) with the concrete scoring anchors and panel
+    personas. A material change to any of the three moves the hash; a
+    display-only/comment change around them does not (the exact constant values
+    are hashed, nothing else). Uses the project's stable-hash idiom
+    (sorted-keys, compact separators) — see judge_dumps._compatibility_fingerprint.
+    """
+    payload = {
+        "judge_request_contract_version": JUDGE_REQUEST_CONTRACT_VERSION,
+        "anchors": ANCHORS,
+        "panel_personas": list(JUDGE_PANEL_PERSONAS),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+JUDGE_ANCHOR_POLICY_HASH = _judge_anchor_policy_hash()
 
 
 def _extract_json(text: str) -> Optional[dict]:
@@ -172,11 +213,7 @@ def judge_panel(client: InferenceClient, judge_model: str, prompt: str, output: 
 
 
 def judge_panel_result(client: InferenceClient, judge_model: str, prompt: str, output: str, rubric: str, *, num_ctx=None, think="auto") -> dict:
-    personas = [
-        "strict correctness judge: penalize factual errors and missed constraints",
-        "pragmatic usefulness judge: reward usable, actionable, well-structured answers",
-        "clarity judge: reward concise, readable writing and clear organization",
-    ]
+    personas = list(JUDGE_PANEL_PERSONAS)
     scores = []
     reasons = []
     failures = []
