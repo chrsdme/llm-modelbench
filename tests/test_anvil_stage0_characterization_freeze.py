@@ -274,10 +274,11 @@ def _run_mock_benchmark(out_dir: Path, run_id: str) -> Path:
 # not yet confirmed stable across environments).
 FROZEN_TEXT_FILES = ["routing.md", "prune.md", "clones.md"]
 FROZEN_CSV_FILES = ["scorecard.csv"]
-FROZEN_JSON_FILES = ["summary.json"]
+FROZEN_JSON_FILES = ["summary.json", "benchmark_bindings.json"]
 FROZEN_JSONL_FILES = ["raw_results.jsonl"]
 
 EXPECTED_EVIDENCE_FILES = {
+    "benchmark_bindings.json",
     "capability_report.json",
     "clones.md",
     "config.json",

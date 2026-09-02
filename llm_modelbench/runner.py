@@ -1546,6 +1546,7 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
         profiles.update(interrogate_models(client, incompatible_profiles, functional=True))
     model_plan: List[Dict[str, Any]] = []
     active_task_union: List[Task] = []
+    _benchmark_task_sets: Dict[str, List[Task]] = {}
     for model in models:
         profile = profiles[model]
         capabilities = profile.get("declared_capabilities") or []
@@ -1580,7 +1581,36 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
             "tasks_total": len(all_tasks),
             "samples_total": sum(_samples_for_task(t, cfg, sample_mode, judge_mode) for t in all_tasks),
         })
+        _benchmark_task_sets[model] = list(all_tasks)
     _validate_needle_ctx_override(cfg, active_task_union)
+
+    # Anvil Stage 3.2D-2: deterministic protocol/runtime/model binding per
+    # model, built from that model's actual resume-independent task set. Only
+    # when the CLI supplied runtime identities (same guard as
+    # runtime_identity.json) -- a bare runner caller records no binding, which
+    # is a valid "no binding recorded" state, not an error.
+    benchmark_bindings: Dict[str, Any] = {}
+    if runtime_identity_values:
+        from .benchmark_binding import (
+            binding_to_dict, build_model_binding, protocol_to_dict, row_binding_reference,
+        )
+        from .identity import ModelArtifactIdentity
+        for model in (m["model"] for m in model_plan):
+            rid = runtime_identity_values.get(model)
+            if rid is None:
+                continue
+            protocol, binding = build_model_binding(
+                model_artifact_identity=ModelArtifactIdentity.from_ollama_tag_row(models_rows.get(model, {})),
+                selected_tasks=_benchmark_task_sets.get(model, []),
+                cfg=cfg,
+                backend=rid.backend,
+                backend_version=rid.server_version,
+            )
+            benchmark_bindings[model] = {
+                "binding": binding_to_dict(binding),
+                "protocol": protocol_to_dict(protocol),
+                "row_reference": row_binding_reference(binding, protocol),
+            }
     # Anvil Stage 2.6B: the families a model may run are decided exactly
     # once, above, by new_measured_supported_families(). The execution
     # loop below consumes that same decision by model name rather than
@@ -1602,6 +1632,15 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
     (out_dir / "skipped_models.json").write_text(json.dumps(skipped_models, indent=2))
     (out_dir / "model_identities.json").write_text(json.dumps(model_identities, indent=2))
     (out_dir / "capability_report.json").write_text(json.dumps({m: profiles[m] for m in active_models}, indent=2))
+    if benchmark_bindings and not (resume and (out_dir / "benchmark_bindings.json").exists()):
+        # Additive, immutable per run. Never rewrite a resume artifact.
+        _bindings_payload = {
+            "schema_version": 1,
+            "bindings": {m: benchmark_bindings[m] for m in sorted(benchmark_bindings)},
+        }
+        (out_dir / "benchmark_bindings.json").write_text(
+            json.dumps(_bindings_payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+        )
     status = progress.StatusWriter(out_dir, run_id=run_id, level=level, samples=max(1, cfg.samples),
                                    model_plan=model_plan, cfg=cfg, gpu=gpu,
                                    skipped_models=skipped_models, filters=filter_descriptions,
@@ -1808,6 +1847,11 @@ def run(client: InferenceClient, cfg: Config, *, level: str, out_dir: Path,
                 if model in runtime_identity_values:
                     from .runtime_identity import row_identity_reference
                     row.update(row_identity_reference(runtime_identity_values[model]))
+                if model in benchmark_bindings:
+                    # Anvil Stage 3.2D-2: additive protocol/runtime/model
+                    # binding reference. Absence on a legacy row is a valid
+                    # "no binding recorded" state.
+                    row.update(benchmark_bindings[model]["row_reference"])
                 if telemetry_ref is not None:
                     row["runtime_telemetry"] = dict(telemetry_ref)
                 if row_metadata_by_task and task.id in row_metadata_by_task:
