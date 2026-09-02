@@ -258,3 +258,63 @@ def test_rejects_legacy_dict_as_current_runtime_profile_identity():
             observation,
             **_current(observation, current_runtime_profile_identity={"backend": "ollama"}),
         )
+
+
+# --- Anvil Stage 3.4C: legacy-minimal vs rich exact-lookup discrimination ------
+
+
+def _minimal_profile(*, backend="ollama"):
+    """A legacy capability-path RuntimeProfileIdentity: backend + protocol +
+    template hash, but no resolved runtime recipe -- exactly the shape
+    capability_evidence_adapter builds (runtime_configuration_hash and
+    gpu_policy both None)."""
+    return RuntimeProfileIdentity(
+        backend=backend, protocol_version="capability-smoke-v2",
+        template_hash="template-hash-1",
+    )
+
+
+def _rich_profile(*, backend="ollama"):
+    """A Stage 3.2D-style rich benchmark RuntimeProfileIdentity."""
+    return RuntimeProfileIdentity(
+        backend=backend, protocol_version="capability-smoke-v2",
+        template_hash="template-hash-1", runtime_configuration_hash="cfg-1",
+        gpu_policy="primary_gpu_first_minimum_multi_gpu",
+    )
+
+
+def test_legacy_minimal_evidence_is_not_an_exact_match_for_a_rich_current_profile():
+    # A stored legacy-minimal capability observation must NOT be classified
+    # as exact evidence for a materially-known rich runtime profile -- their
+    # stable keys differ (recipe/gpu_policy present vs absent), so the
+    # compatibility contract reports RUNTIME_PROFILE_CHANGED, not a match.
+    observation = _observation(runtime_profile_identity=_minimal_profile())
+    result = capability_observation_identity_compatibility(
+        observation, **_current(observation, current_runtime_profile_identity=_rich_profile())
+    )
+    assert result.compatible is False
+    assert result.reason == REASON.RUNTIME_PROFILE_CHANGED
+
+
+def test_legacy_minimal_evidence_still_matches_a_legacy_minimal_current_profile():
+    # Until a runtime recipe is threaded into capability probing (accepted
+    # debt), a legacy-minimal observation legitimately matches a
+    # legacy-minimal current identity -- the bridge must not break today's
+    # working capability lookups.
+    observation = _observation(runtime_profile_identity=_minimal_profile())
+    result = capability_observation_identity_compatibility(
+        observation,
+        **_current(observation, current_runtime_profile_identity=_minimal_profile()),
+    )
+    assert result.compatible is True
+    assert result.reason == REASON.IDENTITY_MATCH
+
+
+def test_rich_current_profile_matches_rich_exact_evidence():
+    observation = _observation(runtime_profile_identity=_rich_profile())
+    result = capability_observation_identity_compatibility(
+        observation,
+        **_current(observation, current_runtime_profile_identity=_rich_profile()),
+    )
+    assert result.compatible is True
+    assert result.reason == REASON.IDENTITY_MATCH

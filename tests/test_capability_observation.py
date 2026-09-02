@@ -183,3 +183,49 @@ def test_ledger_payload_tamper_detection_on_reload():
     tampered = {**payload, "result": MeasuredCapabilityState.MEASURED_UNSUPPORTED.value}
     with pytest.raises(ValueError, match="does not match stored payload"):
         CapabilityObservation.from_ledger_payload(tampered)
+
+
+# --- Anvil Stage 3.4C: legacy-minimal ledger payloads stay historical ----------
+
+
+def _minimal_profile():
+    """Legacy capability-path identity: no resolved runtime recipe -- the
+    shape every capability observation has today (runtime_configuration_hash
+    and gpu_policy both None)."""
+    return RuntimeProfileIdentity(
+        backend="ollama", protocol_version="capability-smoke-v2",
+        template_hash="template-hash-1",
+    )
+
+
+def test_legacy_minimal_payload_round_trips_without_enrichment(tmp_path):
+    ledger = EvidenceLedger(tmp_path / "capability.jsonl")
+    observation = _observation(runtime_profile_identity=_minimal_profile())
+    append_capability_observation(ledger, observation)
+
+    stored = EvidenceLedger(tmp_path / "capability.jsonl").get(observation.observation_id)
+    restored = CapabilityObservation.from_ledger_payload(stored.payload)
+    assert restored == observation
+    assert restored.runtime_profile_identity.runtime_configuration_hash is None
+    assert restored.runtime_profile_identity.gpu_policy is None
+    assert restored.runtime_profile_identity.stable_key() == observation.runtime_profile_identity.stable_key()
+    assert stored.payload["runtime_profile_identity"]["runtime_configuration_hash"] is None
+    assert stored.payload["runtime_profile_identity"]["gpu_policy"] is None
+
+
+def test_reconstruction_cannot_enrich_a_minimal_identity_into_a_rich_one():
+    # "Modernizing" a stored minimal identity on reload by supplying a
+    # runtime_configuration_hash / gpu_policy would recompute a divergent
+    # stable_key -> evidence_hash, and the tamper check must reject it.
+    # Enrichment on read is structurally impossible, not just discouraged.
+    payload = _observation(runtime_profile_identity=_minimal_profile()).to_ledger_payload()
+    enriched = {
+        **payload,
+        "runtime_profile_identity": {
+            **payload["runtime_profile_identity"],
+            "runtime_configuration_hash": "cfg-1",
+            "gpu_policy": "primary_gpu_first_minimum_multi_gpu",
+        },
+    }
+    with pytest.raises(ValueError, match="does not match stored payload"):
+        CapabilityObservation.from_ledger_payload(enriched)
