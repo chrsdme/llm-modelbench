@@ -479,14 +479,11 @@ def test_normalise_sha_matches_across_prefix_and_case_but_not_content():
 
 
 def test_unknown_placement_class_fails_closed():
-    cmd, status, _ = build_llama_server_command(
-        _request(placement_class="something_new"),
-        executable_path="x",
-        model_path="m.gguf",
-        hardware_inventory=INVENTORY,
-    )
-    assert cmd is None
-    assert status is MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE
+    # Anvil Stage 3B.3D: an unknown placement class can no longer even be
+    # represented -- ResolvedRuntime.__post_init__ rejects it against
+    # PLACEMENT_LABELS, so the materialiser never has to interpret one.
+    with pytest.raises(ValueError, match="placement_class must be one of"):
+        _request(placement_class="something_new")
 
 
 def test_gpu_identity_untranslatable_when_uuid_absent_from_inventory():

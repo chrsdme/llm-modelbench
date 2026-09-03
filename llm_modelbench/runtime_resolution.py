@@ -188,6 +188,19 @@ class ResolvedRuntime:
     #: cannot recompute it (it is never handed the topology).
     tensor_split_weights: Optional[Tuple[int, ...]] = None
 
+    def __post_init__(self) -> None:
+        # Anvil Stage 3B.3D (carryover from the 3B.3C deferred list): the
+        # placement class is documented as "one of
+        # ram_spill_preflight.PLACEMENT_LABELS"; enforce it so a recipe the
+        # downstream materialiser cannot interpret (e.g. "single_gpu",
+        # "minimum_multi_gpu") can never be constructed. Narrow, additive: the
+        # real resolver already only emits PLACEMENT_LABELS values.
+        if self.placement_class not in PLACEMENT_LABELS:
+            raise ValueError(
+                f"ResolvedRuntime.placement_class must be one of "
+                f"{PLACEMENT_LABELS!r}, got {self.placement_class!r}"
+            )
+
     def to_dict(self) -> dict:
         return {
             "backend": self.backend,

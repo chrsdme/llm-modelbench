@@ -111,6 +111,150 @@ def _runtime_store(args) -> Path:
     return Path(value) if value else profile_store_path()
 
 
+def _resolve_and_materialise_for_run(args, cfg: Config, *, inventory=None):
+    """Anvil Stage 3B.3D: the composed resolve_runtime -> materialise ->
+    lifecycle-controller step for a real (non-mock) benchmark run.
+
+    Runs the same composed discovery/selection preflight ``_client`` uses
+    (one discovery, not two), converts its output into ``resolve_runtime``
+    inputs, and hands the accepted resolution to the Stage 3B.3C materialiser
+    (external reuse, or -- for ``llama_cpp`` with no reusable external and a
+    complete recipe -- an owned ephemeral ``llama-server``). Ollama is
+    reuse-only; there is no fallback between backends.
+
+    Returns a :class:`runtime_materialisation.RuntimeMaterialisationOutcome`.
+    A non-``ok`` outcome is a structured pre-row refusal the caller turns into
+    a ``SystemExit`` -- never a model-quality failure.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    from .runtime_materialisation import production_seams, resolve_and_materialise_runtime
+    from .runtime_profiles import discover_backend_executables
+    from .hardware import host_memory_snapshot
+
+    unattended = bool(getattr(args, "unattended", False))
+    policy = DecisionPolicy(unattended=unattended, allow_backend_auto_selection=unattended)
+    explicit = getattr(args, "runtime_profile", None)
+    try:
+        profiles, default = load_profiles(_runtime_store(args))
+        preflight = resolve_operational_preflight(
+            cfg, explicit_profile=explicit, default_profile=default,
+            interactive=bool(sys.stdin.isatty()) and not unattended,
+            policy=policy, store_path=_runtime_store(args), gpu_inventory=inventory,
+            discover_fn=discover_runtimes, select_fn=select_runtime,
+        )
+    except RuntimeProfileError as exc:
+        raise SystemExit(f"runtime selection failed: {exc}") from exc
+
+    if preflight.blocked:
+        blocker = preflight.blocker
+        # Preserve the established no-profile Ollama behaviour when the local
+        # service is down and nothing explicit/saved was requested.
+        if blocker.reason != "no_healthy_candidates" or explicit or default or profiles:
+            from .runtime_materialisation import RuntimeMaterialisationOutcome
+            return RuntimeMaterialisationOutcome(
+                ok=False, backend="", resolution_status="no_usable_endpoint",
+                refusal_reason=f"runtime_not_resolved: no_usable_endpoint: {blocker.detail}",
+            )
+        selected_backend = "ollama"
+        selected_endpoint_profile = implicit_ollama_profile(cfg)
+        explicit_profile_name = None
+    else:
+        selected = preflight.selected_candidate
+        selected_backend = selected.profile.backend
+        selected_endpoint_profile = selected.profile
+        explicit_profile_name = explicit or (
+            selected.profile.name if selected.profile.name else None
+        )
+
+    # Read-only metadata; args._runtime_profile is the profile identity the
+    # rest of cmd_run (runtime-identity collection) expects.
+    setattr(args, "_runtime_profile", selected_endpoint_profile)
+
+    backend_executables = None
+    try:
+        backend_executables = discover_backend_executables()
+    except Exception:  # noqa: BLE001 -- executable discovery is best-effort input
+        backend_executables = None
+
+    def now_iso() -> str:
+        return _dt.now(_tz.utc).isoformat()
+
+    seams = production_seams(
+        executable_path=_llama_server_executable_path(backend_executables),
+        # Stage 3B.3D blocker (documented): no benchmark-model -> local GGUF
+        # resolution exists yet. Managed spawn fails closed at
+        # RESOLVED_RECIPE_INCOMPLETE; external reuse is unaffected.
+        model_path=None,
+        model_primary_sha256=None,
+        hardware_inventory=list(preflight.gpu_inventory),
+        now_iso=now_iso,
+    )
+    return resolve_and_materialise_runtime(
+        selected_backend=selected_backend,
+        discovered_candidates=list(preflight.candidates),
+        topology=preflight.topology,
+        host_meminfo=host_memory_snapshot() or {},
+        seams=seams,
+        allow_ram_spill=bool(getattr(cfg, "allow_ram_spill", False)),
+        requested_context=getattr(cfg, "ctx_override", None),
+        explicit_profile_name=explicit_profile_name,
+        backend_executables=backend_executables,
+    )
+
+
+def _llama_server_executable_path(backend_executables) -> "str | None":
+    if not backend_executables:
+        return None
+    for entry in backend_executables:
+        if getattr(entry, "backend", None) == "llama_cpp":
+            return getattr(entry, "executable_path", None)
+    return None
+
+
+def _client_for_materialised_endpoint(endpoint: str, cfg: Config, *, backend: str) -> InferenceClient:
+    """Build the backend client against the materialisation-verified endpoint
+    (never a stale ``cfg.ollama_url`` / configured profile endpoint). The
+    backend is the resolver's -- it is not re-decided here."""
+    if backend == "llama_cpp":
+        from .llama_cpp import LlamaCppBackendAdapter, LlamaCppClient
+        return LlamaCppBackendAdapter(
+            LlamaCppClient(endpoint, cfg.seed, cfg.temperature, cfg.request_timeout)
+        )
+    cfg.ollama_url = endpoint
+    from .ollama import OllamaClient
+    return OllamaBackendAdapter(
+        OllamaClient(endpoint, cfg.seed, cfg.temperature, cfg.request_timeout)
+    )
+
+
+def _persist_materialisation_evidence(out_dir: Path, materialisation, *, benchmark_completed: bool) -> None:
+    """Write ``materialisation_evidence.json`` after the lifecycle scope has
+    exited. Observes the (structurally-recorded, never-raised) cleanup outcome
+    so a clean benchmark with a failed cleanup is not lost -- persisted as an
+    evidence field and surfaced as a printed warning."""
+    from .runtime_materialisation import materialisation_evidence
+
+    controller = getattr(materialisation, "controller", None)
+    cleanup_result = getattr(controller, "last_cleanup", None) if controller is not None else None
+    record = materialisation_evidence(
+        materialisation, cleanup_result=cleanup_result, benchmark_completed=benchmark_completed
+    )
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "materialisation_evidence.json").write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    except OSError as exc:
+        print(f"warning: could not persist materialisation evidence: {exc}")
+    if "cleanup_failed_on_successful_benchmark" in record.get("warnings", []):
+        detail = (record.get("cleanup") or {}).get("detail") or "see materialisation_evidence.json"
+        print(
+            "warning: the benchmark completed but the owned runtime cleanup "
+            f"did not succeed ({detail}); the managed llama-server may still be "
+            "running -- check and stop it manually."
+        )
+
+
 def _confirm_profile_change(message: str, *, yes: bool) -> None:
     if yes:
         return
@@ -567,7 +711,36 @@ def cmd_run(args, cfg):
     # and thread it through both backend selection and runtime-identity
     # collection below, rather than letting each independently re-detect.
     inventory = detect_gpus()
-    client = _client(args, cfg, gpu_inventory=inventory)
+    # Anvil Stage 3B.3D: for a real (non-mock) run the client is built against
+    # the endpoint the Stage 3B.2 resolver + Stage 3B.3C materialiser verify --
+    # reusing a healthy external runtime or launching an owned ephemeral
+    # llama-server -- never a stale configured endpoint. A non-RESOLVED
+    # resolution or a materialisation failure is a structured pre-row refusal
+    # (SystemExit, zero benchmark rows), never a model-quality failure.
+    # --mock keeps the offline stub and touches neither the resolver nor the
+    # materialiser.
+    materialisation = None
+    if getattr(args, "mock", False):
+        client = _client(args, cfg, gpu_inventory=inventory)
+    else:
+        materialisation = _resolve_and_materialise_for_run(args, cfg, inventory=inventory)
+        if not materialisation.ok:
+            raise SystemExit(f"run refused: {materialisation.refusal_reason}")
+        client = _client_for_materialised_endpoint(
+            materialisation.endpoint, cfg, backend=materialisation.backend
+        )
+        # Runtime-identity collection reads args._runtime_profile.endpoint; for
+        # a managed (owned) llama-server that endpoint is the *materialised*
+        # one, not the resolver's pre-launch endpoint, so identity evidence and
+        # the client agree on where the runtime actually is.
+        _existing = getattr(args, "_runtime_profile", None)
+        if _existing is not None and _existing.endpoint != materialisation.endpoint:
+            from dataclasses import replace as _dc_replace
+            try:
+                setattr(args, "_runtime_profile",
+                        _dc_replace(_existing, endpoint=materialisation.endpoint))
+            except TypeError:
+                pass  # not a dataclass profile -- leave as-is
     out_dir = _run_dir(args)
     rankings_dir = _ranking_dir_for(args, run_id=out_dir.name)
     task_ids = _task_ids(args)
@@ -599,52 +772,75 @@ def cmd_run(args, cfg):
     )
     _require_host_code_opt_in(args, plan)
     _confirm_plan(args, plan)
+    # Anvil Stage 3B.3D: run the benchmark inside the runtime lifecycle scope
+    # so an owned (managed) llama-server is torn down on EVERY exit path
+    # (normal completion, exception, KeyboardInterrupt), exactly once. External
+    # reuse exits with no destructive action. The controller records a cleanup
+    # failure structurally rather than raising it; after the scope exits we
+    # observe `last_cleanup` and persist it (a clean benchmark with a failed
+    # cleanup must not disappear). The `finally` guarantees the evidence is
+    # written even on a structured SystemExit / an unexpected exception.
+    import contextlib as _contextlib
+    _lifecycle = (
+        materialisation.controller
+        if materialisation is not None and materialisation.controller is not None
+        else _contextlib.nullcontext()
+    )
+    _benchmark_completed = False
     try:
-        runner.run(client, cfg, level=args.level, out_dir=out_dir,
-                   include=args.include_regex, exclude=args.exclude_regex,
-                   skip_offload=args.skip_offload,
-                   categories=_categories(args),
-                   task_ids=task_ids, task_regex=args.task_regex,
-                   family_base_only=args.family_base_only,
-                   context_aliases_only=args.context_aliases_only,
-                   context_only=args.context_only,
-                   resume=args.resume, judge_mode=args.judge, dump_subjective=args.dump_subjective,
-                   dump_raw=args.dump_raw,
-                   status_interval=args.status_interval, live_ui=args.live_ui,
-                   sample_mode=args.sample_mode, fingerprint_enabled=args.fingerprint,
-                   selected_models=selected_models,
-                   capability_profiles=plan.get("capability_profiles") or capability_profiles,
-                   auto_probe=bool(getattr(args, "auto", False)),
-                   capture_runtime_telemetry=True,
-                   runtime_profile=getattr(args, "_runtime_profile", None),
-                   runtime_identity=current_runtime_identities,
-                   gpu_inventory=inventory)
-    except ValueError as exc:
-        raise SystemExit(f"run refused: {exc}")
-    except KeyboardInterrupt:
-        print(f"\nINTERRUPTED: Ctrl+C received. Partial results are preserved in {out_dir}")
-        print("Rebuilding partial reports from raw_results.jsonl...")
-        try:
+        with _lifecycle:
+            try:
+                runner.run(client, cfg, level=args.level, out_dir=out_dir,
+                       include=args.include_regex, exclude=args.exclude_regex,
+                       skip_offload=args.skip_offload,
+                       categories=_categories(args),
+                       task_ids=task_ids, task_regex=args.task_regex,
+                       family_base_only=args.family_base_only,
+                       context_aliases_only=args.context_aliases_only,
+                       context_only=args.context_only,
+                       resume=args.resume, judge_mode=args.judge, dump_subjective=args.dump_subjective,
+                       dump_raw=args.dump_raw,
+                       status_interval=args.status_interval, live_ui=args.live_ui,
+                       sample_mode=args.sample_mode, fingerprint_enabled=args.fingerprint,
+                       selected_models=selected_models,
+                       capability_profiles=plan.get("capability_profiles") or capability_profiles,
+                       auto_probe=bool(getattr(args, "auto", False)),
+                       capture_runtime_telemetry=True,
+                       runtime_profile=getattr(args, "_runtime_profile", None),
+                       runtime_identity=current_runtime_identities,
+                       gpu_inventory=inventory)
+                _benchmark_completed = True
+            except ValueError as exc:
+                raise SystemExit(f"run refused: {exc}")
+            except KeyboardInterrupt:
+                print(f"\nINTERRUPTED: Ctrl+C received. Partial results are preserved in {out_dir}")
+                print("Rebuilding partial reports from raw_results.jsonl...")
+                try:
+                    report.build(out_dir, cfg)
+                    print(f"partial reports -> {out_dir}")
+                    if rankings_dir is not None:
+                        _update_rankings(out_dir.parent, rankings_dir, quiet=False, include_separate=bool(getattr(args, "separate_ranking", False)), only_run_ids=([out_dir.name] if getattr(args, "separate_ranking", False) else None))
+                except Exception as exc:
+                    print(f"partial report rebuild failed: {exc}")
+                    print(f"You can retry with: llm-modelbench report --out {out_dir}")
+                raise SystemExit(130)
             report.build(out_dir, cfg)
-            print(f"partial reports -> {out_dir}")
+            validity = runner.assess_run_validity(out_dir)
+            print(f"\ndone -> {out_dir}  validity={validity['status']}")
+            if validity["status"] == "invalid":
+                raise SystemExit("run completed without usable benchmark evidence; reports were preserved, rankings were not updated")
+            if getattr(args, "strict_harness", False) and validity["harness_error_rows"]:
+                raise SystemExit(
+                    f"strict harness check failed: {validity['harness_error_rows']} harness-error row(s); "
+                    "reports were preserved, rankings were not updated"
+                )
             if rankings_dir is not None:
                 _update_rankings(out_dir.parent, rankings_dir, quiet=False, include_separate=bool(getattr(args, "separate_ranking", False)), only_run_ids=([out_dir.name] if getattr(args, "separate_ranking", False) else None))
-        except Exception as exc:
-            print(f"partial report rebuild failed: {exc}")
-            print(f"You can retry with: llm-modelbench report --out {out_dir}")
-        raise SystemExit(130)
-    report.build(out_dir, cfg)
-    validity = runner.assess_run_validity(out_dir)
-    print(f"\ndone -> {out_dir}  validity={validity['status']}")
-    if validity["status"] == "invalid":
-        raise SystemExit("run completed without usable benchmark evidence; reports were preserved, rankings were not updated")
-    if getattr(args, "strict_harness", False) and validity["harness_error_rows"]:
-        raise SystemExit(
-            f"strict harness check failed: {validity['harness_error_rows']} harness-error row(s); "
-            "reports were preserved, rankings were not updated"
-        )
-    if rankings_dir is not None:
-        _update_rankings(out_dir.parent, rankings_dir, quiet=False, include_separate=bool(getattr(args, "separate_ranking", False)), only_run_ids=([out_dir.name] if getattr(args, "separate_ranking", False) else None))
+    finally:
+        if materialisation is not None:
+            _persist_materialisation_evidence(
+                out_dir, materialisation, benchmark_completed=_benchmark_completed
+            )
 
 
 

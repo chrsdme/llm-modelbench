@@ -51,7 +51,7 @@ U_B = "GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 # --------------------------------------------------------------------------
 # fixtures
 # --------------------------------------------------------------------------
-def _exec_settings(*, context_size=8192, strategy="single_gpu"):
+def _exec_settings(*, context_size=8192, strategy="single_device"):
     return RuntimeExecutionSettings(strategy=strategy, context_size=context_size)
 
 
@@ -60,7 +60,7 @@ def _resolved_recipe(
     backend="llama_cpp",
     endpoint="http://127.0.0.1:8081",
     gpu_uuids=(U_A,),
-    placement_class="single_gpu",
+    placement_class="full_gpu",
     requested_context=8192,
     allow_ram_spill=False,
     execution_settings=None,
@@ -655,7 +655,7 @@ def test_spill_permission_flows_through_only_from_the_recipe():
 
 
 def test_selected_gpu_uuids_come_from_the_resolved_recipe():
-    req = _request(gpu_uuids=(U_A, U_B), placement_class="minimum_multi_gpu")
+    req = _request(gpu_uuids=(U_A, U_B), placement_class="multi_gpu")
     owned = _owned_result(request=req).owned_runtime
     assert owned.selected_physical_gpu_uuids == (U_A, U_B)
 
