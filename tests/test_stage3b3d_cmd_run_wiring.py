@@ -211,6 +211,40 @@ def test_client_is_built_against_the_materialised_endpoint_not_a_stale_one(monke
     assert built["backend"] == "llama_cpp"
 
 
+def test_resolve_and_materialise_for_run_backend_is_the_selected_candidate_not_recommended(monkeypatch):
+    """_resolve_and_materialise_for_run must take the backend from the
+    selected candidate's profile, never derive it from `recommended`."""
+    from llm_modelbench import preflight as preflight_mod
+    from llm_modelbench.topology_budget import TopologyBudget
+
+    def _fake_preflight(cfg, **kw):
+        cand = RuntimeCandidate(
+            profile=RuntimeProfile(name="llama-local", backend="llama_cpp",
+                                   endpoint="http://127.0.0.1:8081", provenance="configured"),
+            health="healthy", source=("saved_profile",), detail="fx", recommended=True,
+        )
+        return preflight_mod.PreflightResult(
+            gpu_inventory=(), candidates=(cand,), selected_candidate=cand,
+            topology=TopologyBudget(devices=()), blocker=None,
+        )
+
+    monkeypatch.setattr(cli, "resolve_operational_preflight", _fake_preflight)
+    captured = {}
+
+    def _fake_ram(*, selected_backend, **kw):
+        captured["backend"] = selected_backend
+        return rm.RuntimeMaterialisationOutcome(
+            ok=False, backend=selected_backend, resolution_status="fit_unknown",
+            refusal_reason="runtime_not_resolved: fit_unknown: stop here",
+        )
+
+    monkeypatch.setattr(rm, "resolve_and_materialise_runtime", _fake_ram)
+    args = _run_args("/tmp/x-unused")
+    out = cli._resolve_and_materialise_for_run(args, Config(), inventory=())
+    assert captured["backend"] == "llama_cpp"  # from the profile, not "ollama" via recommended
+    assert out.ok is False
+
+
 def test_client_for_materialised_endpoint_honours_the_resolver_backend():
     cfg = Config()
     llama = cli._client_for_materialised_endpoint("http://127.0.0.1:9099", cfg, backend="llama_cpp")

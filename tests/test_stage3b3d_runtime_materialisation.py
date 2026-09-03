@@ -462,10 +462,13 @@ def _ok_managed_outcome(tensor_split_weights=None, gpu_uuids=(U_A, U_B), placeme
 
 
 def test_evidence_carries_resolved_recipe_verbatim():
-    out = _ok_managed_outcome(tensor_split_weights=(7, 5))
+    # U_B sorts AFTER U_A -- put U_B first so a stray sort() in evidence
+    # serialisation would reorder to [U_A, U_B] and this assertion fails.
+    out = _ok_managed_outcome(gpu_uuids=(U_B, U_A), tensor_split_weights=(7, 5))
     ev = materialisation_evidence(out)
     res = ev["resolution"]
-    assert res["selected_physical_gpu_uuids"] == [U_A, U_B]  # resolver order, not sorted
+    assert res["selected_physical_gpu_uuids"] == [U_B, U_A]  # resolver order, NOT sorted
+    assert sorted(res["selected_physical_gpu_uuids"]) != res["selected_physical_gpu_uuids"]
     assert res["tensor_split_weights"] == [7, 5]
     assert res["placement_class"] == "multi_gpu"
     assert res["allow_ram_spill"] is False
@@ -574,6 +577,26 @@ def test_recommended_flag_cannot_influence_materialisation():
         resolve_fn=lambda **kw: _res(False),
     )
     assert a.endpoint == b.endpoint and a.ownership == b.ownership
+    assert a.backend == b.backend == "llama_cpp"  # backend echo is the caller's, never derived from `recommended`
+
+
+def test_backend_echo_is_the_caller_selected_backend_verbatim():
+    # Whatever the selected_candidate's `recommended` flag is, the outcome's
+    # backend is exactly the caller's selected_backend -- never re-derived.
+    for recommended in (True, False):
+        cand = RuntimeCandidate(
+            profile=RuntimeProfile(name="llama-local", backend="llama_cpp",
+                                   endpoint="http://127.0.0.1:8081", provenance="configured"),
+            health="healthy", source=("saved_profile",), detail="fx", recommended=recommended,
+        )
+        res = RuntimeResolution(status=RuntimeResolutionStatus.RESOLVED, reason="resolved",
+                                detail="fx", resolved=_recipe(), selected_candidate=cand)
+        out = resolve_and_materialise_runtime(
+            selected_backend="llama_cpp", discovered_candidates=[], topology=object(),
+            host_meminfo={}, seams=_seams(external_still_healthy=lambda r: False),
+            resolve_fn=lambda **kw: res,
+        )
+        assert out.backend == "llama_cpp"
 
 
 def test_composition_adds_no_planning_authority_bad_seams_type_raises():
