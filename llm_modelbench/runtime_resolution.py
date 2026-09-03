@@ -51,6 +51,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from math import gcd
 from typing import Any, Iterable, Mapping, Optional, Sequence, Tuple
 
 from .capabilities import MeasuredCapabilityState
@@ -174,6 +175,18 @@ class ResolvedRuntime:
     #: *external-reuse* materialisation does not (ModelBench does not choose
     #: what an already-running server has loaded).
     model_primary_sha256: Optional[str] = None
+    #: OWNER DECISION 3B.3C-OD1 -- the deterministic inter-GPU layer split for
+    #: a ``multi_gpu`` (or multi-GPU ``ram_spill``) placement, as positive
+    #: integer weights aligned to ``selected_physical_gpu_uuids`` order,
+    #: reduced by GCD to their smallest equivalent form. Derived at resolve
+    #: time from the *same* authoritative safe GPU weight budgets
+    #: (``GPUMemoryBudget.safe_capacity_bytes`` = installed VRAM after the
+    #: fixed §4 headroom reserve -- the static value that already feeds
+    #: ``resolve_spill_preflight``; never live free VRAM). Capacity-
+    #: proportional, no optimisation search. ``None`` for a single-device
+    #: placement (``full_gpu``). The materialiser reads this verbatim and
+    #: cannot recompute it (it is never handed the topology).
+    tensor_split_weights: Optional[Tuple[int, ...]] = None
 
     def to_dict(self) -> dict:
         return {
@@ -189,6 +202,11 @@ class ResolvedRuntime:
             "allow_ram_spill": self.allow_ram_spill,
             "estimated_ram_spill_bytes": self.estimated_ram_spill_bytes,
             "model_primary_sha256": self.model_primary_sha256,
+            "tensor_split_weights": (
+                list(self.tensor_split_weights)
+                if self.tensor_split_weights is not None
+                else None
+            ),
         }
 
 
@@ -450,6 +468,53 @@ def _safe_selected_pool_capacity_bytes(
     return sum(int(c) for c in caps)
 
 
+class _SplitUnresolvable(Exception):
+    """Internal: the deterministic multi-GPU split cannot be derived from the
+    authoritative safe capacity evidence. Converted to a fail-closed
+    resolution status by :func:`resolve_runtime`."""
+
+
+def _deterministic_tensor_split_weights(
+    topology: TopologyBudget, selected_uuids: Sequence[str]
+) -> Optional[Tuple[int, ...]]:
+    """OWNER DECISION 3B.3C-OD1: capacity-proportional deterministic layer
+    split over the selected GPUs' authoritative *safe* weight budgets.
+
+    Returns positive integer weights aligned to ``selected_uuids`` order,
+    reduced by GCD to their smallest equivalent form (14:10 -> (7, 5); equal
+    -> (1, 1)). ``None`` for a single-device selection (no split needed).
+
+    Raises :class:`_SplitUnresolvable` when any selected device's
+    ``safe_capacity_bytes`` is unknown or non-positive, or a selected UUID is
+    absent from the topology -- the caller fails the whole resolution closed
+    rather than emit a recipe with a guessed or degenerate split. The split is
+    derived from the same static ``safe_capacity_bytes`` that feeds
+    :func:`_safe_selected_pool_capacity_bytes`; live free VRAM never enters.
+    """
+    if len(selected_uuids) <= 1:
+        return None
+    by_uuid = {d.uuid: d for d in topology.devices}
+    caps: list[int] = []
+    for u in selected_uuids:
+        device = by_uuid.get(u)
+        cap = None if device is None else device.safe_capacity_bytes
+        if cap is None or int(cap) <= 0:
+            raise _SplitUnresolvable(
+                f"selected GPU {u!r} has no usable safe capacity budget; the "
+                f"inter-GPU split cannot be resolved"
+            )
+        caps.append(int(cap))
+    divisor = 0
+    for c in caps:
+        divisor = gcd(divisor, c)
+    if divisor <= 0:  # pragma: no cover -- unreachable given caps > 0
+        raise _SplitUnresolvable("degenerate safe-capacity budgets for the selected pool")
+    weights = tuple(c // divisor for c in caps)
+    if any(w <= 0 for w in weights):  # pragma: no cover -- gcd guarantees >= 1
+        raise _SplitUnresolvable("a selected GPU resolved to a zero split weight")
+    return weights
+
+
 def resolve_runtime(
     *,
     selected_backend: Optional[str],
@@ -613,6 +678,24 @@ def resolve_runtime(
 
     selected_uuids = tuple(spill.selected_gpu_uuids or fit.selected_gpu_uuids)
 
+    # OWNER DECISION 3B.3C-OD1: a multi-GPU placement carries an explicit
+    # deterministic inter-GPU split resolved here from the authoritative safe
+    # weight budgets -- never delegated to llama.cpp, never searched. A pool
+    # whose safe capacity is not fully known fails the resolution closed
+    # rather than shipping a recipe the materialiser would have to guess at.
+    try:
+        tensor_split_weights = _deterministic_tensor_split_weights(
+            topology, selected_uuids
+        )
+    except _SplitUnresolvable as exc:
+        return _unresolved(
+            RuntimeResolutionStatus.FIT_UNKNOWN,
+            f"the deterministic multi-GPU split could not be resolved: {exc}",
+            selected_candidate=candidate,
+            workload_fit=fit,
+            considered_endpoints=considered_endpoints,
+        )
+
     # --- 6. resolved runtime recipe ----------------------------------
     strategy = "single_device" if len(selected_uuids) <= 1 else "layer_split"
     # ``allow_cpu_spill`` carries the resolved RAM-spill *permission*, not the
@@ -654,6 +737,7 @@ def resolve_runtime(
             if isinstance(model_primary_sha256, str) and model_primary_sha256.strip()
             else None
         ),
+        tensor_split_weights=tensor_split_weights,
     )
     return RuntimeResolution(
         status=RuntimeResolutionStatus.RESOLVED,

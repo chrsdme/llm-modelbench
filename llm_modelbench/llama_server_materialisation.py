@@ -30,18 +30,39 @@ domain into a real (or, in tests, a fake) ``llama-server`` child process:
   UUID that is not NVIDIA-UUID-shaped or is absent from the authoritative
   hardware inventory is a structured failure, never a silently-wrong env.
 
-``llama-server`` flag choices are pinned against build 10326 (``--help``
-inspection, recorded in ``ANVIL_PROGRESS.md``): ``--ctx-size``,
+``llama-server`` flag choices are pinned against build 10326 (a bounded
+``<exe> --version`` read supplies the build number -- ``--help`` does not
+carry it -- and ``--help`` supplies the option tokens; recorded in
+``ANVIL_PROGRESS.md``): ``--ctx-size``,
 ``-ngl/--n-gpu-layers`` (default ``auto``, accepts the enum ``all``),
 ``-fit/--fit`` (default ``on`` -- adjusts unset args to fit *live* device
 memory), ``-sm/--split-mode {none,layer,row,tensor}`` (default ``layer``).
 Because omitting ``-ngl`` on build 10326 makes *llama-server* decide the
 GPU/CPU layer split from live VRAM, absence of a flag is **not** a spill
 guarantee. The resolved ``placement_class`` is the sole placement authority:
-``full_gpu`` -> ``-ngl all --fit off --split-mode none`` (documented enums,
-fail closed on load); ``multi_gpu`` / ``ram_spill`` -> structured
-``RESOLVED_RECIPE_INCOMPLETE`` (OWNER DECISION REQUIRED 3B.3C-OD1 / -OD2).
-Before spawn, the resolved executable's ``--help`` is checked for the
+
+* ``full_gpu``  -> ``-ngl all --fit off --split-mode none`` (documented
+  enums, single device, fail closed on load).
+* ``multi_gpu`` -> ``-ngl all --fit off --split-mode layer --tensor-split
+  <resolved weights> --main-gpu 0`` (OWNER DECISION 3B.3C-OD1: the resolver
+  carries a deterministic capacity-proportional inter-GPU split on
+  ``ResolvedRuntime.tensor_split_weights``; this module emits it verbatim,
+  never derives, defers, or rebalances it -- it is not even handed the
+  topology).
+* ``ram_spill`` -> ``--ctx-size <resolved concrete context> --fit on -ngl
+  auto`` (+ ``--split-mode none --main-gpu 0`` for one GPU, or
+  ``--split-mode layer --tensor-split <resolved weights> --main-gpu 0`` for a
+  pool). OWNER DECISION 3B.3C-OD2: only after 3B.2 has resolved
+  ``placement_class == "ram_spill"``, granted ``allow_ram_spill``, and a
+  concrete benchmark context, llama.cpp may choose **only** the exact
+  GPU-resident-vs-host layer boundary. ``allow_ram_spill`` false or an absent
+  context -> ``RESOLVED_RECIPE_INCOMPLETE``, never ``--fit on``.
+
+The ``LlamaServerCommand`` invariant ``fit == "on"`` iff ``n_gpu_layers ==
+"auto"`` makes the RAM-spill delegation structurally inseparable from its
+preconditions.
+Before spawn, the resolved executable's ``--version`` (build pin) and
+``--help`` are checked for the
 launch-essential options (:data:`REQUIRED_LLAMA_SERVER_CLI_OPTIONS`); a
 mismatch is :attr:`MaterialisationStatus.CLI_CONTRACT_UNSUPPORTED`, not a
 launch. The bytes at ``model_path`` are hashed and matched to the resolved
@@ -59,6 +80,7 @@ from typing import Callable, Mapping, Optional, Sequence, Tuple
 
 from .freeze import _sha256 as _sha256_file
 from .hardware import GPUDevice
+from .runtime_resolution import ResolvedRuntime
 from .runtime_lifecycle import (
     CleanupFn,
     ForcedCleanupFailed,
@@ -127,6 +149,10 @@ REQUIRED_LLAMA_SERVER_CLI_OPTIONS = (
     "--n-gpu-layers",
     "--fit",
     "--split-mode",
+    # OWNER DECISION 3B.3C-OD1 / -OD2 -- multi-GPU deterministic split +
+    # RAM-spill layer-boundary delegation launch options.
+    "--tensor-split",
+    "--main-gpu",
 )
 
 #: llama-server build this command builder's flag/default assumptions were
@@ -157,20 +183,44 @@ def _default_cli_contract_probe(executable_path: str) -> "frozenset[str]":
 
     argv-list, ``shell=False``, bounded output, short timeout. Any failure to
     run or parse yields an empty set -> the caller fails closed.
+
+    Token presence alone cannot prove the *accepted-value* semantics the
+    command builder depends on (``-ngl auto``, ``--fit on/off``, the
+    ``--tensor-split`` weight-list form). Those are pinned to
+    :data:`SUPPORTED_LLAMA_SERVER_BUILD`: a separate bounded ``<exe>
+    --version`` read must report that build (llama-server prints
+    ``version: <build> (<sha>)`` there -- ``--help`` does *not* carry it). If
+    the build cannot be read or is not the supported one, the contract is
+    unproven and an empty set is returned so the caller fails closed. One
+    pinned-build check, not a version manager.
     """
-    try:
-        completed = subprocess.run(  # noqa: S603 -- argv list, shell=False
-            [executable_path, "--help"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=10.0,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+    def _run(arg: str) -> Optional[str]:
+        try:
+            completed = subprocess.run(  # noqa: S603 -- argv list, shell=False
+                [executable_path, arg],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=10.0,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return (completed.stdout or "") + "\n" + (completed.stderr or "")
+
+    version_blob = _run("--version")
+    if version_blob is None:
         return frozenset()
-    blob = (completed.stdout or "") + "\n" + (completed.stderr or "")
-    return frozenset(re.findall(r"--[a-z][a-z0-9-]+", blob))
+    build_match = re.search(
+        r"(?:version|build)[:\s]+b?(\d{3,})", version_blob, re.IGNORECASE
+    )
+    if build_match is None or build_match.group(1) != SUPPORTED_LLAMA_SERVER_BUILD:
+        return frozenset()
+
+    help_blob = _run("--help")
+    if help_blob is None:
+        return frozenset()
+    return frozenset(re.findall(r"--[a-z][a-z0-9-]+", help_blob))
 
 
 class MaterialisationStatus(str, Enum):
@@ -257,15 +307,26 @@ class LlamaServerCommand:
     ctx_size: Optional[int]
     split_mode: Optional[str]
     env_overlay: Mapping[str, str]
-    #: ``--n-gpu-layers`` value. Only the documented enum ``"all"`` is ever
-    #: emitted by the builder (never a computed integer / ``"auto"``); ``None``
-    #: means the flag is omitted (build-10326 default ``auto`` -> a spill /
-    #: fit path the builder only reaches when the recipe permits it).
+    #: ``--n-gpu-layers`` value. The builder emits either the documented enum
+    #: ``"all"`` (deterministic GPU placement -- ``full_gpu`` / ``multi_gpu``),
+    #: or ``"auto"`` (OWNER DECISION 3B.3C-OD2 -- ``ram_spill`` only, hands
+    #: llama.cpp *only* the exact GPU-resident-vs-host layer boundary). Never a
+    #: computed integer. ``None`` omits the flag.
     n_gpu_layers: Optional[str] = None
     #: ``--fit`` value (``"on"`` / ``"off"``). ``"off"`` pins llama-server's
     #: live-VRAM auto-fit *off* so placement follows the resolved recipe, not
-    #: device memory at launch. ``None`` omits the flag (default ``on``).
+    #: device memory at launch (deterministic placements). ``"on"`` is only
+    #: reached for an owner-sanctioned ``ram_spill`` recipe. ``None`` omits it.
     fit: Optional[str] = None
+    #: ``--tensor-split`` value: the resolved deterministic inter-GPU weights
+    #: joined by ``","`` (OWNER DECISION 3B.3C-OD1). Present only for a
+    #: layer-split placement over >= 2 GPUs. Copied from the recipe verbatim.
+    tensor_split: Optional[str] = None
+    #: ``--main-gpu`` value. ``0`` = ordinal zero inside the already-resolved
+    #: ``CUDA_VISIBLE_DEVICES`` map -- explicitly preserves the primary GPU.
+    #: Emitted for every multi-GPU launch and for a one-GPU ``ram_spill``
+    #: launch (RAM-SPILL COMMAND POLICY). ``None`` omits the flag.
+    main_gpu: Optional[int] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "env_overlay", dict(self.env_overlay))
@@ -273,13 +334,38 @@ class LlamaServerCommand:
             raise ManagedMaterialisationError("port must be an integer 1..65535")
         if self.split_mode is not None and self.split_mode not in {"none", "layer", "row", "tensor"}:
             raise ManagedMaterialisationError("split_mode must be a llama-server split mode")
-        if self.n_gpu_layers is not None and self.n_gpu_layers != "all":
+        if self.n_gpu_layers is not None and self.n_gpu_layers not in {"all", "auto"}:
             raise ManagedMaterialisationError(
-                "n_gpu_layers may only be the documented enum 'all' or None; "
-                "ModelBench never emits a computed layer count"
+                "n_gpu_layers may only be the documented enum 'all', 'auto', or "
+                "None; ModelBench never emits a computed layer count"
             )
         if self.fit is not None and self.fit not in {"on", "off"}:
             raise ManagedMaterialisationError("fit must be 'on', 'off', or None")
+        # OWNER DECISION 3B.3C-OD2 structural invariant: ``--fit on`` and
+        # ``-ngl auto`` only ever appear together (the RAM-spill delegation),
+        # and never apart. Enforced here so the "allow --fit on when spill is
+        # not permitted" mutation fails at construction, not at a policy branch.
+        if (self.fit == "on") != (self.n_gpu_layers == "auto"):
+            raise ManagedMaterialisationError(
+                "fit == 'on' iff n_gpu_layers == 'auto' (the sanctioned "
+                "RAM-spill layer-boundary delegation); neither may appear alone"
+            )
+        if self.tensor_split is not None:
+            parts = self.tensor_split.split(",")
+            if len(parts) < 2 or not all(p.isdigit() and int(p) > 0 for p in parts):
+                raise ManagedMaterialisationError(
+                    "tensor_split must be >= 2 positive integer weights joined by ','"
+                )
+            if self.split_mode != "layer":
+                raise ManagedMaterialisationError(
+                    "tensor_split requires split_mode 'layer'"
+                )
+        if self.main_gpu is not None and (
+            isinstance(self.main_gpu, bool)
+            or not isinstance(self.main_gpu, int)
+            or self.main_gpu < 0
+        ):
+            raise ManagedMaterialisationError("main_gpu must be a non-negative ordinal")
 
     @property
     def argv(self) -> Tuple[str, ...]:
@@ -298,6 +384,8 @@ class LlamaServerCommand:
             env_overlay=self.env_overlay,
             n_gpu_layers=self.n_gpu_layers,
             fit=self.fit,
+            tensor_split=self.tensor_split,
+            main_gpu=self.main_gpu,
         )
 
 
@@ -319,6 +407,10 @@ def _render_argv(cmd: LlamaServerCommand) -> Tuple[str, ...]:
         argv += ["--fit", cmd.fit]
     if cmd.split_mode is not None:
         argv += ["--split-mode", cmd.split_mode]
+    if cmd.tensor_split is not None:
+        argv += ["--tensor-split", cmd.tensor_split]
+    if cmd.main_gpu is not None:
+        argv += ["--main-gpu", str(int(cmd.main_gpu))]
     return tuple(argv)
 
 
@@ -399,17 +491,28 @@ def build_llama_server_command(
         3B.2 already proved the workload fits the selected GPU, so if the
         bytes do not actually fit, llama-server failing to load is the
         correct fail-closed outcome -- not a silent CPU spill.
-      - ``multi_gpu`` -> structured ``RESOLVED_RECIPE_INCOMPLETE``. Stage
-        3B.2 selected the GPU *pool* but never resolved how layers are
-        distributed across it; ModelBench must not derive a split (or a
-        ``--tensor-split`` ratio), and llama.cpp's default distribution
-        cannot be verified as recipe-deterministic here. OWNER DECISION
-        REQUIRED (3B.3C-OD1).
-      - ``ram_spill`` -> structured ``RESOLVED_RECIPE_INCOMPLETE``. Stage
-        3B.2 granted the RAM-spill *permission* and computed
-        ``estimated_ram_spill_bytes`` but never a concrete on-GPU layer
-        count; ModelBench must not invent one. OWNER DECISION REQUIRED
-        (3B.3C-OD2).
+      - ``multi_gpu`` -> ``--n-gpu-layers all --fit off --split-mode layer
+        --tensor-split <weights> --main-gpu 0`` (OWNER DECISION 3B.3C-OD1).
+        The resolver has already computed the deterministic
+        capacity-proportional inter-GPU split on
+        ``ResolvedRuntime.tensor_split_weights`` (GCD-reduced positive-int
+        weights aligned to ``selected_physical_gpu_uuids``). This function
+        only *validates* it (one positive weight per selected UUID) and
+        renders it -- it never derives, defers to llama.cpp, or rebalances the
+        split, and is not handed the topology. A missing / inconsistent split
+        is ``RESOLVED_RECIPE_INCOMPLETE``. ``--main-gpu 0`` = ordinal zero
+        inside the resolved CVD map, preserving the primary GPU.
+      - ``ram_spill`` -> ``--ctx-size <resolved concrete context> --fit on
+        --n-gpu-layers auto`` (+ ``--split-mode none --main-gpu 0`` for one
+        GPU, or ``--split-mode layer --tensor-split <weights> --main-gpu 0``
+        for a pool). OWNER DECISION 3B.3C-OD2: only after 3B.2 has resolved
+        ``placement_class == "ram_spill"``, granted ``allow_ram_spill``, and a
+        concrete benchmark context, llama.cpp may choose **only** the exact
+        GPU-resident-vs-host layer boundary. ``allow_ram_spill`` false, an
+        absent context, or (multi-GPU) a missing resolved split ->
+        ``RESOLVED_RECIPE_INCOMPLETE``, never ``--fit on``. Backend, GPU pool,
+        inter-GPU split, context, model artifact and sampling stay
+        resolver-owned.
     """
     if not isinstance(request, MaterialisationRequest):
         raise ManagedMaterialisationError("request must be a MaterialisationRequest")
@@ -446,24 +549,71 @@ def build_llama_server_command(
         n_gpu_layers: Optional[str] = "all"
         fit: Optional[str] = "off"
         split_mode: Optional[str] = "none"
+        tensor_split: Optional[str] = None
+        main_gpu: Optional[int] = None
+        ctx_size: Optional[int] = (
+            int(recipe.requested_context)
+            if recipe.requested_context is not None
+            else None
+        )
     elif placement == "multi_gpu":
-        return (
-            None,
-            MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE,
-            "resolved placement_class 'multi_gpu' selects a GPU pool but the "
-            "Stage 3B.2 recipe does not resolve the inter-GPU layer "
-            "distribution; ModelBench will not derive one or defer it to "
-            "llama.cpp's default (OWNER DECISION REQUIRED 3B.3C-OD1)",
+        # OWNER DECISION 3B.3C-OD1: the resolver carries the deterministic
+        # inter-GPU split. Emit it verbatim; ModelBench never derives, defers,
+        # or rebalances it. --fit off / -ngl all keep placement pinned.
+        split, reason = _resolved_layer_split_or_none(recipe, "multi_gpu")
+        if reason is not None:
+            return None, MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE, reason
+        n_gpu_layers = "all"
+        fit = "off"
+        split_mode = "layer"
+        tensor_split = split
+        main_gpu = 0
+        ctx_size = (
+            int(recipe.requested_context)
+            if recipe.requested_context is not None
+            else None
         )
     elif placement == "ram_spill":
-        return (
-            None,
-            MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE,
-            "resolved placement_class 'ram_spill' grants a spill permission "
-            "but the Stage 3B.2 recipe resolves no on-GPU layer count; "
-            "ModelBench will not invent an offload quantity (OWNER DECISION "
-            "REQUIRED 3B.3C-OD2)",
-        )
+        # OWNER DECISION 3B.3C-OD2: 3B.2 has resolved placement_class=ram_spill
+        # and RAM preflight passed. llama.cpp is permitted to choose ONLY the
+        # exact GPU-resident-vs-host layer boundary (-ngl auto + --fit on).
+        # Everything else stays resolver-owned. A concrete benchmark context
+        # is mandatory -- with --fit on an absent --ctx-size is itself
+        # fit-adjustable, which would let llama.cpp pick the context.
+        if recipe.allow_ram_spill is not True:
+            return (
+                None,
+                MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE,
+                "resolved placement_class 'ram_spill' without an explicit "
+                "allow_ram_spill permission on the recipe; a managed launch "
+                "must never enable --fit on / -ngl auto without it",
+            )
+        if recipe.requested_context is None:
+            return (
+                None,
+                MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE,
+                "a 'ram_spill' managed launch requires a concrete resolved "
+                "benchmark context (--ctx-size); with --fit on an unset "
+                "context would itself be fit-adjustable (OWNER DECISION "
+                "3B.3C-OD2)",
+            )
+        n_gpu_layers = "auto"
+        fit = "on"
+        ctx_size = int(recipe.requested_context)
+        if len(recipe.selected_physical_gpu_uuids) > 1:
+            split, reason = _resolved_layer_split_or_none(recipe, "ram_spill")
+            if reason is not None:
+                return None, MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE, reason
+            split_mode = "layer"
+            tensor_split = split
+            main_gpu = 0
+        else:
+            # One-GPU spill: the prompt's RAM-SPILL COMMAND POLICY pins
+            # --split-mode none + --main-gpu 0 (ordinal zero inside the
+            # single-entry CUDA_VISIBLE_DEVICES map = the selected primary).
+            split_mode = "none"
+            tensor_split = None
+            main_gpu = 0
     else:
         return (
             None,
@@ -479,19 +629,52 @@ def build_llama_server_command(
             model_path=model_path,
             host=host,
             port=port,
-            ctx_size=(
-                int(recipe.requested_context)
-                if recipe.requested_context is not None
-                else None
-            ),
+            ctx_size=ctx_size,
             split_mode=split_mode,
             env_overlay=env_overlay,
             n_gpu_layers=n_gpu_layers,
             fit=fit,
+            tensor_split=tensor_split,
+            main_gpu=main_gpu,
         ),
         None,
         "",
     )
+
+
+def _resolved_layer_split_or_none(
+    recipe: ResolvedRuntime, placement: str
+) -> Tuple[Optional[str], Optional[str]]:
+    """Validate the recipe's ``tensor_split_weights`` against its selected GPU
+    pool and render the ``--tensor-split`` string. Returns ``(value, None)`` on
+    success or ``(None, reason)`` for a fail-closed structured failure.
+
+    The weights are OWNER DECISION 3B.3C-OD1's authoritative resolved split.
+    This function *checks* them (present, one positive integer per selected
+    UUID) and joins them -- it never computes or reweights."""
+    uuids = recipe.selected_physical_gpu_uuids
+    weights = recipe.tensor_split_weights
+    if weights is None:
+        return (
+            None,
+            f"resolved placement_class {placement!r} selects {len(uuids)} GPUs "
+            f"but the recipe carries no tensor_split_weights; ModelBench will "
+            f"not derive an inter-GPU split (OWNER DECISION 3B.3C-OD1)",
+        )
+    if len(weights) != len(uuids):
+        return (
+            None,
+            f"resolved tensor_split_weights {tuple(weights)!r} does not have one "
+            f"weight per selected GPU ({len(uuids)}); the split is inconsistent",
+        )
+    if not all(isinstance(w, int) and not isinstance(w, bool) and w > 0 for w in weights):
+        return (
+            None,
+            f"resolved tensor_split_weights {tuple(weights)!r} contains a "
+            f"non-positive or non-integer weight; a selected GPU would get no "
+            f"layers",
+        )
+    return ",".join(str(int(w)) for w in weights), None
 
 
 # ---------------------------------------------------------------------------

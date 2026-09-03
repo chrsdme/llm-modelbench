@@ -62,12 +62,18 @@ def _recipe(
     placement_class="full_gpu",
     estimated_ram_spill_bytes=None,
     model_primary_sha256=SHA,
+    tensor_split_weights="_auto",
 ):
     # ``strategy`` defaults to match ``placement_class`` / the UUID count the
     # way the real resolver does (single_device for <=1 UUID, layer_split for
     # a pool); an explicit value still overrides for edge-case coverage.
     if strategy is None:
         strategy = "single_device" if len(gpu_uuids) <= 1 else "layer_split"
+    # OD1: the real resolver derives a GCD-reduced split for a >1-UUID pool.
+    # Default the fixture to an equal split of the right length; pass an
+    # explicit tuple / None to override.
+    if tensor_split_weights == "_auto":
+        tensor_split_weights = tuple(1 for _ in gpu_uuids) if len(gpu_uuids) > 1 else None
     settings = RuntimeExecutionSettings(strategy=strategy, context_size=requested_context)
     return ResolvedRuntime(
         backend=backend,
@@ -83,6 +89,7 @@ def _recipe(
         allow_ram_spill=allow_ram_spill,
         estimated_ram_spill_bytes=estimated_ram_spill_bytes,
         model_primary_sha256=model_primary_sha256,
+        tensor_split_weights=tensor_split_weights,
     )
 
 
@@ -240,32 +247,192 @@ def test_no_extra_gpu_is_added():
     assert cmd.env_overlay["CUDA_VISIBLE_DEVICES"].count("GPU-") == 1
 
 
-def test_multi_gpu_fails_closed_recipe_incomplete_for_materialisation():
-    cmd, status, detail = build_llama_server_command(
-        _request(gpu_uuids=(U_A, U_B), placement_class="multi_gpu"),
-        executable_path="x",
-        model_path="m.gguf",
-        hardware_inventory=INVENTORY,
-    )
-    assert cmd is None
-    assert status is MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE
-    assert "multi_gpu" in detail and "OD1" in detail
-
-
-def test_ram_spill_placement_fails_closed_no_invented_offload_quantity():
-    cmd, status, detail = build_llama_server_command(
+# --- OWNER DECISION 3B.3C-OD1 -- deterministic multi-GPU split -------------
+def _multi_gpu_cmd(weights=(7, 5), uuids=(U_A, U_B), **kw):
+    return build_llama_server_command(
         _request(
-            placement_class="ram_spill",
-            allow_ram_spill=True,
-            estimated_ram_spill_bytes=1234,
+            gpu_uuids=uuids, placement_class="multi_gpu",
+            tensor_split_weights=weights, **kw,
         ),
-        executable_path="x",
-        model_path="m.gguf",
-        hardware_inventory=INVENTORY,
+        executable_path="x", model_path="m.gguf", hardware_inventory=INVENTORY,
     )
+
+
+def test_multi_gpu_emits_the_exact_resolved_tensor_split():
+    cmd, status, _ = _multi_gpu_cmd(weights=(7, 5))
+    assert status is None
+    argv = cmd.argv
+    assert argv[argv.index("--tensor-split") + 1] == "7,5"
+    assert argv[argv.index("--split-mode") + 1] == "layer"
+    assert argv[argv.index("--n-gpu-layers") + 1] == "all"
+    assert argv[argv.index("--fit") + 1] == "off"
+    assert "auto" not in argv
+    # OD1: --main-gpu 0 = ordinal zero inside the resolved CVD map = primary.
+    assert argv[argv.index("--main-gpu") + 1] == "0"
+    assert cmd.env_overlay["CUDA_VISIBLE_DEVICES"] == (
+        f"GPU-{U_A[4:].lower()},GPU-{U_B[4:].lower()}"
+    )
+
+
+def test_multi_gpu_three_way_split_is_emitted_verbatim():
+    inv3 = INVENTORY + (GPUDevice(2, "GPU-00000000-1111-2222-3333-666666666666",
+                                  "0000:03:00.0", "C", 8000.0, None, None),)
+    U_C = "GPU-00000000-1111-2222-3333-666666666666"
+    cmd, status, _ = build_llama_server_command(
+        _request(gpu_uuids=(U_A, U_B, U_C), placement_class="multi_gpu",
+                 tensor_split_weights=(4, 3, 2)),
+        executable_path="x", model_path="m.gguf", hardware_inventory=inv3,
+    )
+    assert status is None
+    assert cmd.argv[cmd.argv.index("--tensor-split") + 1] == "4,3,2"
+
+
+def test_multi_gpu_materialiser_cannot_alter_the_split():
+    # The builder is not handed the topology, so it has no capacity input to
+    # recompute from -- the only split it can emit is the recipe's.
+    cmd_a, _, _ = _multi_gpu_cmd(weights=(7, 5))
+    cmd_b, _, _ = _multi_gpu_cmd(weights=(3, 2))
+    assert cmd_a.argv[cmd_a.argv.index("--tensor-split") + 1] == "7,5"
+    assert cmd_b.argv[cmd_b.argv.index("--tensor-split") + 1] == "3,2"
+
+
+def test_multi_gpu_split_survives_with_port():
+    cmd, _, _ = _multi_gpu_cmd(weights=(7, 5))
+    moved = cmd.with_port(8137)
+    assert moved.port == 8137
+    assert moved.argv[moved.argv.index("--tensor-split") + 1] == "7,5"
+    assert moved.argv[moved.argv.index("--split-mode") + 1] == "layer"
+    assert moved.argv[moved.argv.index("--main-gpu") + 1] == "0"
+
+
+def test_multi_gpu_missing_split_fails_closed():
+    cmd, status, detail = _multi_gpu_cmd(weights=None)
     assert cmd is None
     assert status is MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE
-    assert "ram_spill" in detail and "OD2" in detail
+    assert "split" in detail.lower()
+
+
+def test_multi_gpu_split_length_mismatch_fails_closed():
+    cmd, status, _ = _multi_gpu_cmd(weights=(7,), uuids=(U_A, U_B))
+    assert cmd is None
+    assert status is MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE
+
+
+def test_multi_gpu_non_positive_split_weight_fails_closed():
+    cmd, status, _ = _multi_gpu_cmd(weights=(7, 0))
+    assert cmd is None
+    assert status is MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE
+
+
+def test_multi_gpu_split_cannot_be_a_live_capacity_ratio():
+    # A discriminating test: replacing the resolved (7,5) with an equal split
+    # must be observable in the emitted command.
+    cmd, _, _ = _multi_gpu_cmd(weights=(7, 5))
+    assert cmd.argv[cmd.argv.index("--tensor-split") + 1] != "1,1"
+
+
+# --- OWNER DECISION 3B.3C-OD2 -- RAM spill delegates only the layer boundary
+def _ram_spill_cmd(*, uuids=(U_A,), weights="_auto", context=8192, allow=True, **kw):
+    rkw = dict(
+        gpu_uuids=uuids, placement_class="ram_spill",
+        allow_ram_spill=allow, estimated_ram_spill_bytes=4321,
+        requested_context=context,
+    )
+    if weights != "_auto":
+        rkw["tensor_split_weights"] = weights
+    rkw.update(kw)
+    return build_llama_server_command(
+        _request(**rkw),
+        executable_path="x", model_path="m.gguf", hardware_inventory=INVENTORY,
+    )
+
+
+def test_ram_spill_one_gpu_emits_fit_on_auto_with_concrete_context():
+    cmd, status, _ = _ram_spill_cmd(uuids=(U_A,), context=8192)
+    assert status is None
+    argv = cmd.argv
+    assert argv[argv.index("--ctx-size") + 1] == "8192"
+    assert argv[argv.index("--fit") + 1] == "on"
+    assert argv[argv.index("--n-gpu-layers") + 1] == "auto"
+    assert argv[argv.index("--split-mode") + 1] == "none"
+    assert "--tensor-split" not in argv
+    # RAM-SPILL COMMAND POLICY pins --main-gpu 0 for a one-GPU spill recipe.
+    assert argv[argv.index("--main-gpu") + 1] == "0"
+
+
+def test_ram_spill_multi_gpu_uses_the_exact_stage_3b2_tensor_split():
+    cmd, status, _ = _ram_spill_cmd(uuids=(U_A, U_B), weights=(7, 5), context=4096)
+    assert status is None
+    argv = cmd.argv
+    assert argv[argv.index("--fit") + 1] == "on"
+    assert argv[argv.index("--n-gpu-layers") + 1] == "auto"
+    assert argv[argv.index("--split-mode") + 1] == "layer"
+    assert argv[argv.index("--tensor-split") + 1] == "7,5"
+    assert argv[argv.index("--main-gpu") + 1] == "0"
+
+
+def test_ram_spill_without_concrete_context_fails_closed():
+    cmd, status, detail = _ram_spill_cmd(uuids=(U_A,), context=None)
+    assert cmd is None
+    assert status is MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE
+    assert "context" in detail.lower()
+
+
+def test_ram_spill_without_permission_fails_closed_never_fit_on():
+    cmd, status, _ = _ram_spill_cmd(uuids=(U_A,), allow=False)
+    assert cmd is None
+    assert status is MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE
+
+
+def test_ram_spill_multi_gpu_missing_split_fails_closed():
+    cmd, status, _ = _ram_spill_cmd(uuids=(U_A, U_B), weights=None)
+    assert cmd is None
+    assert status is MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE
+
+
+def test_full_gpu_never_emits_fit_on_or_auto():
+    cmd, _, _ = build_llama_server_command(
+        _request(gpu_uuids=(U_A,), placement_class="full_gpu"),
+        executable_path="x", model_path="m.gguf", hardware_inventory=INVENTORY,
+    )
+    assert cmd.argv[cmd.argv.index("--fit") + 1] == "off"
+    assert cmd.argv[cmd.argv.index("--n-gpu-layers") + 1] == "all"
+    assert "auto" not in cmd.argv
+
+
+def test_multi_gpu_normal_never_emits_fit_on_or_auto():
+    cmd, _, _ = _multi_gpu_cmd(weights=(7, 5))
+    assert cmd.argv[cmd.argv.index("--fit") + 1] == "off"
+    assert cmd.argv[cmd.argv.index("--n-gpu-layers") + 1] == "all"
+    assert "auto" not in cmd.argv
+
+
+def test_ram_spill_context_survives_with_port():
+    cmd, _, _ = _ram_spill_cmd(uuids=(U_A,), context=8192)
+    moved = cmd.with_port(8200)
+    assert moved.argv[moved.argv.index("--ctx-size") + 1] == "8192"
+    assert moved.argv[moved.argv.index("--fit") + 1] == "on"
+    assert moved.argv[moved.argv.index("--n-gpu-layers") + 1] == "auto"
+
+
+def test_llama_command_rejects_fit_on_without_auto_layers():
+    from llm_modelbench.llama_server_materialisation import LlamaServerCommand
+    with pytest.raises(ManagedMaterialisationError):
+        LlamaServerCommand(
+            executable_path="x", model_path="m", host="127.0.0.1", port=8080,
+            ctx_size=8192, split_mode="none", env_overlay={},
+            n_gpu_layers="all", fit="on",
+        )
+
+
+def test_llama_command_rejects_auto_layers_without_fit_on():
+    from llm_modelbench.llama_server_materialisation import LlamaServerCommand
+    with pytest.raises(ManagedMaterialisationError):
+        LlamaServerCommand(
+            executable_path="x", model_path="m", host="127.0.0.1", port=8080,
+            ctx_size=8192, split_mode="none", env_overlay={},
+            n_gpu_layers="auto", fit="off",
+        )
 
 
 def test_full_gpu_with_a_multi_uuid_pool_fails_closed_not_single_device():
@@ -572,6 +739,85 @@ def test_cli_contract_missing_launch_essential_option_fails_before_spawn():
 def test_cli_contract_probe_that_cannot_run_the_binary_fails_closed():
     out = _spawn(_request(), cli_contract_probe=lambda exe: frozenset())
     assert out.status is MaterialisationStatus.CLI_CONTRACT_UNSUPPORTED
+
+
+def test_cli_contract_requires_the_multi_gpu_launch_options():
+    for opt in ("--tensor-split", "--main-gpu", "--split-mode"):
+        assert opt in lsm.REQUIRED_LLAMA_SERVER_CLI_OPTIONS
+
+
+def test_cli_contract_missing_tensor_split_fails_before_spawn():
+    spawned = {"n": 0}
+
+    def _counting_popen(argv, **kw):
+        spawned["n"] += 1
+        return _FakePopen(argv, **kw)
+
+    def _no_tensor_split(exe):
+        return frozenset(lsm.REQUIRED_LLAMA_SERVER_CLI_OPTIONS) - {"--tensor-split"}
+
+    out = _spawn(
+        _request(gpu_uuids=(U_A, U_B), placement_class="multi_gpu",
+                 tensor_split_weights=(7, 5)),
+        cli_contract_probe=_no_tensor_split,
+        popen=_counting_popen,
+    )
+    assert out.status is MaterialisationStatus.CLI_CONTRACT_UNSUPPORTED
+    assert spawned["n"] == 0
+
+
+def test_default_cli_probe_requires_the_supported_build_or_fails_closed(monkeypatch):
+    # value semantics (-ngl auto, --fit on/off) can't be proven from token
+    # scraping alone; the default probe pins to the known-good build via a
+    # SEPARATE `--version` read (llama-server does not print the build in
+    # `--help`).
+    version_blob = "version: 10326 (3653e6d6d)\nbuilt with GNU 15.2.0\n"
+    help_blob = (
+        "usage: llama-server\n"
+        "--model --host --port --ctx-size --n-gpu-layers --fit "
+        "--split-mode --tensor-split --main-gpu\n"
+    )
+    state = {"version": version_blob}
+
+    def _fake_run(argv, **kw):
+        blob = state["version"] if argv[-1] == "--version" else help_blob
+
+        class _R:
+            stdout = blob
+            stderr = ""
+
+        return _R()
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    assert "--tensor-split" in lsm._default_cli_contract_probe("/x/llama-server")
+    assert "--main-gpu" in lsm._default_cli_contract_probe("/x/llama-server")
+
+    # wrong build -> fail closed
+    state["version"] = version_blob.replace("10326", "9999")
+    assert lsm._default_cli_contract_probe("/x/llama-server") == frozenset()
+
+    # no build line at all -> fail closed
+    state["version"] = "some unrelated banner\n"
+    assert lsm._default_cli_contract_probe("/x/llama-server") == frozenset()
+
+
+@pytest.mark.skipif(
+    __import__("shutil").which("llama-server") is None,
+    reason="llama-server not installed",
+)
+def test_default_cli_probe_against_the_real_installed_binary():
+    # AGENTS.md-allowed: `--version` / `--help` reads, no inference, no
+    # service mutation. Proves the build-pin regex and token scrape actually
+    # match the binary the resolver would launch.
+    import shutil
+
+    exe = shutil.which("llama-server")
+    advertised = lsm._default_cli_contract_probe(exe)
+    assert advertised, "the installed llama-server did not satisfy the build pin"
+    for opt in lsm.REQUIRED_LLAMA_SERVER_CLI_OPTIONS:
+        assert opt in advertised, opt
+    # a path that cannot run -> fail closed
+    assert lsm._default_cli_contract_probe("/nonexistent/llama-server") == frozenset()
 
 
 # ==========================================================================
@@ -1053,7 +1299,14 @@ def test_materialiser_never_calls_fit_or_topology_or_recommended():
         "resolve_spill_preflight",
         "_recommended",
         "tok_s",
-        "tensor_split",  # we never construct --tensor-split ratios
+        # OWNER DECISION 3B.3C-OD1: the materialiser emits the resolver's
+        # `tensor_split_weights` verbatim (--tensor-split), but it must never
+        # *derive* a split -- it is never handed the topology or any capacity
+        # figure. Ban the capacity/budget symbols it would need to compute one.
+        "safe_capacity_bytes",
+        "effective_now_bytes",
+        "TopologyBudget",
+        "gcd",
     ):
         assert banned not in src, banned
 

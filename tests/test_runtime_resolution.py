@@ -35,6 +35,7 @@ from llm_modelbench.topology_budget import topology_from_inventory
 
 U_A = "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 U_B = "GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+U_C = "GPU-cccccccc-cccc-cccc-cccc-cccccccccccc"
 
 GB = 1024 * 1024 * 1024
 
@@ -61,11 +62,27 @@ def _single_gpu_topology(*, installed_mb=24000, free_mb=None):
     )
 
 
-def _dual_gpu_topology(*, a_mb=16000, b_mb=16000):
+def _dual_gpu_topology(*, a_mb=16000, b_mb=16000, a_free_mb=None, b_free_mb=None):
+    live = {}
+    if a_free_mb is not None:
+        live[U_A] = {"free": a_free_mb}
+    if b_free_mb is not None:
+        live[U_B] = {"free": b_free_mb}
     return topology_from_inventory(
         (
             GPUDevice(0, U_A, "0000:01:00.0", "fixture-A", a_mb, None, None),
             GPUDevice(1, U_B, "0000:02:00.0", "fixture-B", b_mb, None, None),
+        ),
+        live_by_uuid_mib=live or None,
+    )
+
+
+def _triple_gpu_topology(*, a_mb=16000, b_mb=16000, c_mb=16000):
+    return topology_from_inventory(
+        (
+            GPUDevice(0, U_A, "0000:01:00.0", "fixture-A", a_mb, None, None),
+            GPUDevice(1, U_B, "0000:02:00.0", "fixture-B", b_mb, None, None),
+            GPUDevice(2, U_C, "0000:03:00.0", "fixture-C", c_mb, None, None),
         ),
     )
 
@@ -557,3 +574,196 @@ def test_resolved_recipe_serializes_with_stable_physical_gpu_identity():
     assert d["selected_physical_gpu_uuids"] == [U_A]
     assert d["placement_class"] in ("full_gpu", "multi_gpu", "ram_spill")
     assert d["runtime_profile_identity_stable_key"]  # non-empty stable key
+
+
+# --------------------------------------------------------------------------
+# OWNER DECISION 3B.3C-OD1 -- deterministic multi-GPU tensor split
+# --------------------------------------------------------------------------
+from math import gcd  # noqa: E402
+
+from llm_modelbench.topology_budget import TopologyBudget  # noqa: E402
+
+
+def _expected_split(topology: TopologyBudget, uuids):
+    caps = []
+    by_uuid = {d.uuid: d for d in topology.devices}
+    for u in uuids:
+        caps.append(int(by_uuid[u].safe_capacity_bytes))
+    g = 0
+    for c in caps:
+        g = gcd(g, c)
+    return tuple(c // g for c in caps)
+
+
+def _resolve_multi(**overrides):
+    kwargs = dict(
+        selected_backend="ollama",
+        discovered_candidates=[_candidate()],
+        topology=_dual_gpu_topology(a_mb=16000, b_mb=16000),
+        host_meminfo=_meminfo(),
+        weight_bytes=20 * GB,
+        kv_cache_bytes=1 * GB,
+        requested_context=8192,
+        allow_ram_spill=False,
+    )
+    kwargs.update(overrides)
+    return resolve_runtime(**kwargs)
+
+
+def test_single_gpu_recipe_carries_no_tensor_split():
+    res = _resolve()
+    assert res.resolved.placement_class == "full_gpu"
+    assert res.resolved.tensor_split_weights is None
+    assert res.resolved.to_dict()["tensor_split_weights"] is None
+
+
+def test_two_required_gpus_get_an_exact_deterministic_split():
+    top = _dual_gpu_topology(a_mb=16000, b_mb=16000)
+    res = _resolve_multi(topology=top)
+    assert res.resolved.placement_class == "multi_gpu"
+    uuids = res.resolved.selected_physical_gpu_uuids
+    assert res.resolved.tensor_split_weights == _expected_split(top, uuids)
+
+
+def test_three_required_gpus_get_an_exact_deterministic_split():
+    top = _triple_gpu_topology(a_mb=12000, b_mb=12000, c_mb=12000)
+    res = _resolve_multi(
+        topology=top, weight_bytes=26 * GB, kv_cache_bytes=1 * GB,
+    )
+    assert res.resolved.placement_class == "multi_gpu"
+    uuids = res.resolved.selected_physical_gpu_uuids
+    assert len(uuids) == 3
+    assert res.resolved.tensor_split_weights == _expected_split(top, uuids)
+
+
+def test_minimum_number_of_gpus_is_preserved_in_the_split():
+    # three cards available, workload fits on two -> split has exactly 2 weights
+    top = _triple_gpu_topology(a_mb=16000, b_mb=16000, c_mb=16000)
+    res = _resolve_multi(topology=top, weight_bytes=20 * GB, kv_cache_bytes=1 * GB)
+    assert res.resolved.placement_class == "multi_gpu"
+    assert len(res.resolved.selected_physical_gpu_uuids) == 2
+    assert len(res.resolved.tensor_split_weights) == 2
+
+
+def test_heterogeneous_capacities_produce_proportional_deterministic_weights():
+    top = _dual_gpu_topology(a_mb=20000, b_mb=12000)
+    res = _resolve_multi(topology=top, weight_bytes=24 * GB, kv_cache_bytes=1 * GB)
+    assert res.resolved.placement_class == "multi_gpu"
+    w = res.resolved.tensor_split_weights
+    uuids = res.resolved.selected_physical_gpu_uuids
+    assert w == _expected_split(top, uuids)
+    # proportional: weight ratio tracks safe-capacity ratio
+    by_uuid = {d.uuid: d for d in top.devices}
+    cap0 = by_uuid[uuids[0]].safe_capacity_bytes
+    cap1 = by_uuid[uuids[1]].safe_capacity_bytes
+    assert w[0] * cap1 == w[1] * cap0
+
+
+def test_equal_capacities_produce_equivalent_weights():
+    top = _dual_gpu_topology(a_mb=16000, b_mb=16000)
+    res = _resolve_multi(topology=top)
+    assert res.resolved.tensor_split_weights == (1, 1)
+
+
+def test_shuffled_hardware_inventory_produces_identical_resolved_recipe():
+    inv_fwd = (
+        GPUDevice(0, U_A, "0000:01:00.0", "A", 20000, None, None),
+        GPUDevice(1, U_B, "0000:02:00.0", "B", 12000, None, None),
+    )
+    inv_rev = tuple(reversed(inv_fwd))
+    t1 = topology_from_inventory(inv_fwd)
+    t2 = topology_from_inventory(inv_rev)
+    r1 = _resolve_multi(topology=t1, weight_bytes=24 * GB, kv_cache_bytes=1 * GB)
+    r2 = _resolve_multi(topology=t2, weight_bytes=24 * GB, kv_cache_bytes=1 * GB)
+    assert r1.resolved.selected_physical_gpu_uuids == r2.resolved.selected_physical_gpu_uuids
+    assert r1.resolved.tensor_split_weights == r2.resolved.tensor_split_weights
+    assert r1.resolved.to_dict() == r2.resolved.to_dict()
+
+
+def test_transient_gpu_ordinal_changes_do_not_alter_the_per_uuid_split():
+    # Same physical cards + capacities, host ordinals swapped. The pool is
+    # ordered "primary (GPU0) first", so a genuine primary change legitimately
+    # reorders selected_physical_gpu_uuids -- and the split tuple moves in
+    # lockstep. The invariant that must hold is the physical-UUID -> weight
+    # binding, not the tuple index.
+    inv1 = (
+        GPUDevice(0, U_A, "0000:01:00.0", "A", 20000, None, None),
+        GPUDevice(1, U_B, "0000:02:00.0", "B", 12000, None, None),
+    )
+    inv2 = (
+        GPUDevice(1, U_A, "0000:01:00.0", "A", 20000, None, None),
+        GPUDevice(0, U_B, "0000:02:00.0", "B", 12000, None, None),
+    )
+    r1 = _resolve_multi(topology=topology_from_inventory(inv1),
+                        weight_bytes=24 * GB, kv_cache_bytes=1 * GB)
+    r2 = _resolve_multi(topology=topology_from_inventory(inv2),
+                        weight_bytes=24 * GB, kv_cache_bytes=1 * GB)
+    assert dict(zip(r1.resolved.selected_physical_gpu_uuids,
+                    r1.resolved.tensor_split_weights)) == \
+           dict(zip(r2.resolved.selected_physical_gpu_uuids,
+                    r2.resolved.tensor_split_weights))
+
+
+def test_split_does_not_use_live_free_vram():
+    # identical physical capacity; one run has a device reporting low live-free
+    # VRAM below its safe capacity. The split must be identical either way
+    # (safe_capacity_bytes is static; effective_now_bytes would fold live_free in).
+    base = _dual_gpu_topology(a_mb=20000, b_mb=12000)
+    starved = _dual_gpu_topology(a_mb=20000, b_mb=12000, a_free_mb=1000, b_free_mb=1000)
+    r_base = _resolve_multi(topology=base, weight_bytes=24 * GB, kv_cache_bytes=1 * GB)
+    # starved live-free would make the pool not fit at all via effective_now;
+    # force multi by allowing spill so ram_spill path still selects the pool.
+    r_starved = _resolve_multi(
+        topology=starved, weight_bytes=24 * GB, kv_cache_bytes=1 * GB,
+        allow_ram_spill=True, host_meminfo=_meminfo(avail_mb=200000),
+    )
+    assert r_base.resolved.tensor_split_weights == r_starved.resolved.tensor_split_weights
+
+
+def test_selected_uuid_order_is_primary_first():
+    top = _triple_gpu_topology(a_mb=12000, b_mb=12000, c_mb=12000)
+    res = _resolve_multi(topology=top, weight_bytes=26 * GB, kv_cache_bytes=1 * GB)
+    # placement priority is host-ordinal ascending; U_A is ordinal 0
+    assert res.resolved.selected_physical_gpu_uuids[0] == U_A
+
+
+def test_unselected_gpu_never_appears_in_split_or_pool():
+    top = _triple_gpu_topology(a_mb=16000, b_mb=16000, c_mb=16000)
+    res = _resolve_multi(topology=top, weight_bytes=20 * GB, kv_cache_bytes=1 * GB)
+    assert U_C not in res.resolved.selected_physical_gpu_uuids
+    assert len(res.resolved.tensor_split_weights) == len(res.resolved.selected_physical_gpu_uuids)
+
+
+def test_unknown_selected_capacity_fails_closed_no_recipe():
+    # a selected card with no installed capacity -> safe_capacity_bytes is None
+    inv = (
+        GPUDevice(0, U_A, "0000:01:00.0", "A", 16000, None, None),
+        GPUDevice(1, U_B, "0000:02:00.0", "B", None, None, None),
+    )
+    res = _resolve_multi(topology=topology_from_inventory(inv),
+                         weight_bytes=20 * GB, kv_cache_bytes=1 * GB)
+    assert res.resolved is None
+    assert res.status in (
+        RuntimeResolutionStatus.FIT_UNKNOWN,
+        RuntimeResolutionStatus.ENVIRONMENT_INFEASIBLE,
+    )
+
+
+def test_candidate_run_repeated_twice_is_structurally_identical():
+    top = _dual_gpu_topology(a_mb=20000, b_mb=12000)
+    a = _resolve_multi(topology=top, weight_bytes=24 * GB, kv_cache_bytes=1 * GB)
+    b = _resolve_multi(topology=top, weight_bytes=24 * GB, kv_cache_bytes=1 * GB)
+    assert a.resolved.to_dict() == b.resolved.to_dict()
+
+
+def test_multi_gpu_ram_spill_recipe_also_carries_the_split():
+    top = _dual_gpu_topology(a_mb=16000, b_mb=12000)
+    res = _resolve_multi(
+        topology=top, weight_bytes=30 * GB, kv_cache_bytes=1 * GB,
+        allow_ram_spill=True, host_meminfo=_meminfo(avail_mb=200000),
+    )
+    assert res.resolved.placement_class == "ram_spill"
+    assert len(res.resolved.selected_physical_gpu_uuids) == 2
+    assert res.resolved.tensor_split_weights == _expected_split(
+        top, res.resolved.selected_physical_gpu_uuids
+    )
