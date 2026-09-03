@@ -349,6 +349,29 @@ def test_ledger_trust_class_defaults_and_round_trips(tmp_path: Path):
     assert reloaded.trust_class is EvidenceTrustClass.CALIBRATION_ONLY
 
 
+def test_legacy_ledger_line_without_trust_class_key_deserialises_unchanged(tmp_path: Path):
+    """Stage 3B.2 must NOT touch the historical LedgerRecord.from_dict
+    fallback (owner rule: 'do not change deserialization defaults in a way
+    that retrospectively upgrades old records' -- but equally must not
+    break them). A pre-trust-class line still loads with the unchanged
+    historical default."""
+    path = tmp_path / "ledger.jsonl"
+    legacy_line = json.dumps(
+        {
+            "record_id": "legacy-1",
+            "record_type": "primary_row",
+            "payload": {"task": "old"},
+            "provenance": [],
+        }
+    )
+    path.write_text(legacy_line + "\n", encoding="utf-8")
+    fresh = EvidenceLedger(path)
+    assert fresh.malformed_lines() == ()
+    rec = fresh.get("legacy-1")
+    assert rec is not None
+    assert rec.trust_class is EvidenceTrustClass.CANONICAL_COMPATIBLE
+
+
 # ---------------------------------------------------------------------------
 # EffectiveEvidenceResolver
 # ---------------------------------------------------------------------------

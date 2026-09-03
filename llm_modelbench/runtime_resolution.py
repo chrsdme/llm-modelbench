@@ -573,10 +573,19 @@ def resolve_runtime(
 
     # --- 6. resolved runtime recipe ----------------------------------
     strategy = "single_device" if len(selected_uuids) <= 1 else "layer_split"
+    # ``allow_cpu_spill`` carries the resolved RAM-spill *permission*, not the
+    # actual resulting placement -- matching the existing convention in
+    # ``runtime_identity.collect_runtime_identity`` (Stage 3.2C-2b: "the
+    # resolved RAM-spill permission (not the actual resulting placement) is
+    # identity-bearing") and ``benchmark_binding._execution_settings_from_config``.
+    # An absent/false permission stays ``None`` (identical to the historical
+    # default) so an ordinary run keeps a stable identity hash. The actual
+    # placement outcome is carried separately in ``placement_class`` /
+    # ``estimated_ram_spill_bytes`` on ``ResolvedRuntime``.
     execution_settings = RuntimeExecutionSettings(
         strategy=strategy if len(selected_uuids) >= 1 else None,
         context_size=requested_context,
-        allow_cpu_spill=True if (allow_ram_spill and placement_class == "ram_spill") else None,
+        allow_cpu_spill=True if allow_ram_spill else None,
     )
     # Validate against the selected UUID set (raises on an inconsistent recipe).
     execution_settings.normalized(selected_uuids)

@@ -35,8 +35,16 @@ from llm_modelbench.ollama import MockClient
 # CANONICAL_COMPATIBLE via this thin shim rather than at every call site.
 from llm_modelbench.capability_observation import append_capability_observation as _acobs_real
 from llm_modelbench.evidence import EvidenceTrustClass as _ETC
-def append_capability_observation(ledger, observation, *, trust_class=_ETC.CANONICAL_COMPATIBLE, provenance=()):
+# These files exercise ledger / projection / adapter behaviour, not the
+# trust decision itself -- so they pin an explicit CANONICAL_COMPATIBLE
+# rather than thread a trust class through every call site. The write-time
+# trust decision is proven in tests/test_capability_trust.py and the three
+# writer tests in tests/test_capability_reprobe_execute.py. The helper is
+# deliberately NOT named like the real function so it cannot be mistaken
+# for the production writer (which has no default and never assumes canonical).
+def _append_with_explicit_canonical_trust(ledger, observation, *, trust_class=_ETC.CANONICAL_COMPATIBLE, provenance=()):
     return _acobs_real(ledger, observation, trust_class=trust_class, provenance=provenance)
+append_capability_observation = _append_with_explicit_canonical_trust
 
 def _model_identity(*, digest="digest-1"):
     return ModelArtifactIdentity(

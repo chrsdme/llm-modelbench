@@ -117,6 +117,23 @@ def test_recommended_flag_has_no_authority_over_resolution():
     assert second.resolved.runtime_profile_name == "aaa"  # unchanged
 
 
+def test_recommended_function_mutation_has_no_authority(monkeypatch):
+    """Directly monkeypatch runtime_profiles._recommended to return the
+    inverse backend. The resolution must be byte-identical -- the resolver
+    never imports or calls it. Reads vacuous today; it is the regression
+    guard if someone later wires _recommended into the authority path."""
+    import llm_modelbench.runtime_profiles as rp
+
+    baseline = _resolve().to_dict()
+
+    def _inverted(profile, health, gpu_count):  # pragma: no cover - guard
+        return True  # would mark every candidate "recommended"
+
+    monkeypatch.setattr(rp, "_recommended", _inverted)
+    after = _resolve().to_dict()
+    assert after == baseline
+
+
 def test_recommended_gpu_count_heuristic_is_never_consulted():
     """A dual-GPU host would make runtime_profiles._recommended prefer
     llama_cpp -- but with selected_backend='ollama' and a healthy ollama
@@ -345,6 +362,33 @@ def test_explicit_ram_spill_resolves_when_safe_host_ram_is_sufficient():
     assert res.resolved.allow_ram_spill is True
     assert res.resolved.execution_settings.allow_cpu_spill is True
     assert res.resolved.estimated_ram_spill_bytes and res.resolved.estimated_ram_spill_bytes > 0
+
+
+def test_allow_cpu_spill_tracks_permission_not_placement_outcome():
+    """allow_cpu_spill is identity-bearing as the resolved RAM-spill
+    *permission*, not the resulting placement (matching
+    runtime_identity.collect_runtime_identity, Stage 3.2C-2b). A run that
+    was granted --allow-ram-spill but ends up fitting fully on GPU still
+    records allow_cpu_spill=True; the actual placement is carried by
+    placement_class / estimated_ram_spill_bytes."""
+    res = _resolve(
+        topology=_single_gpu_topology(installed_mb=48000),
+        weight_bytes=8 * GB, kv_cache_bytes=1 * GB,
+        allow_ram_spill=True,
+    )
+    assert res.is_resolved
+    assert res.resolved.placement_class in ("full_gpu", "multi_gpu")
+    assert res.resolved.estimated_ram_spill_bytes in (None, 0)
+    assert res.resolved.allow_ram_spill is True
+    assert res.resolved.execution_settings.allow_cpu_spill is True
+
+
+def test_allow_cpu_spill_stays_none_without_permission_even_near_capacity():
+    """The ordinary run (no permission) keeps allow_cpu_spill=None -- the
+    historical default -- so its identity hash is unchanged."""
+    res = _resolve(allow_ram_spill=False)
+    assert res.is_resolved
+    assert res.resolved.execution_settings.allow_cpu_spill is None
 
 
 def test_explicit_ram_spill_still_fails_when_safe_physical_ram_insufficient():
