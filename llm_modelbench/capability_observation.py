@@ -57,7 +57,7 @@ from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Tuple
 
 from .capabilities import MeasuredCapabilityState
 from .classify import FAMILY_ORDER
-from .evidence import EvidenceLedger, LedgerRecord, ProvenanceLink
+from .evidence import EvidenceLedger, EvidenceTrustClass, LedgerRecord, ProvenanceLink
 
 if TYPE_CHECKING:
     from .identity import ModelArtifactIdentity, RuntimeProfileIdentity
@@ -247,16 +247,37 @@ def append_capability_observation(
     ledger: EvidenceLedger,
     observation: CapabilityObservation,
     *,
+    trust_class: EvidenceTrustClass,
     provenance: Tuple[ProvenanceLink, ...] = (),
 ) -> LedgerRecord:
     """Thin wrapper over ``EvidenceLedger.append`` fixing the record type
     and payload shape. Kept as a function rather than a method on
     ``CapabilityObservation`` -- the observation itself has no knowledge of
     ledgers, matching Stage 0's evidence-model separation of typed facts
-    from their storage."""
+    from their storage.
+
+    ``trust_class`` is **required** (Anvil Stage 3B.2, owner's frozen rule):
+    fresh native capability evidence must receive an *explicit*
+    :class:`~llm_modelbench.evidence.EvidenceTrustClass` at write time --
+    trust is never inferred from freshness or schema. Production writers
+    compute it via
+    :func:`~llm_modelbench.capability_trust.classify_fresh_capability_trust`,
+    which fails closed to ``UNKNOWN_LEGACY`` unless the complete current
+    probe contract is explicitly demonstrated. This wrapper deliberately
+    has **no default** so the ``EvidenceLedger.append`` /
+    ``LedgerRecord.from_json_line`` ``CANONICAL_COMPATIBLE`` fallback (kept
+    unchanged so historical rows are not reinterpreted) can never be
+    reached for a native observation by omission.
+    """
+    if not isinstance(trust_class, EvidenceTrustClass):
+        raise TypeError(
+            "append_capability_observation requires an explicit EvidenceTrustClass "
+            f"trust_class, not {type(trust_class).__name__!r}"
+        )
     return ledger.append(
         CAPABILITY_OBSERVATION_RECORD_TYPE,
         observation.to_ledger_payload(),
         provenance=provenance,
+        trust_class=trust_class,
         record_id=observation.observation_id,
     )

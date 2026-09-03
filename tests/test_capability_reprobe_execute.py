@@ -8,7 +8,7 @@ import inspect
 
 from llm_modelbench.capabilities import CAPABILITY_SCHEMA_VERSION, PROBE_PROTOCOL_VERSION, MeasuredCapabilityState
 from llm_modelbench.capability_evidence_classification import EvidenceCellStatus, classify_fleet
-from llm_modelbench.capability_observation import CapabilityObservation, append_capability_observation
+from llm_modelbench.capability_observation import CapabilityObservation
 from llm_modelbench.capability_projection import CapabilityProjectionStatus, project_capability_from_ledger
 from llm_modelbench import capability_reprobe_execute as execute_mod
 from llm_modelbench.capability_reprobe_execute import (
@@ -27,6 +27,16 @@ from llm_modelbench.ollama import MockClient
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+# Anvil Stage 3B.2: append_capability_observation now requires an explicit
+# EvidenceTrustClass (owner's frozen rule). These tests exercise ledger /
+# projection behaviour, not trust classification, so they pass an explicit
+# CANONICAL_COMPATIBLE via this thin shim rather than at every call site.
+from llm_modelbench.capability_observation import append_capability_observation as _acobs_real
+from llm_modelbench.evidence import EvidenceTrustClass as _ETC
+def append_capability_observation(ledger, observation, *, trust_class=_ETC.CANONICAL_COMPATIBLE, provenance=()):
+    return _acobs_real(ledger, observation, trust_class=trust_class, provenance=provenance)
 
 def _model_identity(*, digest="digest-1"):
     return ModelArtifactIdentity(
@@ -489,3 +499,52 @@ def test_apply_flag_actually_probes_and_writes_the_ledger(tmp_path):
     assert ledger_path.exists()
     ledger = EvidenceLedger(ledger_path)
     assert len(list(ledger.all())) == 1
+
+
+# ---------------------------------------------------------------------------
+# Anvil Stage 3B.2 slice B: the reprobe-execute writer assigns an explicit
+# EvidenceTrustClass computed from the current probe contract -- never a
+# blanket canonical, never inferred from the fact that a probe just ran.
+# ---------------------------------------------------------------------------
+
+def test_writer_assigns_canonical_trust_for_a_complete_contract_probe(tmp_path, monkeypatch):
+    from llm_modelbench.evidence import EvidenceTrustClass
+
+    ledger = EvidenceLedger(tmp_path / "ledger.jsonl")
+    # _observation() has a content-addressed model identity, real runtime
+    # identity, current protocol/schema, MEASURED_SUPPORTED -> complete contract.
+    _patch_fixed_observation(monkeypatch, _observation())
+    outcome = execute_reprobe_actions((_action(),), _FakeClient(), ledger)[0]
+    assert outcome.appended is True
+    record = ledger.get(outcome.observation_id)
+    assert record.trust_class is EvidenceTrustClass.CANONICAL_COMPATIBLE
+
+
+def test_writer_fails_closed_to_unknown_legacy_when_provenance_is_incomplete(tmp_path, monkeypatch):
+    from llm_modelbench.evidence import EvidenceTrustClass
+
+    ledger = EvidenceLedger(tmp_path / "ledger.jsonl")
+    # A fresh, current-schema observation whose model identity has NO
+    # content-addressed provenance (name-hash artifact_set_id, primary_sha256
+    # None). The probe still ran; trust must NOT follow from that.
+    nameonly = _observation(
+        model_identity=ModelArtifactIdentity.from_ollama_tag_row({"name": "mystery:latest"})
+    )
+    assert nameonly.capability_schema_version == CAPABILITY_SCHEMA_VERSION
+    _patch_fixed_observation(monkeypatch, nameonly)
+    outcome = execute_reprobe_actions((_action(),), _FakeClient(), ledger)[0]
+    assert outcome.appended is True
+    record = ledger.get(outcome.observation_id)
+    assert record.trust_class is EvidenceTrustClass.UNKNOWN_LEGACY
+
+
+def test_writer_does_not_default_to_canonical_by_omission(tmp_path):
+    """append_capability_observation has no trust_class default: omitting it
+    is a TypeError, so the EvidenceLedger CANONICAL_COMPATIBLE fallback can
+    never be reached for a native observation by omission."""
+    import pytest as _pytest
+    from llm_modelbench.capability_observation import append_capability_observation as real_writer
+
+    ledger = EvidenceLedger(tmp_path / "ledger.jsonl")
+    with _pytest.raises(TypeError):
+        real_writer(ledger, _observation())

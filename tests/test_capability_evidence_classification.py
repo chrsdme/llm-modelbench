@@ -25,6 +25,16 @@ from llm_modelbench.capability_observation import CAPABILITY_OBSERVATION_RECORD_
 from llm_modelbench.evidence import EvidenceLedger, ProvenanceLink, ProvenanceRelation
 
 
+
+# Anvil Stage 3B.2: append_capability_observation now requires an explicit
+# EvidenceTrustClass (owner's frozen rule). These tests exercise ledger /
+# projection behaviour, not trust classification, so they pass an explicit
+# CANONICAL_COMPATIBLE via this thin shim rather than at every call site.
+from llm_modelbench.capability_observation import append_capability_observation as _acobs_real
+from llm_modelbench.evidence import EvidenceTrustClass as _ETC
+def append_capability_observation(ledger, observation, *, trust_class=_ETC.CANONICAL_COMPATIBLE, provenance=()):
+    return _acobs_real(ledger, observation, trust_class=trust_class, provenance=provenance)
+
 def _template_config(*, num_ctx=8192):
     material = {
         "template": "{{ .System }}\n{{ .Prompt }}",
@@ -271,7 +281,6 @@ def _native_observation(*, family="text", state=MeasuredCapabilityState.MEASURED
 
 def test_native_selected_overrides_legacy_missing(tmp_path):
     ledger = EvidenceLedger(tmp_path / "ledger.jsonl")
-    from llm_modelbench.capability_observation import append_capability_observation
 
     append_capability_observation(ledger, _native_observation(state=MeasuredCapabilityState.MEASURED_SUPPORTED))
     cell = classify_model_capability("qwen2.5-coder:14b", "text", [], _current_identity(), ledger=ledger)
@@ -281,7 +290,6 @@ def test_native_selected_overrides_legacy_missing(tmp_path):
 
 def test_native_ambiguous_fails_closed_through_classify_model_capability(tmp_path):
     ledger = EvidenceLedger(tmp_path / "ledger.jsonl")
-    from llm_modelbench.capability_observation import append_capability_observation
 
     append_capability_observation(ledger, _native_observation(state=MeasuredCapabilityState.MEASURED_SUPPORTED))
     append_capability_observation(ledger, _native_observation(state=MeasuredCapabilityState.MEASURED_UNSUPPORTED))

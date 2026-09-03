@@ -13,11 +13,20 @@ from llm_modelbench.capabilities import MeasuredCapabilityState
 from llm_modelbench.capability_observation import (
     CAPABILITY_OBSERVATION_RECORD_TYPE,
     CapabilityObservation,
-    append_capability_observation,
 )
 from llm_modelbench.evidence import EvidenceLedger
 from llm_modelbench.identity import ModelArtifactIdentity, RuntimeProfileIdentity
 
+
+
+# Anvil Stage 3B.2: append_capability_observation now requires an explicit
+# EvidenceTrustClass (owner's frozen rule). These tests exercise ledger /
+# projection behaviour, not trust classification, so they pass an explicit
+# CANONICAL_COMPATIBLE via this thin shim rather than at every call site.
+from llm_modelbench.capability_observation import append_capability_observation as _acobs_real
+from llm_modelbench.evidence import EvidenceTrustClass as _ETC
+def append_capability_observation(ledger, observation, *, trust_class=_ETC.CANONICAL_COMPATIBLE, provenance=()):
+    return _acobs_real(ledger, observation, trust_class=trust_class, provenance=provenance)
 
 def _model(*, digest="digest-1"):
     return ModelArtifactIdentity(

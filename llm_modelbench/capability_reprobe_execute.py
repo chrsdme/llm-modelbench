@@ -54,6 +54,7 @@ from .capability_evidence_classification import (
     classify_fleet,
 )
 from .capability_observation import append_capability_observation
+from .capability_trust import classify_fresh_capability_trust
 from .capability_projection import (
     CapabilityProjection,
     CapabilityProjectionStatus,
@@ -199,7 +200,21 @@ def _execute_one(action: ReprobeAction, client: Any, ledger: EvidenceLedger) -> 
         superseded = tuple(prior_projection.considered_observation_ids)
 
     provenance = tuple(ProvenanceLink(ProvenanceRelation.SUPERSEDES, record_id) for record_id in superseded)
-    record = append_capability_observation(ledger, observation, provenance=provenance)
+    # Anvil Stage 3B.2 (owner's frozen rule): assign the EvidenceTrustClass
+    # explicitly at write time. classify_fresh_capability_trust fails closed
+    # to UNKNOWN_LEGACY unless the complete current probe contract is
+    # explicitly demonstrated by this observation (current probe/schema
+    # version, content-addressed model provenance, real runtime identity,
+    # committing measured result). Trust is never inferred from the fact
+    # that this probe just ran.
+    trust_class = classify_fresh_capability_trust(
+        observation,
+        expected_probe_protocol_version=PROBE_PROTOCOL_VERSION,
+        expected_capability_schema_version=CAPABILITY_SCHEMA_VERSION,
+    )
+    record = append_capability_observation(
+        ledger, observation, trust_class=trust_class, provenance=provenance
+    )
 
     after_projection = project_capability_from_ledger(ledger, capability=action.capability, **current_identity_kwargs)
     return ReprobeOutcome(
