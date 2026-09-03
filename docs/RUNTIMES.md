@@ -22,8 +22,15 @@ LAN hosts or persist raw process command lines or environments.
 Ollama supports inventory and its existing repair/KV workflow. llama.cpp uses
 the externally running server's documented HTTP interface and is intentionally
 one-model-at-a-time unless switching capability is proven. ModelBench never
-starts, stops, restarts, or reconfigures `llama-server`. Service control and
-KV repair report unsupported for llama.cpp rather than attempting an emulation.
+restarts or reconfigures an externally running `llama-server`, never manages it
+as a system service, and never touches a server process it did not itself
+launch. It may materialise its own ephemeral `llama-server` child for a
+benchmark it owns end to end — a direct child process, bound to localhost,
+proven by PID + `/proc` start-time identity before any teardown signal, and
+torn down (graceful then forced, re-proving ownership each time) when the work
+completes. This is not a persistent daemon and not a service. Service control
+and KV repair still report unsupported for llama.cpp rather than attempting an
+emulation.
 
 ## Hardware and telemetry
 

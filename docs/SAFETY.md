@@ -13,6 +13,20 @@ Do not start a benchmark, run model prompts, pull/delete models, or conduct a
 broad fleet run without explicit operator approval. Documentation, reporting,
 and cleanup work do not imply permission to execute models.
 
+## Managed runtime child processes
+
+For a benchmark it owns end to end, ModelBench may spawn its own ephemeral
+`llama-server` child process and tear it down when the work completes. Such a
+child is launched from an argv list (never a shell), bound to localhost, and
+proven by PID plus `/proc` process-start-time identity before any teardown
+signal; teardown is graceful then forced, re-proving ownership before each
+signal, and never uses name-, port-, or process-group-based killing. This is
+not a persistent daemon and not a system service. Ollama is reuse-only:
+ModelBench never spawns, restarts, stops, or reconfigures Ollama, and it never
+signals or reconfigures any runtime process it did not itself launch. The
+privileged Ollama restart boundary below remains the *only* path that mutates a
+system service.
+
 ## Read-only versus execution commands
 
 `report`, `export-review`, `repeat-report`, `diff`, `coverage`, `gaps`, `dossier`, `sensitivity-report`, `simulate`, and `serve` read existing artifacts. `rankings` reads/rebuilds artifact databases. `runtime discover`, `inventory`, non-mock `plan`, and `doctor` inspect the selected local runtime or host metadata. `inventory/plan --auto` make small capability-probe model calls. `judge-dumps` calls only the selected judge model. `run` and `wizard` execute benchmark models.

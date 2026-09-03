@@ -166,6 +166,14 @@ class ResolvedRuntime:
     requested_context: Optional[int]
     allow_ram_spill: bool
     estimated_ram_spill_bytes: Optional[int]
+    #: Content-addressed identity of the model bytes this recipe was resolved
+    #: for, carried verbatim from ``resolve_runtime(model_primary_sha256=...)``.
+    #: ``None`` when the caller supplied none. Stage 3B.3C's *managed*
+    #: ``llama-server`` spawn requires this to be present (it must prove it is
+    #: loading exactly the resolved artifact and not an arbitrary path); an
+    #: *external-reuse* materialisation does not (ModelBench does not choose
+    #: what an already-running server has loaded).
+    model_primary_sha256: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -180,6 +188,7 @@ class ResolvedRuntime:
             "requested_context": self.requested_context,
             "allow_ram_spill": self.allow_ram_spill,
             "estimated_ram_spill_bytes": self.estimated_ram_spill_bytes,
+            "model_primary_sha256": self.model_primary_sha256,
         }
 
 
@@ -640,6 +649,11 @@ def resolve_runtime(
         requested_context=requested_context,
         allow_ram_spill=allow_ram_spill,
         estimated_ram_spill_bytes=spill.estimated_ram_spill_bytes,
+        model_primary_sha256=(
+            model_primary_sha256.strip()
+            if isinstance(model_primary_sha256, str) and model_primary_sha256.strip()
+            else None
+        ),
     )
     return RuntimeResolution(
         status=RuntimeResolutionStatus.RESOLVED,

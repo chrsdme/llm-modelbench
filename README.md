@@ -260,8 +260,11 @@ See [capability routing](docs/CAPABILITY_ROUTING.md).
 
 ## Runtime support
 
-Ollama and llama.cpp are separate external runtimes. ModelBench does not start,
-stop, restart, or reconfigure `llama-server`. Runtime selection and identity are
+Ollama and llama.cpp are separate external runtimes. ModelBench does not manage
+Ollama as a service and does not restart or reconfigure an externally running
+`llama-server`; it may, for a benchmark it owns end to end, spawn and then tear
+down its own ephemeral `llama-server` child process (never a persistent daemon,
+never touching a server it did not launch). Runtime selection and identity are
 persisted with run and campaign evidence, so resume refuses a different
 runtime. Runtime discovery, profile storage, endpoint restrictions, multi-GPU
 inventory, telemetry boundaries, and the Ollama-only repair exception are

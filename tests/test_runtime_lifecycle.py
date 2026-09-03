@@ -415,6 +415,37 @@ def test_cleanup_failure_on_clean_exit_is_structured_not_raised():
     assert ctrl.last_cleanup.ok is False
 
 
+def test_forced_cleanup_failure_is_distinct_from_a_generic_callback_error():
+    from llm_modelbench.runtime_lifecycle import ForcedCleanupFailed
+
+    def _cleanup(owned):
+        # the adapter ran the full graceful->forced escalation and the
+        # process still outlived SIGKILL
+        raise ForcedCleanupFailed("survived SIGTERM and SIGKILL")
+
+    ctrl = _owned_controller(cleanup_fn=_cleanup)
+    res = ctrl.cleanup()
+    assert res.outcome is CleanupOutcome.FORCED_FAILED
+    assert res.outcome is not CleanupOutcome.GRACEFUL_FAILED
+    assert res.destructive_action_performed is True
+    assert ctrl.state is LifecycleState.CLEANUP_FAILED
+    # still exactly one destructive attempt
+    second = ctrl.cleanup()
+    assert second.outcome is CleanupOutcome.ALREADY_COMPLETED
+
+
+def test_forced_cleanup_failure_does_not_replace_the_primary_exception():
+    from llm_modelbench.runtime_lifecycle import ForcedCleanupFailed
+
+    def _cleanup(owned):
+        raise ForcedCleanupFailed("refused to die")
+
+    with pytest.raises(ValueError, match="primary"):
+        with _owned_controller(cleanup_fn=_cleanup) as ctrl:
+            raise ValueError("primary failure")
+    assert ctrl.last_cleanup.outcome is CleanupOutcome.FORCED_FAILED
+
+
 def test_cleanup_result_is_structured():
     ctrl = _owned_controller(cleanup_fn=lambda o: None)
     out = ctrl.cleanup()
@@ -592,9 +623,13 @@ def test_full_owned_lifecycle_never_calls_subprocess(monkeypatch):
     assert ctrl.state is LifecycleState.CLEANED
 
 
-def test_lifecycle_states_are_only_those_with_a_3b3b_producer():
-    # 3B.3C will add SPAWN_PENDING / STARTING / FAILED / NOT_REQUIRED when it
-    # actually spawns and can produce those states.
+def test_lifecycle_states_are_only_those_with_a_real_producer():
+    # 3B.3C does NOT add SPAWN_PENDING / STARTING / FAILED / NOT_REQUIRED:
+    # its spawn is synchronous and never surfaces a mid-flight
+    # MaterialisationResult, and every spawn/reuse/failure outcome is carried
+    # by llama_server_materialisation.MaterialisationStatus, not by a new
+    # LifecycleState. The controller's own state stays READY / CLEANUP_* /
+    # CLEANED / REUSED_EXTERNAL.
     for reserved in ("SPAWN_PENDING", "STARTING", "FAILED", "NOT_REQUIRED"):
         assert not hasattr(LifecycleState, reserved), reserved
     assert set(LifecycleState) == {

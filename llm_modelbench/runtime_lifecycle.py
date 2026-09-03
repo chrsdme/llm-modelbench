@@ -46,6 +46,7 @@ from .runtime_resolution import (
 
 __all__ = [
     "MaterialisationRequestError",
+    "ForcedCleanupFailed",
     "LaunchProcessProof",
     "MaterialisationRequest",
     "RuntimeOwnership",
@@ -78,6 +79,16 @@ class MaterialisationRequestError(ValueError):
     """A :class:`MaterialisationRequest` was constructed from something other
     than an accepted (``RESOLVED``) :class:`RuntimeResolution`, or by
     bypassing :meth:`MaterialisationRequest.from_resolution`."""
+
+
+class ForcedCleanupFailed(RuntimeError):
+    """A cleanup callback signalled that the forced (e.g. SIGKILL) phase of a
+    teardown did not succeed within its bounded window -- the owned process
+    is still alive. :meth:`RuntimeLifecycleController.cleanup` maps this to
+    :attr:`CleanupOutcome.FORCED_FAILED` (distinct from the
+    :attr:`CleanupOutcome.GRACEFUL_FAILED` a generic callback exception
+    yields), so a caller can tell "SIGTERM path errored" from "the process
+    outlived SIGKILL" without parsing prose."""
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +437,6 @@ class MaterialisationResult:
     endpoint: Optional[str] = None
     runtime_profile_identity: Optional[RuntimeProfileIdentity] = None
     owned_runtime: Optional[OwnedRuntime] = None
-    failure_reason: Optional[str] = None
 
     def __post_init__(self) -> None:
         owned = self.ownership is RuntimeOwnership.MODELBENCH_OWNED
@@ -597,9 +607,11 @@ class RuntimeLifecycleController:
           no second destructive action;
         * ownership cannot be revalidated -> refused
           (:attr:`CleanupOutcome.OWNERSHIP_NOT_REVALIDATED`);
-        * callback raises -> :attr:`CleanupOutcome.GRACEFUL_FAILED`, still
-          marked attempted (no automatic retry / no second signal here --
-          3B.3C owns the graceful->forced escalation).
+        * callback raises :class:`ForcedCleanupFailed` -> refused-to-die:
+          :attr:`CleanupOutcome.FORCED_FAILED` (the callback already ran the
+          full graceful->forced escalation);
+        * callback raises anything else -> :attr:`CleanupOutcome.GRACEFUL_FAILED`,
+          still marked attempted (no automatic retry / no second signal here).
         """
         if not self.owns_runtime:
             self._last_cleanup = CleanupResult(
@@ -650,6 +662,17 @@ class RuntimeLifecycleController:
 
         try:
             self._cleanup_fn(owned)
+        except ForcedCleanupFailed as exc:
+            # The callback ran the full graceful->forced escalation and the
+            # process still outlived SIGKILL within its bounded window. This
+            # is materially different from a generic callback error.
+            self._state = LifecycleState.CLEANUP_FAILED
+            self._last_cleanup = CleanupResult(
+                outcome=CleanupOutcome.FORCED_FAILED,
+                detail=f"forced cleanup failed: {exc}",
+                destructive_action_performed=True,
+            )
+            return self._last_cleanup
         except Exception as exc:  # noqa: BLE001 -- surfaced as structured outcome
             self._state = LifecycleState.CLEANUP_FAILED
             self._last_cleanup = CleanupResult(

@@ -1,0 +1,967 @@
+"""Anvil Stage 3B.3C -- managed ``llama-server`` materialisation.
+
+Composes the accepted Stage 3B.2 resolution + the Stage 3B.3B lifecycle
+domain into a real (or, in tests, a fake) ``llama-server`` child process:
+
+    request  (MaterialisationRequest, from an accepted RESOLVED resolution)
+        -> reuse-eligibility (structural: was the resolved candidate healthy?)
+        -> artifact-identity check     (managed spawn only, unconditional)
+        -> argv build                  (no shell, argv list, env overlay)
+        -> endpoint allocation         (localhost, bounded candidate scan)
+        -> Popen launch
+        -> LaunchProcessProof capture  (/proc adapter)
+        -> bounded monotonic readiness poll  (+ recipe-conformance check)
+        -> OwnedRuntime + MaterialisationResult
+        -> RuntimeLifecycleController  (graceful -> forced teardown)
+
+**Authority boundaries (do not cross):**
+
+* The resolver owns backend / GPU selection / RAM-spill permission /
+  context. This module *translates* that recipe into invocation semantics;
+  it never re-decides any of it. No fit calculation, no ``_recommended()``
+  call, no performance search, no alternate model, no alternate backend.
+* Ollama is **reuse-only** in Stage 3B.3 (amendment §23). The single place
+  that rule lives is :func:`materialise`'s backend dispatch. The
+  llama-server command builder does not know Ollama exists.
+* GPU identity stays physical-UUID based. At the process boundary the
+  selected UUIDs become ``CUDA_VISIBLE_DEVICES=GPU-<uuid>,...`` (CUDA UUID
+  addressing -- verified against the installed ``llama-server`` on the
+  target host). No transient ordinal is computed or persisted. A selected
+  UUID that is not NVIDIA-UUID-shaped or is absent from the authoritative
+  hardware inventory is a structured failure, never a silently-wrong env.
+
+``llama-server`` flag choices are pinned against build 10326
+(``--help`` inspection, recorded in ``ANVIL_PROGRESS.md``):
+``--ctx-size``, ``-sm/--split-mode {none,layer,row,tensor}``.
+RAM/CPU spill is a *negative* requirement -- when the recipe forbids spill
+the command simply adds no spill-enabling flag; ``allow_ram_spill`` already
+had its effect inside the resolver (fit decision / ``placement_class``).
+"""
+from __future__ import annotations
+
+import re
+import socket
+import subprocess  # noqa: S404 -- argv-list Popen, shell=False only; see _launch()
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, Mapping, Optional, Sequence, Tuple
+
+from .hardware import GPUDevice
+from .runtime_lifecycle import (
+    CleanupFn,
+    ForcedCleanupFailed,
+    LaunchProcessProof,
+    MaterialisationRequest,
+    MaterialisationResult,
+    RevalidateFn,
+    RuntimeLifecycleController,
+    RuntimeOwnership,
+    materialise_owned_runtime,
+    reuse_external_runtime,
+)
+
+__all__ = [
+    "MaterialisationStatus",
+    "ManagedMaterialisationError",
+    "LlamaServerCommand",
+    "EndpointCandidate",
+    "ManagedMaterialisationOutcome",
+    "DiagnosticSink",
+    "build_llama_server_command",
+    "resolve_cuda_visible_devices",
+    "candidate_endpoints",
+    "materialise",
+    "spawn_managed_llama_server",
+    "lifecycle_controller_for",
+    "MANAGED_READINESS_TIMEOUT_S",
+    "MANAGED_GRACEFUL_TIMEOUT_S",
+    "MANAGED_FORCED_TIMEOUT_S",
+]
+
+# ---------------------------------------------------------------------------
+# tunables (bounded; injectable in tests)
+# ---------------------------------------------------------------------------
+MANAGED_READINESS_TIMEOUT_S = 90.0
+MANAGED_READINESS_POLL_S = 0.25
+MANAGED_GRACEFUL_TIMEOUT_S = 10.0
+MANAGED_FORCED_TIMEOUT_S = 5.0
+#: Bounded localhost candidate-port window for a managed server.
+_ENDPOINT_BASE_PORT = 8080
+_ENDPOINT_WINDOW = 64
+_LOOPBACK_HOST = "127.0.0.1"
+
+#: An NVIDIA GPU UUID as reported by ``nvidia-smi`` (``GPU-<uuid>``) or the
+#: bare UUID. CUDA accepts the ``GPU-``-prefixed form in CUDA_VISIBLE_DEVICES.
+_NVIDIA_UUID_RE = re.compile(
+    r"^(?:GPU-)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+class MaterialisationStatus(str, Enum):
+    """Structured outcome of a materialisation attempt. Downstream code
+    switches on this -- never on an exception string or ``pid is not None``.
+    Every value has a real producer in this module."""
+
+    #: A healthy compatible external runtime was reused; zero spawn.
+    REUSED_EXTERNAL = "reused_external"
+    #: A managed llama-server was spawned, proven owned, and is ready.
+    SPAWNED_READY = "spawned_ready"
+
+    # --- recipe / identity (no spawn) ----------------------------------
+    #: The resolved recipe lacks launch-essential information (model artifact
+    #: identity) that this module will not invent.
+    RESOLVED_RECIPE_INCOMPLETE = "resolved_recipe_incomplete_for_materialisation"
+    #: The model path handed to materialisation does not correspond to the
+    #: artifact identity the recipe was resolved against.
+    ARTIFACT_IDENTITY_MISMATCH = "artifact_identity_mismatch"
+    #: A selected physical GPU UUID cannot be translated to a runtime device
+    #: (not NVIDIA-UUID-shaped, or absent from the authoritative inventory).
+    GPU_IDENTITY_UNTRANSLATABLE = "gpu_identity_untranslatable"
+    #: The backend launch executable is not authoritatively available.
+    EXECUTABLE_UNAVAILABLE = "executable_unavailable"
+    #: Selected backend is Ollama and no usable external endpoint exists.
+    #: Stage 3B.3 does not start/restart/mutate an Ollama daemon.
+    EXTERNAL_RUNTIME_REQUIRED = "external_runtime_required"
+
+    # --- spawn / readiness -------------------------------------------
+    #: Popen itself failed (executable vanished, OSError at exec).
+    SPAWN_FAILED = "spawn_failed"
+    #: The child exited before readiness was established, on its own merits
+    #: (not an endpoint bind race).
+    PROCESS_EXITED_BEFORE_READY = "process_exited_before_ready"
+    #: Readiness was not established within the bounded monotonic window.
+    READINESS_TIMEOUT = "readiness_timeout"
+    #: Every candidate endpoint was occupied / conflicted (incl. a lost bind
+    #: race, or a foreign listener already owning a candidate port).
+    ENDPOINT_CONFLICT = "endpoint_conflict"
+    #: The ready listener is ours but does not match the resolved recipe
+    #: (e.g. reported context differs). Retrying another port cannot help.
+    WRONG_SERVICE = "wrong_service"
+    #: The process launched but its ownership proof could not be established.
+    OWNERSHIP_PROOF_FAILED = "ownership_proof_failed"
+
+
+class ManagedMaterialisationError(RuntimeError):
+    """Raised only for programming errors (bad argument types, a backend the
+    resolver never produces). Every *expected* failure is a
+    :class:`MaterialisationStatus`, not an exception."""
+
+
+# ---------------------------------------------------------------------------
+# command builder
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class LlamaServerCommand:
+    """An immutable, shell-free ``llama-server`` invocation.
+
+    ``argv`` is a tuple where the executable, model path, host and port are
+    each their own element -- never interpolated into a string, never
+    ``shlex.split()`` of a built string. ``env_overlay`` carries only
+    ``CUDA_VISIBLE_DEVICES`` (UUID addressing); it is applied *over* the
+    parent environment at spawn.
+
+    The argv is reconstructed from the typed fields (:func:`_render_argv`),
+    so "same recipe + same executable/model/host/port -> byte-identical argv"
+    is structural, not a splicing accident.
+    """
+
+    executable_path: str
+    model_path: str
+    host: str
+    port: int
+    ctx_size: Optional[int]
+    split_mode: Optional[str]
+    env_overlay: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "env_overlay", dict(self.env_overlay))
+        if isinstance(self.port, bool) or not isinstance(self.port, int) or not 1 <= self.port <= 65535:
+            raise ManagedMaterialisationError("port must be an integer 1..65535")
+        if self.split_mode is not None and self.split_mode not in {"none", "layer", "row", "tensor"}:
+            raise ManagedMaterialisationError("split_mode must be a llama-server split mode")
+
+    @property
+    def argv(self) -> Tuple[str, ...]:
+        return _render_argv(self)
+
+    def with_port(self, port: int) -> "LlamaServerCommand":
+        """Return a copy bound to ``port`` -- the only environment-dependent
+        argv element."""
+        return LlamaServerCommand(
+            executable_path=self.executable_path,
+            model_path=self.model_path,
+            host=self.host,
+            port=port,
+            ctx_size=self.ctx_size,
+            split_mode=self.split_mode,
+            env_overlay=self.env_overlay,
+        )
+
+
+def _render_argv(cmd: LlamaServerCommand) -> Tuple[str, ...]:
+    argv = [
+        cmd.executable_path,
+        "--model",
+        cmd.model_path,
+        "--host",
+        cmd.host,
+        "--port",
+        str(cmd.port),
+    ]
+    if cmd.ctx_size is not None:
+        argv += ["--ctx-size", str(int(cmd.ctx_size))]
+    if cmd.split_mode is not None:
+        argv += ["--split-mode", cmd.split_mode]
+    return tuple(argv)
+
+
+def resolve_cuda_visible_devices(
+    selected_physical_gpu_uuids: Sequence[str],
+    *,
+    hardware_inventory: Sequence[GPUDevice],
+) -> Tuple[Optional[str], Optional[str]]:
+    """Translate the recipe's selected physical GPU UUIDs into a
+    ``CUDA_VISIBLE_DEVICES`` value using **UUID addressing** (no ordinals).
+
+    Returns ``(value, None)`` on success or ``(None, reason)`` when a
+    selected UUID is not NVIDIA-UUID-shaped or is absent from the
+    authoritative hardware inventory. The order of
+    ``selected_physical_gpu_uuids`` is preserved verbatim (CUDA honours it --
+    verified on the target host); inventory enumeration order never affects
+    the result, so the same selected set always yields the same value.
+    """
+    if not selected_physical_gpu_uuids:
+        # No GPU pinning in the recipe -> do not set the env at all.
+        return None, None
+    inv_uuids = {_canonical_uuid(d.uuid) for d in hardware_inventory if d.uuid}
+    out = []
+    for raw in selected_physical_gpu_uuids:
+        if not isinstance(raw, str) or not _NVIDIA_UUID_RE.match(raw.strip()):
+            return None, f"selected GPU UUID {raw!r} is not an NVIDIA GPU UUID"
+        canon = _canonical_uuid(raw)
+        if canon not in inv_uuids:
+            return (
+                None,
+                f"selected GPU UUID {raw!r} is not present in the authoritative "
+                f"hardware inventory",
+            )
+        out.append(f"GPU-{canon}")
+    return ",".join(out), None
+
+
+def _canonical_uuid(value: str) -> str:
+    v = value.strip()
+    if v.upper().startswith("GPU-"):
+        v = v[4:]
+    return v.lower()
+
+
+def build_llama_server_command(
+    request: MaterialisationRequest,
+    *,
+    executable_path: str,
+    model_path: str,
+    hardware_inventory: Sequence[GPUDevice],
+    host: str = _LOOPBACK_HOST,
+    port: int = _ENDPOINT_BASE_PORT,
+) -> Tuple[Optional[LlamaServerCommand], Optional[MaterialisationStatus], str]:
+    """Deterministically construct the ``llama-server`` command from an
+    accepted resolution.
+
+    Returns ``(command, None, "")`` on success, or ``(None, status, detail)``
+    for a structured failure (untranslatable GPU identity).
+
+    Translation rules (faithful, no search):
+
+    * context: ``--ctx-size <requested_context>`` iff the recipe set one.
+    * GPU visibility: ``CUDA_VISIBLE_DEVICES=GPU-<uuid>,...`` over exactly
+      the selected UUIDs, order preserved. Nothing else restricts device use
+      (no ``--device``, which would pass transient ordinals).
+    * multi-GPU (``strategy == "layer_split"``, >=2 UUIDs): ``--split-mode
+      layer`` and **no** ``--tensor-split``. ModelBench deliberately does not
+      choose the layer distribution -- doing so would be the frozen-rule-
+      forbidden performance guess -- so llama.cpp's default distribution
+      applies. The resolver never emits ``strategy == "tensor_split"``, so no
+      split ratios are ever constructed.
+    * RAM/CPU spill: a *negative* requirement. When the recipe forbids spill
+      the command adds no spill-enabling flag (and no ``--n-gpu-layers``).
+      ``allow_ram_spill`` already had its effect inside the resolver.
+    """
+    if not isinstance(request, MaterialisationRequest):
+        raise ManagedMaterialisationError("request must be a MaterialisationRequest")
+    if not (isinstance(executable_path, str) and executable_path):
+        raise ManagedMaterialisationError("executable_path is required")
+    if not (isinstance(model_path, str) and model_path):
+        raise ManagedMaterialisationError("model_path is required")
+
+    recipe = request.recipe
+    cvd, gpu_reason = resolve_cuda_visible_devices(
+        recipe.selected_physical_gpu_uuids, hardware_inventory=hardware_inventory
+    )
+    if gpu_reason is not None:
+        return None, MaterialisationStatus.GPU_IDENTITY_UNTRANSLATABLE, gpu_reason
+
+    split_mode = None
+    if (
+        recipe.execution_settings.strategy == "layer_split"
+        and len(recipe.selected_physical_gpu_uuids) >= 2
+    ):
+        split_mode = "layer"
+
+    env_overlay = {} if cvd is None else {"CUDA_VISIBLE_DEVICES": cvd}
+    return (
+        LlamaServerCommand(
+            executable_path=executable_path,
+            model_path=model_path,
+            host=host,
+            port=port,
+            ctx_size=(
+                int(recipe.requested_context)
+                if recipe.requested_context is not None
+                else None
+            ),
+            split_mode=split_mode,
+            env_overlay=env_overlay,
+        ),
+        None,
+        "",
+    )
+
+
+# ---------------------------------------------------------------------------
+# endpoint policy
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class EndpointCandidate:
+    host: str
+    port: int
+
+    @property
+    def url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+
+def candidate_endpoints(
+    *,
+    base_port: int = _ENDPOINT_BASE_PORT,
+    window: int = _ENDPOINT_WINDOW,
+    host: str = _LOOPBACK_HOST,
+) -> Tuple[EndpointCandidate, ...]:
+    """A bounded, deterministic list of localhost candidate endpoints. The
+    list itself is environment-independent; which one is *used* depends on
+    what is already occupied (recorded in the result)."""
+    return tuple(EndpointCandidate(host, base_port + offset) for offset in range(window))
+
+
+def _port_is_bindable(host: str, port: int) -> bool:
+    """True iff a fresh socket can bind ``(host, port)`` right now.
+
+    No ``SO_REUSEADDR`` -- we *want* the bind to fail if anything holds the
+    port. A successful bind is not a guarantee the port stays free until the
+    child binds it; that race is handled downstream by re-checking
+    bindability after a child exits (a lost race -> ``ENDPOINT_CONFLICT`` for
+    that candidate, try the next -- never a foreign kill).
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+# ---------------------------------------------------------------------------
+# readiness + identity confirmation callables
+# ---------------------------------------------------------------------------
+#: Probe callable: given a base URL, return one of
+#: "ready", "not_ready", "unreachable", "wrong_service".
+#: The production adapter MUST catch LlamaCppError (connection refused becomes
+#: "unreachable") so an uncaught raise never escapes the bounded poll loop.
+ReadinessProbe = Callable[[str], str]
+
+#: Attribution callable: given (port, pid), return one of
+#: "ours"          -- the listener on port is provably our pid,
+#: "foreign"       -- the listener on port is provably a different process,
+#: "unestablished" -- attribution could not be established (perm-denied,
+#:                    truncated scan) -- MUST NOT be read as "foreign".
+PortAttribution = Callable[[int, int], str]
+
+#: Recipe-conformance callable: given a base URL and the requested context,
+#: return True iff the running server's reported context matches (or the
+#: check is not applicable). A mismatch is WRONG_SERVICE.
+ContextConformance = Callable[[str, Optional[int]], bool]
+
+
+@dataclass(frozen=True)
+class ManagedMaterialisationOutcome:
+    """Everything a caller needs after a materialisation attempt."""
+
+    status: MaterialisationStatus
+    detail: str
+    result: Optional[MaterialisationResult] = None
+    #: The retained Popen-like object for an owned, ready runtime (so the
+    #: lifecycle controller's cleanup adapter can signal it). None otherwise.
+    process: object = field(default=None, repr=False)
+    endpoint: Optional[str] = None
+    #: Bounded tail of the child's stdout/stderr, for failure diagnostics.
+    diagnostic_tail: str = ""
+    #: The argv actually launched (audit); None if nothing was launched.
+    launched_argv: Optional[Tuple[str, ...]] = None
+    #: Attribution verdict at readiness time ("ours"/"unestablished"); an
+    #: owned+ready runtime never returns "foreign" (that is ENDPOINT_CONFLICT).
+    attribution: Optional[str] = None
+    #: For a SPAWNED_READY outcome, the still-draining diagnostic sink for the
+    #: owned child. The lifecycle controller closes it on teardown so the
+    #: drain thread and the output pipe do not outlive the process. None for
+    #: every non-owned / failed outcome (those close their sink immediately).
+    diagnostic_sink: object = field(default=None, repr=False)
+
+    @property
+    def ok(self) -> bool:
+        return self.status in (
+            MaterialisationStatus.REUSED_EXTERNAL,
+            MaterialisationStatus.SPAWNED_READY,
+        )
+
+
+# ---------------------------------------------------------------------------
+# top-level dispatcher -- the ONE place the Ollama reuse-only rule lives
+# ---------------------------------------------------------------------------
+def _resolved_candidate_was_healthy(request: MaterialisationRequest) -> bool:
+    """Structural reuse-eligibility: the resolver only produces a RESOLVED
+    result when it selected a candidate, and it selects one only when that
+    candidate's health is ``"healthy"``. So a healthy selected candidate ==
+    "a usable external runtime already exists". Deriving this from the
+    request (not a caller bool) is what makes "never spawn when reuse is
+    possible" structural."""
+    cand = request.resolution.selected_candidate
+    return cand is not None and getattr(cand, "health", None) == "healthy"
+
+
+def materialise(
+    request: MaterialisationRequest,
+    *,
+    spawn_managed: Callable[[MaterialisationRequest], ManagedMaterialisationOutcome],
+    external_still_healthy: Optional[Callable[[MaterialisationRequest], bool]] = None,
+) -> ManagedMaterialisationOutcome:
+    """Decide, from an accepted resolution, whether to reuse an external
+    runtime or materialise a managed one.
+
+    **Hard precondition (structural, not a caller argument):** if the
+    resolved candidate was ``healthy``, a usable external runtime exists and
+    is reused -- ``spawn_managed`` is never reached, for any backend. This is
+    the guard that "spawn llama-server even when external runtime is
+    reusable" must break.
+
+    ``external_still_healthy`` is an optional *refinement* probe (the
+    resolution can be seconds stale): it may only *demote* a reuse to a
+    fresh materialisation decision, never promote a spawn to a reuse. If it
+    is supplied and returns ``False`` for a candidate that *was* healthy,
+    the flow falls through to the no-external branch below.
+
+    * **Any backend, external runtime usable** -> reuse it, zero spawn.
+    * **Ollama, no usable external endpoint** -> structured
+      :attr:`MaterialisationStatus.EXTERNAL_RUNTIME_REQUIRED`. Stage 3B.3
+      never starts / restarts / mutates an Ollama daemon and never falls
+      back to llama.cpp. (Amendment §23; owner-frozen for Stage 3B.3.)
+    * **llama_cpp, no usable external endpoint** -> ``spawn_managed(request)``.
+    """
+    if not isinstance(request, MaterialisationRequest):
+        raise ManagedMaterialisationError("request must be a MaterialisationRequest")
+
+    backend = request.backend
+    reuse_ok = _resolved_candidate_was_healthy(request)
+    if reuse_ok and external_still_healthy is not None:
+        reuse_ok = bool(external_still_healthy(request))
+
+    if reuse_ok:
+        return ManagedMaterialisationOutcome(
+            status=MaterialisationStatus.REUSED_EXTERNAL,
+            detail=f"reusing healthy external {backend} runtime at {request.endpoint}",
+            result=reuse_external_runtime(request),
+            endpoint=request.endpoint,
+        )
+
+    if backend == "ollama":
+        return ManagedMaterialisationOutcome(
+            status=MaterialisationStatus.EXTERNAL_RUNTIME_REQUIRED,
+            detail=(
+                "selected backend is Ollama and no usable external endpoint was "
+                "resolved; Stage 3B.3 reuses an Ollama daemon but never starts, "
+                "restarts, or reconfigures one, and does not fall back to llama.cpp"
+            ),
+        )
+
+    if backend == "llama_cpp":
+        return spawn_managed(request)
+
+    raise ManagedMaterialisationError(
+        f"materialise() received an unsupported backend {backend!r}; the "
+        f"resolver never produces this"
+    )
+
+
+# ---------------------------------------------------------------------------
+# managed spawn
+# ---------------------------------------------------------------------------
+def spawn_managed_llama_server(
+    request: MaterialisationRequest,
+    *,
+    executable_path: Optional[str],
+    model_path: Optional[str],
+    model_primary_sha256: Optional[str],
+    hardware_inventory: Sequence[GPUDevice],
+    observe_identity: Callable[[int], Optional[LaunchProcessProof]],
+    readiness_probe: ReadinessProbe,
+    port_attribution: PortAttribution,
+    context_conformance: ContextConformance,
+    now_iso: Callable[[], str],
+    popen: Optional[Callable[..., object]] = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+    readiness_timeout_s: float = MANAGED_READINESS_TIMEOUT_S,
+    poll_interval_s: float = MANAGED_READINESS_POLL_S,
+    base_port: int = _ENDPOINT_BASE_PORT,
+    endpoint_window: int = _ENDPOINT_WINDOW,
+    port_bindable: Callable[[str, int], bool] = _port_is_bindable,
+) -> ManagedMaterialisationOutcome:
+    """Launch, verify, and hand back an owned ``llama-server``.
+
+    Every argument that touches the OS is injected so the whole path is
+    exercised by a fake-process integration harness without CUDA / llama.cpp
+    / a model. Production wiring supplies the real adapters.
+    """
+    if not isinstance(request, MaterialisationRequest):
+        raise ManagedMaterialisationError("request must be a MaterialisationRequest")
+
+    # --- 1. executable authority --------------------------------------
+    if not (isinstance(executable_path, str) and executable_path):
+        return ManagedMaterialisationOutcome(
+            status=MaterialisationStatus.EXECUTABLE_UNAVAILABLE,
+            detail="llama-server launch executable is not authoritatively available",
+        )
+
+    # --- 2. model artifact authority (UNCONDITIONAL for managed spawn) --
+    recipe_sha = request.recipe.model_primary_sha256
+    if not (isinstance(recipe_sha, str) and recipe_sha.strip()):
+        return ManagedMaterialisationOutcome(
+            status=MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE,
+            detail=(
+                "the resolved recipe carries no model_primary_sha256; a managed "
+                "llama-server launch must prove it is loading exactly the "
+                "resolved artifact"
+            ),
+        )
+    if not (isinstance(model_path, str) and model_path):
+        return ManagedMaterialisationOutcome(
+            status=MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE,
+            detail="no local model path was supplied for the managed launch",
+        )
+    if not (isinstance(model_primary_sha256, str) and model_primary_sha256.strip()):
+        return ManagedMaterialisationOutcome(
+            status=MaterialisationStatus.ARTIFACT_IDENTITY_MISMATCH,
+            detail="the supplied model path carries no content-addressed identity",
+        )
+    if model_primary_sha256.strip() != recipe_sha.strip():
+        return ManagedMaterialisationOutcome(
+            status=MaterialisationStatus.ARTIFACT_IDENTITY_MISMATCH,
+            detail=(
+                f"supplied model artifact {model_primary_sha256.strip()!r} does not "
+                f"match the resolved artifact {recipe_sha.strip()!r}"
+            ),
+        )
+
+    # --- 3. command build (GPU identity translation happens here) -----
+    base_cmd, gpu_status, gpu_detail = build_llama_server_command(
+        request,
+        executable_path=executable_path,
+        model_path=model_path,
+        hardware_inventory=hardware_inventory,
+        port=base_port,
+    )
+    if base_cmd is None:
+        return ManagedMaterialisationOutcome(status=gpu_status, detail=gpu_detail)
+
+    _popen = popen if popen is not None else _default_popen
+    candidates = candidate_endpoints(base_port=base_port, window=endpoint_window)
+    last_detail = "no candidate endpoint was available"
+
+    for cand in candidates:
+        if not port_bindable(cand.host, cand.port):
+            last_detail = f"candidate {cand.url} is occupied"
+            continue
+
+        cmd = base_cmd.with_port(cand.port)
+        sink = DiagnosticSink()
+        try:
+            proc = _launch(_popen, cmd, sink)
+        except OSError as exc:
+            sink.close()
+            return ManagedMaterialisationOutcome(
+                status=MaterialisationStatus.SPAWN_FAILED,
+                detail=f"llama-server launch failed: {type(exc).__name__}: {exc}",
+                diagnostic_tail=sink.tail(),
+                launched_argv=cmd.argv,
+            )
+
+        outcome = _verify_and_own(
+            request=request,
+            proc=proc,
+            cmd=cmd,
+            endpoint=cand,
+            observe_identity=observe_identity,
+            readiness_probe=readiness_probe,
+            port_attribution=port_attribution,
+            context_conformance=context_conformance,
+            now_iso=now_iso,
+            monotonic=monotonic,
+            sleeper=sleeper,
+            readiness_timeout_s=readiness_timeout_s,
+            poll_interval_s=poll_interval_s,
+            sink=sink,
+            port_bindable=port_bindable,
+        )
+        if outcome.status is MaterialisationStatus.SPAWNED_READY:
+            return outcome
+
+        # This candidate failed. Ensure the owned child is gone before the
+        # next candidate (no leaked children).
+        _reap(proc)
+        sink.close()
+        if outcome.status is MaterialisationStatus.ENDPOINT_CONFLICT:
+            last_detail = outcome.detail
+            continue
+        # Any other failure is terminal -- another port cannot help.
+        return outcome
+
+    return ManagedMaterialisationOutcome(
+        status=MaterialisationStatus.ENDPOINT_CONFLICT,
+        detail=(
+            f"no free managed endpoint in {candidates[0].url}..+{endpoint_window}: "
+            f"{last_detail}"
+        ),
+    )
+
+
+def _verify_and_own(
+    *,
+    request: MaterialisationRequest,
+    proc,
+    cmd: LlamaServerCommand,
+    endpoint: EndpointCandidate,
+    observe_identity,
+    readiness_probe: ReadinessProbe,
+    port_attribution: PortAttribution,
+    context_conformance: ContextConformance,
+    now_iso,
+    monotonic,
+    sleeper,
+    readiness_timeout_s: float,
+    poll_interval_s: float,
+    sink: "DiagnosticSink",
+    port_bindable: Callable[[str, int], bool],
+) -> ManagedMaterialisationOutcome:
+    def _exit_reason() -> ManagedMaterialisationOutcome:
+        """Discriminate a lost bind race (retry) from a genuine early death
+        (terminal). If the port is *no longer* bindable the child lost the
+        race to a foreign binder; if it is bindable again the child died on
+        its own merits."""
+        if not port_bindable(endpoint.host, endpoint.port):
+            return ManagedMaterialisationOutcome(
+                status=MaterialisationStatus.ENDPOINT_CONFLICT,
+                detail=(
+                    f"candidate {endpoint.url} was taken between the bind check "
+                    f"and the child bind (lost race); trying the next candidate"
+                ),
+                diagnostic_tail=sink.tail(),
+                launched_argv=cmd.argv,
+            )
+        return ManagedMaterialisationOutcome(
+            status=MaterialisationStatus.PROCESS_EXITED_BEFORE_READY,
+            detail=f"llama-server exited (rc={proc.returncode}) before readiness",
+            diagnostic_tail=sink.tail(),
+            launched_argv=cmd.argv,
+        )
+
+    # --- ownership proof BEFORE declaring anything --------------------
+    pid = getattr(proc, "pid", None)
+    if not isinstance(pid, int) or pid <= 0:
+        return ManagedMaterialisationOutcome(
+            status=MaterialisationStatus.OWNERSHIP_PROOF_FAILED,
+            detail="launched process has no usable PID",
+            diagnostic_tail=sink.tail(),
+            launched_argv=cmd.argv,
+        )
+    if proc.poll() is not None:
+        return _exit_reason()
+    launch_proof = observe_identity(pid)
+    if launch_proof is None:
+        return ManagedMaterialisationOutcome(
+            status=MaterialisationStatus.OWNERSHIP_PROOF_FAILED,
+            detail="could not establish a process-identity proof for the launched pid",
+            diagnostic_tail=sink.tail(),
+            launched_argv=cmd.argv,
+        )
+
+    # --- bounded monotonic readiness poll ----------------------------
+    # Two independent bounds: a monotonic-time deadline AND a hard cap on the
+    # number of poll iterations. Either alone terminates the loop; together
+    # they mean a broken clock or a probe that never advances time still
+    # cannot spin forever.
+    deadline = monotonic() + max(0.0, float(readiness_timeout_s))
+    interval = min(max(0.001, float(poll_interval_s)), max(0.001, float(readiness_timeout_s)))
+    max_attempts = max(1, int(float(readiness_timeout_s) / interval) + 2)
+    attempts = 0
+    while True:
+        attempts += 1
+        if proc.poll() is not None:
+            return _exit_reason()
+        verdict = readiness_probe(endpoint.url)
+        if verdict == "ready":
+            break
+        if verdict == "wrong_service":
+            # An endpoint answered on our candidate port with a non-llama
+            # service -> the port is taken by a foreign process. Retry.
+            return ManagedMaterialisationOutcome(
+                status=MaterialisationStatus.ENDPOINT_CONFLICT,
+                detail=f"{endpoint.url} is answered by a non-llama-server; trying next",
+                diagnostic_tail=sink.tail(),
+                launched_argv=cmd.argv,
+            )
+        if monotonic() >= deadline or attempts >= max_attempts:
+            return ManagedMaterialisationOutcome(
+                status=MaterialisationStatus.READINESS_TIMEOUT,
+                detail=(
+                    f"llama-server did not become ready within {readiness_timeout_s:g}s "
+                    f"({attempts} poll attempts)"
+                ),
+                diagnostic_tail=sink.tail(),
+                launched_argv=cmd.argv,
+            )
+        sleeper(interval)
+
+    # --- prove the ready endpoint is OUR process -------------------
+    attribution = port_attribution(endpoint.port, pid)
+    if attribution == "foreign":
+        # A foreign process owns the ready listener -> endpoint conflict,
+        # retry the next candidate (NOT wrong_service -- that is reserved for
+        # "the listener is ours but fails recipe conformance").
+        return ManagedMaterialisationOutcome(
+            status=MaterialisationStatus.ENDPOINT_CONFLICT,
+            detail=(
+                f"the ready listener on {endpoint.url} is provably a different "
+                f"process; trying the next candidate"
+            ),
+            diagnostic_tail=sink.tail(),
+            launched_argv=cmd.argv,
+        )
+    # "ours" or "unestablished" -> proceed, preserving which it was.
+
+    # --- independent recipe conformance -------------------------
+    if not context_conformance(endpoint.url, request.recipe.requested_context):
+        return ManagedMaterialisationOutcome(
+            status=MaterialisationStatus.WRONG_SERVICE,
+            detail=(
+                f"the ready llama-server at {endpoint.url} does not match the "
+                f"resolved context ({request.recipe.requested_context})"
+            ),
+            diagnostic_tail=sink.tail(),
+            launched_argv=cmd.argv,
+        )
+
+    result = materialise_owned_runtime(
+        request,
+        launch_proof=launch_proof,
+        launched_at=now_iso(),
+    )
+    return ManagedMaterialisationOutcome(
+        status=MaterialisationStatus.SPAWNED_READY,
+        detail=f"managed llama-server ready at {endpoint.url} (pid {pid})",
+        result=result,
+        process=proc,
+        endpoint=endpoint.url,
+        diagnostic_tail=sink.tail(),
+        launched_argv=cmd.argv,
+        attribution=attribution,
+        diagnostic_sink=sink,
+    )
+
+
+# ---------------------------------------------------------------------------
+# stdout/stderr: bounded ring buffer, actively drained, cleaned on close
+# ---------------------------------------------------------------------------
+class DiagnosticSink:
+    """A bounded diagnostic buffer for a child's merged stdout/stderr.
+
+    A background thread drains the child's output pipe into a fixed-size ring
+    buffer so the child can never block on a full OS pipe, and only the last
+    ``max_bytes`` are retained (no unbounded log growth). :meth:`close`
+    stops the drainer and releases resources.
+    """
+
+    def __init__(self, max_bytes: int = 64 * 1024) -> None:
+        import threading
+
+        self._max = max_bytes
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        self._thread = None
+        self._stream = None
+
+    def attach(self, stream) -> None:
+        import threading
+
+        self._stream = stream
+
+        def _drain() -> None:
+            try:
+                while True:
+                    chunk = stream.read(4096)
+                    if not chunk:
+                        return
+                    with self._lock:
+                        self._buf.extend(chunk)
+                        if len(self._buf) > self._max:
+                            del self._buf[: len(self._buf) - self._max]
+            except (OSError, ValueError):
+                return
+
+        self._thread = threading.Thread(
+            target=_drain, name="llama-server-diag", daemon=True
+        )
+        self._thread.start()
+
+    def tail(self) -> str:
+        with self._lock:
+            return bytes(self._buf).decode("utf-8", "replace")
+
+    def close(self) -> None:
+        stream = self._stream
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Popen -- argv list, never shell
+# ---------------------------------------------------------------------------
+def _default_popen(argv, **kwargs):
+    return subprocess.Popen(argv, **kwargs)  # noqa: S603 -- argv list, shell=False
+
+
+def _launch(popen, cmd: LlamaServerCommand, sink: DiagnosticSink):
+    """Start the child with an argv list (no shell) and an env overlay, and
+    attach the bounded diagnostic drainer."""
+    import os as _os
+
+    env = dict(_os.environ)
+    env.update(cmd.env_overlay)
+    proc = popen(
+        list(cmd.argv),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        shell=False,
+        close_fds=True,
+    )
+    if getattr(proc, "stdout", None) is not None:
+        sink.attach(proc.stdout)
+    return proc
+
+
+def _reap(proc) -> None:
+    """Best-effort ensure a failed candidate child is not left running.
+
+    Only reached for a child WE just launched that has NOT been conferred an
+    OwnedRuntime -- direct termination is safe. A child that already exited
+    is simply waited on."""
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=MANAGED_GRACEFUL_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=MANAGED_FORCED_TIMEOUT_S)
+        else:
+            proc.wait(timeout=1.0)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        pass
+
+
+# ---------------------------------------------------------------------------
+# lifecycle-controller wiring for an owned managed runtime
+# ---------------------------------------------------------------------------
+def lifecycle_controller_for(
+    outcome: ManagedMaterialisationOutcome,
+    *,
+    observe_identity: Callable[[int], Optional[LaunchProcessProof]],
+    terminate: Callable[..., str],
+    graceful_timeout_s: float = MANAGED_GRACEFUL_TIMEOUT_S,
+    forced_timeout_s: float = MANAGED_FORCED_TIMEOUT_S,
+) -> RuntimeLifecycleController:
+    """Build a :class:`RuntimeLifecycleController` for a materialisation
+    outcome.
+
+    * REUSED_EXTERNAL -> controller with no cleanup authority (no callbacks).
+    * SPAWNED_READY -> controller whose ``revalidate_fn`` re-observes the
+      ``/proc`` identity and whose ``cleanup_fn`` runs a scoped graceful ->
+      forced termination of exactly the retained child, re-proving ownership
+      before *each* signal. A process that survives both signals within
+      their bounded windows raises :class:`ForcedCleanupFailed`, which the
+      controller maps to :attr:`CleanupOutcome.FORCED_FAILED`.
+    """
+    result = outcome.result
+    if result is None:
+        raise ManagedMaterialisationError("outcome carries no MaterialisationResult")
+
+    if result.ownership is RuntimeOwnership.EXTERNAL_REUSED:
+        return RuntimeLifecycleController(result)
+
+    proc = outcome.process
+    if proc is None:
+        raise ManagedMaterialisationError("owned outcome carries no retained process")
+
+    def _revalidate(owned) -> Optional[LaunchProcessProof]:
+        return observe_identity(owned.launch_proof.pid)
+
+    sink = outcome.diagnostic_sink
+
+    def _cleanup(owned) -> None:
+        def _still_ours() -> bool:
+            observed = observe_identity(owned.launch_proof.pid)
+            return observed is not None and owned.launch_proof.revalidation_matches(observed)
+
+        try:
+            verdict = terminate(
+                proc,
+                graceful_timeout_s=graceful_timeout_s,
+                forced_timeout_s=forced_timeout_s,
+                revalidate=_still_ours,
+            )
+        finally:
+            # Close the diagnostic drainer + output pipe regardless of the
+            # teardown outcome -- they must not outlive the process.
+            if sink is not None:
+                sink.close()
+        if verdict == "survived":
+            raise ForcedCleanupFailed(
+                "managed llama-server survived graceful and forced termination "
+                "within their bounded windows"
+            )
+
+    revalidate_fn: RevalidateFn = _revalidate
+    cleanup_fn: CleanupFn = _cleanup
+    return RuntimeLifecycleController(
+        result, cleanup_fn=cleanup_fn, revalidate_fn=revalidate_fn
+    )

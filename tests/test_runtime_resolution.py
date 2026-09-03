@@ -331,6 +331,28 @@ def test_required_content_addressed_identity_present_passes():
     assert res.is_resolved
 
 
+def test_resolved_recipe_retains_model_primary_sha256_for_managed_materialisation():
+    # Stage 3B.3C's managed llama-server spawn needs the resolved recipe to
+    # carry the artifact identity it was resolved against, so it can prove it
+    # is launching exactly that artifact and not an arbitrary path.
+    res = _resolve(model_primary_sha256="sha256:deadbeef")
+    assert res.is_resolved
+    assert res.resolved.model_primary_sha256 == "sha256:deadbeef"
+    assert res.resolved.to_dict()["model_primary_sha256"] == "sha256:deadbeef"
+
+
+def test_resolved_recipe_model_primary_sha256_is_none_when_not_supplied():
+    res = _resolve()  # _resolve() supplies no model_primary_sha256
+    assert res.is_resolved
+    assert res.resolved.model_primary_sha256 is None
+    assert res.resolved.to_dict()["model_primary_sha256"] is None
+
+
+def test_resolved_recipe_model_primary_sha256_is_trimmed():
+    res = _resolve(model_primary_sha256="  sha256:abc  ")
+    assert res.resolved.model_primary_sha256 == "sha256:abc"
+
+
 # --------------------------------------------------------------------------
 # capability gate (§6) -- evidence consumed, never computed
 # --------------------------------------------------------------------------
