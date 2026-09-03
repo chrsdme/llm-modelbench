@@ -145,16 +145,19 @@ class _StubClient:
 
 
 def _stop_after_client(monkeypatch, *, capture=None):
-    """Make cmd_run raise _STOP right after the client is built (the next step
-    is _run_dir / _resolve_model_selection). Records the client if asked."""
-    orig = cli._run_dir
+    """Make cmd_run raise _STOP right after the client is built. The first step
+    inside the runtime-lifecycle scope is ``_ranking_dir_for`` (see cmd_run);
+    stopping there proves the client was already constructed against the
+    materialised endpoint without running any benchmark work. (`_run_dir` is
+    now computed *before* materialisation, so it can't be the stop point.)"""
+    orig = cli._ranking_dir_for
 
-    def _boom(args):
+    def _boom(args, **kw):
         if capture is not None:
             capture["reached"] = True
         raise _STOP
 
-    monkeypatch.setattr(cli, "_run_dir", _boom)
+    monkeypatch.setattr(cli, "_ranking_dir_for", _boom)
     return orig
 
 
@@ -243,6 +246,41 @@ def test_resolve_and_materialise_for_run_backend_is_the_selected_candidate_not_r
     out = cli._resolve_and_materialise_for_run(args, Config(), inventory=())
     assert captured["backend"] == "llama_cpp"  # from the profile, not "ollama" via recommended
     assert out.ok is False
+
+
+def test_no_profile_ollama_down_is_a_structured_pre_row_refusal(monkeypatch):
+    """Stage 3B.3D behaviour change: with no explicit/saved/default profile and
+    the local Ollama service down, a real run is a structured NO_USABLE_ENDPOINT
+    refusal (not a client built anyway that then emits per-row harness errors).
+    resolve_runtime is still driven through the implicit Ollama profile."""
+    from llm_modelbench import preflight as preflight_mod
+
+    blocker = preflight_mod.PreflightBlocker(
+        reason="no_healthy_candidates", detail="ollama endpoint unreachable",
+    )
+    monkeypatch.setattr(cli, "load_profiles", lambda store: ({}, None))
+    monkeypatch.setattr(
+        cli, "resolve_operational_preflight",
+        lambda cfg, **kw: preflight_mod.PreflightResult(
+            gpu_inventory=(), candidates=(), selected_candidate=None,
+            topology=None, blocker=blocker,
+        ),
+    )
+    seen = {}
+
+    def _fake_ram(*, selected_backend, **kw):
+        seen["backend"] = selected_backend
+        return rm.RuntimeMaterialisationOutcome(
+            ok=False, backend=selected_backend, resolution_status="no_usable_endpoint",
+            refusal_reason="runtime_not_resolved: no_usable_endpoint: ollama endpoint unreachable",
+        )
+
+    monkeypatch.setattr(rm, "resolve_and_materialise_runtime", _fake_ram)
+    args = _run_args("/tmp/x-unused")
+    out = cli._resolve_and_materialise_for_run(args, Config(), inventory=())
+    assert seen["backend"] == "ollama"
+    assert out.ok is False
+    assert "no_usable_endpoint" in out.refusal_reason
 
 
 def test_client_for_materialised_endpoint_honours_the_resolver_backend():
@@ -364,6 +402,67 @@ def test_external_reuse_runtime_is_never_cleaned(monkeypatch, tmp_path):
     assert outcome.controller.cleanup_calls == 0
     ev = json.loads((tmp_path / "r" / "materialisation_evidence.json").read_text())
     assert ev["materialisation"]["ownership"] == "external_reused"
+
+
+def test_owned_runtime_cleaned_when_plan_confirmation_is_declined(monkeypatch, tmp_path):
+    """DEFECT-3B.3D-02 regression: the lifecycle scope must open *before* the
+    interactive plan confirmation. An operator declining the plan (SystemExit)
+    after the materialiser has spawned an owned llama-server must still trigger
+    exactly one cleanup and still persist materialisation evidence."""
+    outcome = _owned_outcome()
+
+    def _run(client, cfg, **kw):  # pragma: no cover - must never be reached
+        raise AssertionError("runner.run must not run when the plan is declined")
+
+    _wire_full_run(monkeypatch, outcome, run_impl=_run)
+    monkeypatch.setattr(
+        cli, "_confirm_plan",
+        lambda *a, **k: (_ for _ in ()).throw(SystemExit("cancelled before run")),
+    )
+    with pytest.raises(SystemExit, match="cancelled before run"):
+        cli.cmd_run(_run_args(tmp_path), Config())
+    assert outcome.controller.cleanup_calls == 1
+    ev = json.loads((tmp_path / "r" / "materialisation_evidence.json").read_text())
+    assert ev["ok"] is True
+    assert ev["cleanup"]["observed"] is True
+    assert ev["materialisation"]["ownership"] == "modelbench_owned"
+
+
+def test_keyboardinterrupt_in_runner_cleans_owned_runtime_and_exits_130(monkeypatch, tmp_path):
+    """KeyboardInterrupt inside runner.run: the partial-report rebuild runs,
+    the owned runtime is cleaned exactly once, and cmd_run exits with code 130.
+    The `with _lifecycle` scope sits *outside* the `except KeyboardInterrupt`
+    handler, so teardown happens after the partial-report rebuild."""
+    outcome = _owned_outcome()
+    order: list[str] = []
+
+    def _run(client, cfg, **kw):
+        kw["out_dir"].mkdir(parents=True, exist_ok=True)
+        (kw["out_dir"] / "raw_results.jsonl").write_text("", encoding="utf-8")
+        raise KeyboardInterrupt
+
+    _wire_full_run(monkeypatch, outcome, run_impl=_run)
+
+    import llm_modelbench.report as report_mod
+    monkeypatch.setattr(report_mod, "build",
+                        lambda *a, **k: order.append("partial_report_rebuild"))
+
+    ctrl = outcome.controller
+    _orig_cleanup = ctrl.cleanup
+
+    def _tracked_cleanup():
+        order.append("cleanup")
+        return _orig_cleanup()
+
+    monkeypatch.setattr(ctrl, "cleanup", _tracked_cleanup)
+
+    with pytest.raises(SystemExit) as ei:
+        cli.cmd_run(_run_args(tmp_path), Config())
+    assert ei.value.code == 130
+    assert order == ["partial_report_rebuild", "cleanup"]
+    assert ctrl.cleanup_calls == 1
+    ev = json.loads((tmp_path / "r" / "materialisation_evidence.json").read_text())
+    assert ev["cleanup"]["observed"] is True
 
 
 def test_no_direct_subprocess_or_popen_in_cli_run_path():

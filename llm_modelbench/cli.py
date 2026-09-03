@@ -147,8 +147,17 @@ def _resolve_and_materialise_for_run(args, cfg: Config, *, inventory=None):
 
     if preflight.blocked:
         blocker = preflight.blocker
-        # Preserve the established no-profile Ollama behaviour when the local
-        # service is down and nothing explicit/saved was requested.
+        # Stage 3B.3D behaviour change (owner-visible): the pre-3B.3D no-profile
+        # path built an Ollama client anyway when the local service was down and
+        # let the failure surface as per-row harness errors. Under the Stage
+        # 3B.3D Ollama policy (reuse-only, no spawn, no restart, no fallback) a
+        # real run with no usable endpoint is a *structured pre-row refusal*
+        # instead: resolve_runtime is still driven (via the implicit Ollama
+        # profile, which also sets args._runtime_profile), returns
+        # NO_USABLE_ENDPOINT, and the caller turns that into a clean SystemExit
+        # with zero benchmark rows. `--mock` is unaffected (it never reaches
+        # here). An explicit/saved/default profile keeps the earlier
+        # RuntimeMaterialisationOutcome refusal shape below.
         if blocker.reason != "no_healthy_candidates" or explicit or default or profiles:
             from .runtime_materialisation import RuntimeMaterialisationOutcome
             return RuntimeMaterialisationOutcome(
@@ -719,6 +728,7 @@ def cmd_run(args, cfg):
     # (SystemExit, zero benchmark rows), never a model-quality failure.
     # --mock keeps the offline stub and touches neither the resolver nor the
     # materialiser.
+    out_dir = _run_dir(args)
     materialisation = None
     if getattr(args, "mock", False):
         client = _client(args, cfg, gpu_inventory=inventory)
@@ -741,45 +751,15 @@ def cmd_run(args, cfg):
                         _dc_replace(_existing, endpoint=materialisation.endpoint))
             except TypeError:
                 pass  # not a dataclass profile -- leave as-is
-    out_dir = _run_dir(args)
-    rankings_dir = _ranking_dir_for(args, run_id=out_dir.name)
-    task_ids = _task_ids(args)
-    selected_models = getattr(args, "_selected_models", None)
-    if selected_models is None:
-        selected_models = _resolve_model_selection(args, client)
-    # Read-only selected-runtime metadata, collected per model.  This is passed
-    # into runner before it may inspect resumable evidence.
-    profile = getattr(args, "_runtime_profile", None) or implicit_ollama_profile(cfg)
-    try:
-        tag_rows = {str(row.get("name")): row for row in client.tags()}
-        current_runtime_identities = {
-            model: collect_runtime_identity(client=client, profile=profile, model_name=model,
-                                            model_row=tag_rows.get(model), config=cfg, inventory=inventory)
-            for model in selected_models
-        }
-    except Exception as exc:
-        raise SystemExit(f"run refused: current_runtime_identity_missing: {exc}") from exc
-    # The CLI gate is intentionally before ranking scope, plan construction,
-    # --auto probes, plan JSON, confirmation, telemetry, and runner execution.
-    if args.resume and (out_dir / "raw_results.jsonl").exists():
-        try: validate_resume_runtime_identities(out_dir, current_runtime_identities, selected_models)
-        except ValueError as exc: raise SystemExit(f"run refused: {exc}") from None
-    _write_run_ranking_scope(out_dir, args, rankings_dir=rankings_dir)
-    capability_profiles = getattr(args, "_capability_profiles", None)
-    plan = getattr(args, "_accepted_plan", None) or _plan_for_args(
-        args, cfg, client, selected_models=selected_models, capability_profiles=capability_profiles,
-        runtime_identities=current_runtime_identities,
-    )
-    _require_host_code_opt_in(args, plan)
-    _confirm_plan(args, plan)
-    # Anvil Stage 3B.3D: run the benchmark inside the runtime lifecycle scope
-    # so an owned (managed) llama-server is torn down on EVERY exit path
-    # (normal completion, exception, KeyboardInterrupt), exactly once. External
-    # reuse exits with no destructive action. The controller records a cleanup
-    # failure structurally rather than raising it; after the scope exits we
-    # observe `last_cleanup` and persist it (a clean benchmark with a failed
-    # cleanup must not disappear). The `finally` guarantees the evidence is
-    # written even on a structured SystemExit / an unexpected exception.
+    # Anvil Stage 3B.3D: the runtime lifecycle scope opens *immediately* after
+    # client construction -- before runtime-identity collection, resume-identity
+    # validation, ranking scope, plan construction, the host-code opt-in and the
+    # interactive plan confirmation. Every one of those steps can raise
+    # SystemExit (or the operator can decline the plan prompt) *after* an owned
+    # llama-server has already been spawned by the materialiser; wrapping only
+    # runner.run would leak that process on every such early exit and would also
+    # skip the evidence `finally`. `_run_dir` is a pure path join, so it is
+    # hoisted above the materialisation call and is safe to compute eagerly.
     import contextlib as _contextlib
     _lifecycle = (
         materialisation.controller
@@ -789,6 +769,37 @@ def cmd_run(args, cfg):
     _benchmark_completed = False
     try:
         with _lifecycle:
+            rankings_dir = _ranking_dir_for(args, run_id=out_dir.name)
+            task_ids = _task_ids(args)
+            selected_models = getattr(args, "_selected_models", None)
+            if selected_models is None:
+                selected_models = _resolve_model_selection(args, client)
+            # Read-only selected-runtime metadata, collected per model.  This is
+            # passed into runner before it may inspect resumable evidence.
+            profile = getattr(args, "_runtime_profile", None) or implicit_ollama_profile(cfg)
+            try:
+                tag_rows = {str(row.get("name")): row for row in client.tags()}
+                current_runtime_identities = {
+                    model: collect_runtime_identity(client=client, profile=profile, model_name=model,
+                                                    model_row=tag_rows.get(model), config=cfg, inventory=inventory)
+                    for model in selected_models
+                }
+            except Exception as exc:
+                raise SystemExit(f"run refused: current_runtime_identity_missing: {exc}") from exc
+            # The CLI gate is intentionally before ranking scope, plan
+            # construction, --auto probes, plan JSON, confirmation, telemetry,
+            # and runner execution.
+            if args.resume and (out_dir / "raw_results.jsonl").exists():
+                try: validate_resume_runtime_identities(out_dir, current_runtime_identities, selected_models)
+                except ValueError as exc: raise SystemExit(f"run refused: {exc}") from None
+            _write_run_ranking_scope(out_dir, args, rankings_dir=rankings_dir)
+            capability_profiles = getattr(args, "_capability_profiles", None)
+            plan = getattr(args, "_accepted_plan", None) or _plan_for_args(
+                args, cfg, client, selected_models=selected_models, capability_profiles=capability_profiles,
+                runtime_identities=current_runtime_identities,
+            )
+            _require_host_code_opt_in(args, plan)
+            _confirm_plan(args, plan)
             try:
                 runner.run(client, cfg, level=args.level, out_dir=out_dir,
                        include=args.include_regex, exclude=args.exclude_regex,
