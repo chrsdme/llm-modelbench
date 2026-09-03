@@ -30,12 +30,22 @@ domain into a real (or, in tests, a fake) ``llama-server`` child process:
   UUID that is not NVIDIA-UUID-shaped or is absent from the authoritative
   hardware inventory is a structured failure, never a silently-wrong env.
 
-``llama-server`` flag choices are pinned against build 10326
-(``--help`` inspection, recorded in ``ANVIL_PROGRESS.md``):
-``--ctx-size``, ``-sm/--split-mode {none,layer,row,tensor}``.
-RAM/CPU spill is a *negative* requirement -- when the recipe forbids spill
-the command simply adds no spill-enabling flag; ``allow_ram_spill`` already
-had its effect inside the resolver (fit decision / ``placement_class``).
+``llama-server`` flag choices are pinned against build 10326 (``--help``
+inspection, recorded in ``ANVIL_PROGRESS.md``): ``--ctx-size``,
+``-ngl/--n-gpu-layers`` (default ``auto``, accepts the enum ``all``),
+``-fit/--fit`` (default ``on`` -- adjusts unset args to fit *live* device
+memory), ``-sm/--split-mode {none,layer,row,tensor}`` (default ``layer``).
+Because omitting ``-ngl`` on build 10326 makes *llama-server* decide the
+GPU/CPU layer split from live VRAM, absence of a flag is **not** a spill
+guarantee. The resolved ``placement_class`` is the sole placement authority:
+``full_gpu`` -> ``-ngl all --fit off --split-mode none`` (documented enums,
+fail closed on load); ``multi_gpu`` / ``ram_spill`` -> structured
+``RESOLVED_RECIPE_INCOMPLETE`` (OWNER DECISION REQUIRED 3B.3C-OD1 / -OD2).
+Before spawn, the resolved executable's ``--help`` is checked for the
+launch-essential options (:data:`REQUIRED_LLAMA_SERVER_CLI_OPTIONS`); a
+mismatch is :attr:`MaterialisationStatus.CLI_CONTRACT_UNSUPPORTED`, not a
+launch. The bytes at ``model_path`` are hashed and matched to the resolved
+artifact identity (:attr:`MaterialisationStatus.MODEL_CONTENT_MISMATCH`).
 """
 from __future__ import annotations
 
@@ -47,6 +57,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Mapping, Optional, Sequence, Tuple
 
+from .freeze import _sha256 as _sha256_file
 from .hardware import GPUDevice
 from .runtime_lifecycle import (
     CleanupFn,
@@ -77,6 +88,8 @@ __all__ = [
     "MANAGED_READINESS_TIMEOUT_S",
     "MANAGED_GRACEFUL_TIMEOUT_S",
     "MANAGED_FORCED_TIMEOUT_S",
+    "REQUIRED_LLAMA_SERVER_CLI_OPTIONS",
+    "SUPPORTED_LLAMA_SERVER_BUILD",
 ]
 
 # ---------------------------------------------------------------------------
@@ -97,6 +110,67 @@ _NVIDIA_UUID_RE = re.compile(
     r"^(?:GPU-)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
+
+
+#: Launch-essential ``llama-server`` long options whose presence (and, for the
+#: two placement flags, whose build-10326 default semantics) the command
+#: builder depends on. If the resolved executable's ``--help`` does not
+#: advertise all of these, ``spawn_managed_llama_server`` fails structurally
+#: *before* spawn rather than launching an unintended configuration (audit
+#: §8 -- ``--fit`` and the ``-ngl all`` enum are new build-10326 syntax; an
+#: older binary silently means the opposite).
+REQUIRED_LLAMA_SERVER_CLI_OPTIONS = (
+    "--model",
+    "--host",
+    "--port",
+    "--ctx-size",
+    "--n-gpu-layers",
+    "--fit",
+    "--split-mode",
+)
+
+#: llama-server build this command builder's flag/default assumptions were
+#: verified against (``llama-server --help``). Recorded so a compatibility
+#: mismatch is visible, not silent.
+SUPPORTED_LLAMA_SERVER_BUILD = "10326"
+
+
+def _default_model_content_hasher(model_path: str) -> str:
+    """Content hash of the bytes at ``model_path`` (chunked, reusing the
+    repo's single file hasher). Raises ``OSError`` if the path is unreadable."""
+    from pathlib import Path
+
+    return _sha256_file(Path(model_path))
+
+
+def _normalise_sha(value: str) -> str:
+    """Compare model hashes regardless of an optional ``sha256:`` prefix or
+    case (Ollama digests carry the prefix; a bare GGUF hash may not)."""
+    v = value.strip().lower()
+    if v.startswith("sha256:"):
+        v = v[len("sha256:"):]
+    return v
+
+
+def _default_cli_contract_probe(executable_path: str) -> "frozenset[str]":
+    """Return the set of long-option tokens advertised by ``<exe> --help``.
+
+    argv-list, ``shell=False``, bounded output, short timeout. Any failure to
+    run or parse yields an empty set -> the caller fails closed.
+    """
+    try:
+        completed = subprocess.run(  # noqa: S603 -- argv list, shell=False
+            [executable_path, "--help"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+    blob = (completed.stdout or "") + "\n" + (completed.stderr or "")
+    return frozenset(re.findall(r"--[a-z][a-z0-9-]+", blob))
 
 
 class MaterialisationStatus(str, Enum):
@@ -141,6 +215,15 @@ class MaterialisationStatus(str, Enum):
     WRONG_SERVICE = "wrong_service"
     #: The process launched but its ownership proof could not be established.
     OWNERSHIP_PROOF_FAILED = "ownership_proof_failed"
+    #: The bytes at the supplied model path do not hash to the resolved
+    #: artifact identity (or the path could not be read to prove it).
+    #: Distinct from ARTIFACT_IDENTITY_MISMATCH (a caller-claim mismatch,
+    #: caught earlier without touching the filesystem).
+    MODEL_CONTENT_MISMATCH = "model_content_mismatch"
+    #: The resolved executable's ``--help`` does not advertise a
+    #: launch-essential option; command construction assumptions are not
+    #: known to hold for this binary. Zero spawn.
+    CLI_CONTRACT_UNSUPPORTED = "cli_contract_unsupported"
 
 
 class ManagedMaterialisationError(RuntimeError):
@@ -174,6 +257,15 @@ class LlamaServerCommand:
     ctx_size: Optional[int]
     split_mode: Optional[str]
     env_overlay: Mapping[str, str]
+    #: ``--n-gpu-layers`` value. Only the documented enum ``"all"`` is ever
+    #: emitted by the builder (never a computed integer / ``"auto"``); ``None``
+    #: means the flag is omitted (build-10326 default ``auto`` -> a spill /
+    #: fit path the builder only reaches when the recipe permits it).
+    n_gpu_layers: Optional[str] = None
+    #: ``--fit`` value (``"on"`` / ``"off"``). ``"off"`` pins llama-server's
+    #: live-VRAM auto-fit *off* so placement follows the resolved recipe, not
+    #: device memory at launch. ``None`` omits the flag (default ``on``).
+    fit: Optional[str] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "env_overlay", dict(self.env_overlay))
@@ -181,6 +273,13 @@ class LlamaServerCommand:
             raise ManagedMaterialisationError("port must be an integer 1..65535")
         if self.split_mode is not None and self.split_mode not in {"none", "layer", "row", "tensor"}:
             raise ManagedMaterialisationError("split_mode must be a llama-server split mode")
+        if self.n_gpu_layers is not None and self.n_gpu_layers != "all":
+            raise ManagedMaterialisationError(
+                "n_gpu_layers may only be the documented enum 'all' or None; "
+                "ModelBench never emits a computed layer count"
+            )
+        if self.fit is not None and self.fit not in {"on", "off"}:
+            raise ManagedMaterialisationError("fit must be 'on', 'off', or None")
 
     @property
     def argv(self) -> Tuple[str, ...]:
@@ -197,6 +296,8 @@ class LlamaServerCommand:
             ctx_size=self.ctx_size,
             split_mode=self.split_mode,
             env_overlay=self.env_overlay,
+            n_gpu_layers=self.n_gpu_layers,
+            fit=self.fit,
         )
 
 
@@ -212,6 +313,10 @@ def _render_argv(cmd: LlamaServerCommand) -> Tuple[str, ...]:
     ]
     if cmd.ctx_size is not None:
         argv += ["--ctx-size", str(int(cmd.ctx_size))]
+    if cmd.n_gpu_layers is not None:
+        argv += ["--n-gpu-layers", cmd.n_gpu_layers]
+    if cmd.fit is not None:
+        argv += ["--fit", cmd.fit]
     if cmd.split_mode is not None:
         argv += ["--split-mode", cmd.split_mode]
     return tuple(argv)
@@ -276,18 +381,35 @@ def build_llama_server_command(
     Translation rules (faithful, no search):
 
     * context: ``--ctx-size <requested_context>`` iff the recipe set one.
+      With ``--fit off`` (see below) an omitted ``--ctx-size`` means
+      llama-server takes the context from the model's own metadata -- a
+      deterministic value -- rather than adjusting it to fit live VRAM.
     * GPU visibility: ``CUDA_VISIBLE_DEVICES=GPU-<uuid>,...`` over exactly
       the selected UUIDs, order preserved. Nothing else restricts device use
       (no ``--device``, which would pass transient ordinals).
-    * multi-GPU (``strategy == "layer_split"``, >=2 UUIDs): ``--split-mode
-      layer`` and **no** ``--tensor-split``. ModelBench deliberately does not
-      choose the layer distribution -- doing so would be the frozen-rule-
-      forbidden performance guess -- so llama.cpp's default distribution
-      applies. The resolver never emits ``strategy == "tensor_split"``, so no
-      split ratios are ever constructed.
-    * RAM/CPU spill: a *negative* requirement. When the recipe forbids spill
-      the command adds no spill-enabling flag (and no ``--n-gpu-layers``).
-      ``allow_ram_spill`` already had its effect inside the resolver.
+    * placement authority: the resolved ``placement_class`` (one of
+      ``ram_spill_preflight.PLACEMENT_LABELS``) is the *sole* placement
+      decision. build 10326's ``-ngl`` default is ``auto`` and ``--fit``
+      default is ``on`` -- i.e. omitting the GPU-layer flag makes
+      *llama-server* decide the GPU/CPU split from live device memory. That
+      would be a second placement authority, so:
+
+      - ``full_gpu``  -> ``--n-gpu-layers all --fit off --split-mode none``.
+        Every value is a documented enum, never a computed quantity. Stage
+        3B.2 already proved the workload fits the selected GPU, so if the
+        bytes do not actually fit, llama-server failing to load is the
+        correct fail-closed outcome -- not a silent CPU spill.
+      - ``multi_gpu`` -> structured ``RESOLVED_RECIPE_INCOMPLETE``. Stage
+        3B.2 selected the GPU *pool* but never resolved how layers are
+        distributed across it; ModelBench must not derive a split (or a
+        ``--tensor-split`` ratio), and llama.cpp's default distribution
+        cannot be verified as recipe-deterministic here. OWNER DECISION
+        REQUIRED (3B.3C-OD1).
+      - ``ram_spill`` -> structured ``RESOLVED_RECIPE_INCOMPLETE``. Stage
+        3B.2 granted the RAM-spill *permission* and computed
+        ``estimated_ram_spill_bytes`` but never a concrete on-GPU layer
+        count; ModelBench must not invent one. OWNER DECISION REQUIRED
+        (3B.3C-OD2).
     """
     if not isinstance(request, MaterialisationRequest):
         raise ManagedMaterialisationError("request must be a MaterialisationRequest")
@@ -303,12 +425,52 @@ def build_llama_server_command(
     if gpu_reason is not None:
         return None, MaterialisationStatus.GPU_IDENTITY_UNTRANSLATABLE, gpu_reason
 
-    split_mode = None
-    if (
-        recipe.execution_settings.strategy == "layer_split"
-        and len(recipe.selected_physical_gpu_uuids) >= 2
-    ):
-        split_mode = "layer"
+    placement = recipe.placement_class
+    if placement == "full_gpu":
+        # ``full_gpu`` is a single-device placement in every resolver path
+        # (ram_spill_preflight.placement_label_for -> "full_gpu" only for
+        # single_gpu_fit / candidate_single_gpu_fit, which topology_budget
+        # returns with exactly one UUID; the post-discount branch labels a
+        # >1-UUID pool "multi_gpu"). Enforce the invariant rather than assume
+        # it -- emitting --split-mode none for a >1-UUID recipe would silently
+        # override the resolved pool down to one device.
+        if len(recipe.selected_physical_gpu_uuids) > 1:
+            return (
+                None,
+                MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE,
+                "resolved placement_class 'full_gpu' carries more than one "
+                "selected GPU UUID; a single-device launch would silently "
+                "drop GPUs the recipe selected (OWNER DECISION REQUIRED "
+                "3B.3C-OD1)",
+            )
+        n_gpu_layers: Optional[str] = "all"
+        fit: Optional[str] = "off"
+        split_mode: Optional[str] = "none"
+    elif placement == "multi_gpu":
+        return (
+            None,
+            MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE,
+            "resolved placement_class 'multi_gpu' selects a GPU pool but the "
+            "Stage 3B.2 recipe does not resolve the inter-GPU layer "
+            "distribution; ModelBench will not derive one or defer it to "
+            "llama.cpp's default (OWNER DECISION REQUIRED 3B.3C-OD1)",
+        )
+    elif placement == "ram_spill":
+        return (
+            None,
+            MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE,
+            "resolved placement_class 'ram_spill' grants a spill permission "
+            "but the Stage 3B.2 recipe resolves no on-GPU layer count; "
+            "ModelBench will not invent an offload quantity (OWNER DECISION "
+            "REQUIRED 3B.3C-OD2)",
+        )
+    else:
+        return (
+            None,
+            MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE,
+            f"resolved placement_class {placement!r} is not a placement this "
+            f"builder can faithfully translate",
+        )
 
     env_overlay = {} if cvd is None else {"CUDA_VISIBLE_DEVICES": cvd}
     return (
@@ -324,6 +486,8 @@ def build_llama_server_command(
             ),
             split_mode=split_mode,
             env_overlay=env_overlay,
+            n_gpu_layers=n_gpu_layers,
+            fit=fit,
         ),
         None,
         "",
@@ -528,6 +692,8 @@ def spawn_managed_llama_server(
     base_port: int = _ENDPOINT_BASE_PORT,
     endpoint_window: int = _ENDPOINT_WINDOW,
     port_bindable: Callable[[str, int], bool] = _port_is_bindable,
+    content_hasher: Callable[[str], str] = _default_model_content_hasher,
+    cli_contract_probe: Callable[[str], "frozenset[str]"] = _default_cli_contract_probe,
 ) -> ManagedMaterialisationOutcome:
     """Launch, verify, and hand back an owned ``llama-server``.
 
@@ -566,7 +732,7 @@ def spawn_managed_llama_server(
             status=MaterialisationStatus.ARTIFACT_IDENTITY_MISMATCH,
             detail="the supplied model path carries no content-addressed identity",
         )
-    if model_primary_sha256.strip() != recipe_sha.strip():
+    if _normalise_sha(model_primary_sha256) != _normalise_sha(recipe_sha):
         return ManagedMaterialisationOutcome(
             status=MaterialisationStatus.ARTIFACT_IDENTITY_MISMATCH,
             detail=(
@@ -575,8 +741,49 @@ def spawn_managed_llama_server(
             ),
         )
 
-    # --- 3. command build (GPU identity translation happens here) -----
-    base_cmd, gpu_status, gpu_detail = build_llama_server_command(
+    # --- 2b. model *content* authority: the claim check above only compares
+    # two hash strings. Prove the bytes at ``model_path`` actually hash to the
+    # resolved artifact identity before anything is launched. Managed spawn
+    # only -- external reuse never reaches here.
+    try:
+        observed_content_sha = content_hasher(model_path)
+    except OSError as exc:
+        return ManagedMaterialisationOutcome(
+            status=MaterialisationStatus.MODEL_CONTENT_MISMATCH,
+            detail=(
+                f"could not read the model bytes at {model_path!r} to prove "
+                f"artifact identity: {type(exc).__name__}: {exc}"
+            ),
+        )
+    if _normalise_sha(observed_content_sha) != _normalise_sha(recipe_sha):
+        return ManagedMaterialisationOutcome(
+            status=MaterialisationStatus.MODEL_CONTENT_MISMATCH,
+            detail=(
+                f"the bytes at {model_path!r} hash to "
+                f"{_normalise_sha(observed_content_sha)!r}, not the resolved "
+                f"artifact {_normalise_sha(recipe_sha)!r}"
+            ),
+        )
+
+    # --- 2c. CLI contract: the command builder depends on build-10326
+    # option/default semantics (``--fit off`` + ``-ngl all``). Fail closed if
+    # the resolved executable does not advertise the launch-essential options
+    # rather than launching an unintended configuration on an older binary.
+    advertised = cli_contract_probe(executable_path)
+    missing = [opt for opt in REQUIRED_LLAMA_SERVER_CLI_OPTIONS if opt not in advertised]
+    if missing:
+        return ManagedMaterialisationOutcome(
+            status=MaterialisationStatus.CLI_CONTRACT_UNSUPPORTED,
+            detail=(
+                f"resolved executable {executable_path!r} does not advertise "
+                f"launch-essential option(s) {missing!r}; command construction "
+                f"is pinned to llama-server build {SUPPORTED_LLAMA_SERVER_BUILD} "
+                f"semantics"
+            ),
+        )
+
+    # --- 3. command build (GPU identity translation + placement here) --
+    base_cmd, build_status, build_detail = build_llama_server_command(
         request,
         executable_path=executable_path,
         model_path=model_path,
@@ -584,7 +791,7 @@ def spawn_managed_llama_server(
         port=base_port,
     )
     if base_cmd is None:
-        return ManagedMaterialisationOutcome(status=gpu_status, detail=gpu_detail)
+        return ManagedMaterialisationOutcome(status=build_status, detail=build_detail)
 
     _popen = popen if popen is not None else _default_popen
     candidates = candidate_endpoints(base_port=base_port, window=endpoint_window)

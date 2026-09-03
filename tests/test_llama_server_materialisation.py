@@ -56,11 +56,18 @@ def _recipe(
     backend="llama_cpp",
     endpoint="http://127.0.0.1:9",
     gpu_uuids=(U_A,),
-    strategy="single_device",
+    strategy=None,
     requested_context=8192,
     allow_ram_spill=False,
+    placement_class="full_gpu",
+    estimated_ram_spill_bytes=None,
     model_primary_sha256=SHA,
 ):
+    # ``strategy`` defaults to match ``placement_class`` / the UUID count the
+    # way the real resolver does (single_device for <=1 UUID, layer_split for
+    # a pool); an explicit value still overrides for edge-case coverage.
+    if strategy is None:
+        strategy = "single_device" if len(gpu_uuids) <= 1 else "layer_split"
     settings = RuntimeExecutionSettings(strategy=strategy, context_size=requested_context)
     return ResolvedRuntime(
         backend=backend,
@@ -71,12 +78,24 @@ def _recipe(
             backend=backend, execution_settings=settings
         ),
         selected_physical_gpu_uuids=tuple(gpu_uuids),
-        placement_class="single_gpu",
+        placement_class=placement_class,
         requested_context=requested_context,
         allow_ram_spill=allow_ram_spill,
-        estimated_ram_spill_bytes=None,
+        estimated_ram_spill_bytes=estimated_ram_spill_bytes,
         model_primary_sha256=model_primary_sha256,
     )
+
+
+#: A CLI-contract probe stub that advertises exactly the launch-essential
+#: options -- the default in tests that are not about CLI compatibility.
+def _ok_cli_probe(executable_path):
+    return frozenset(lsm.REQUIRED_LLAMA_SERVER_CLI_OPTIONS)
+
+
+#: A content hasher stub that returns the resolved SHA -- the default in
+#: tests that are not about path->content binding.
+def _matching_content_hasher(model_path):
+    return SHA
 
 
 def _resolution(*, candidate_health="unreachable", **recipe_kw):
@@ -161,39 +180,59 @@ def test_single_gpu_selection_becomes_cuda_visible_devices_uuid_form():
         hardware_inventory=INVENTORY,
     )
     assert cmd.env_overlay["CUDA_VISIBLE_DEVICES"] == f"GPU-{U_A[4:].lower()}"
-    assert "--split-mode" not in cmd.argv
     assert "--device" not in cmd.argv  # no transient ordinal
 
 
-def test_multi_gpu_layer_split_emits_split_mode_layer_no_tensor_split():
-    cmd, _, _ = build_llama_server_command(
-        _request(gpu_uuids=(U_A, U_B), strategy="layer_split"),
+# --- placement translation: placement_class is the SOLE authority ---------
+# build 10326: -ngl default 'auto' + --fit default 'on' means an OMITTED
+# GPU-layer flag hands the GPU/CPU split decision to llama-server (live VRAM).
+# These tests pin the EFFECTIVE launch policy, not just token absence.
+def test_full_gpu_pins_all_layers_on_gpu_and_disables_live_fit():
+    cmd, status, _ = build_llama_server_command(
+        _request(gpu_uuids=(U_A,), placement_class="full_gpu"),
         executable_path="x",
         model_path="m.gguf",
         hardware_inventory=INVENTORY,
     )
-    assert cmd.argv[cmd.argv.index("--split-mode") + 1] == "layer"
-    assert "--tensor-split" not in cmd.argv
-    assert cmd.env_overlay["CUDA_VISIBLE_DEVICES"] == (
-        f"GPU-{U_A[4:].lower()},GPU-{U_B[4:].lower()}"
+    assert status is None
+    argv = cmd.argv
+    # every GPU layer is pinned on-GPU by the documented enum 'all' ...
+    assert argv[argv.index("--n-gpu-layers") + 1] == "all"
+    # ... and llama-server's live-VRAM auto-fit is turned OFF, so placement
+    # follows the recipe rather than device memory at launch.
+    assert argv[argv.index("--fit") + 1] == "off"
+    # single-device intent is explicit (survives a future default change).
+    assert argv[argv.index("--split-mode") + 1] == "none"
+    # never a computed quantity / ratio.
+    assert "--tensor-split" not in argv
+    assert "auto" not in argv
+
+
+def test_full_gpu_command_is_a_pure_function_of_the_recipe():
+    kw = dict(gpu_uuids=(U_A,), placement_class="full_gpu")
+    a, _, _ = build_llama_server_command(
+        _request(**kw), executable_path="/x/llama-server", model_path="m.gguf",
+        hardware_inventory=INVENTORY, port=8090,
     )
+    # inventory *order* must not change the result
+    b, _, _ = build_llama_server_command(
+        _request(**kw), executable_path="/x/llama-server", model_path="m.gguf",
+        hardware_inventory=tuple(reversed(INVENTORY)), port=8090,
+    )
+    assert a.argv == b.argv
+    assert a.env_overlay == b.env_overlay
 
 
 def test_gpu_uuid_order_is_preserved_verbatim():
-    cmd, _, _ = build_llama_server_command(
-        _request(gpu_uuids=(U_B, U_A), strategy="layer_split"),
-        executable_path="x",
-        model_path="m.gguf",
-        hardware_inventory=INVENTORY,
-    )
-    assert cmd.env_overlay["CUDA_VISIBLE_DEVICES"] == (
-        f"GPU-{U_B[4:].lower()},GPU-{U_A[4:].lower()}"
-    )
+    # multi-GPU builds fail closed, so exercise CVD ordering via the helper.
+    v, reason = resolve_cuda_visible_devices((U_B, U_A), hardware_inventory=INVENTORY)
+    assert reason is None
+    assert v == f"GPU-{U_B[4:].lower()},GPU-{U_A[4:].lower()}"
 
 
 def test_no_extra_gpu_is_added():
     cmd, _, _ = build_llama_server_command(
-        _request(gpu_uuids=(U_A,)),
+        _request(gpu_uuids=(U_A,), placement_class="full_gpu"),
         executable_path="x",
         model_path="m.gguf",
         hardware_inventory=INVENTORY,
@@ -201,47 +240,86 @@ def test_no_extra_gpu_is_added():
     assert cmd.env_overlay["CUDA_VISIBLE_DEVICES"].count("GPU-") == 1
 
 
-def test_ram_spill_cannot_self_enable_no_spill_flag_when_recipe_forbids():
-    cmd, _, _ = build_llama_server_command(
-        _request(allow_ram_spill=False),
+def test_multi_gpu_fails_closed_recipe_incomplete_for_materialisation():
+    cmd, status, detail = build_llama_server_command(
+        _request(gpu_uuids=(U_A, U_B), placement_class="multi_gpu"),
         executable_path="x",
         model_path="m.gguf",
         hardware_inventory=INVENTORY,
     )
-    # no --n-gpu-layers / no host-RAM opt-in flag
-    assert "--n-gpu-layers" not in cmd.argv
-    assert "-ngl" not in cmd.argv
+    assert cmd is None
+    assert status is MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE
+    assert "multi_gpu" in detail and "OD1" in detail
 
 
-def test_ram_spill_permitted_still_adds_no_search_flag():
-    cmd, _, _ = build_llama_server_command(
-        _request(allow_ram_spill=True),
+def test_ram_spill_placement_fails_closed_no_invented_offload_quantity():
+    cmd, status, detail = build_llama_server_command(
+        _request(
+            placement_class="ram_spill",
+            allow_ram_spill=True,
+            estimated_ram_spill_bytes=1234,
+        ),
         executable_path="x",
         model_path="m.gguf",
         hardware_inventory=INVENTORY,
     )
-    assert "--n-gpu-layers" not in cmd.argv
-    assert "--tensor-split" not in cmd.argv
+    assert cmd is None
+    assert status is MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE
+    assert "ram_spill" in detail and "OD2" in detail
 
 
-def test_identical_recipe_produces_identical_semantic_argv_and_env():
-    a, _, _ = build_llama_server_command(
-        _request(gpu_uuids=(U_A, U_B), strategy="layer_split"),
-        executable_path="/x/llama-server",
+def test_full_gpu_with_a_multi_uuid_pool_fails_closed_not_single_device():
+    # the resolver never produces this, but if it did, --split-mode none would
+    # silently override the pool -> must fail closed instead.
+    cmd, status, detail = build_llama_server_command(
+        _request(gpu_uuids=(U_A, U_B), placement_class="full_gpu"),
+        executable_path="x",
         model_path="m.gguf",
         hardware_inventory=INVENTORY,
-        port=8090,
     )
-    # different inventory *order* must not change the result
-    b, _, _ = build_llama_server_command(
-        _request(gpu_uuids=(U_A, U_B), strategy="layer_split"),
-        executable_path="/x/llama-server",
+    assert cmd is None
+    assert status is MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE
+    assert "more than one" in detail
+
+
+def test_full_gpu_primary_gpu_is_the_recipe_first_uuid_ordinal_zero():
+    # A4: with CUDA_VISIBLE_DEVICES listing the recipe's UUID(s) in order,
+    # ordinal 0 is the first selected UUID, so llama-server's --main-gpu
+    # default (0) is the intended primary. Documented compatibility
+    # assumption (not verifiable on a GPU-less host) -- pinned here.
+    cmd, status, _ = build_llama_server_command(
+        _request(gpu_uuids=(U_A,), placement_class="full_gpu"),
+        executable_path="x",
         model_path="m.gguf",
-        hardware_inventory=tuple(reversed(INVENTORY)),
-        port=8090,
+        hardware_inventory=INVENTORY,
     )
-    assert a.argv == b.argv
-    assert a.env_overlay == b.env_overlay
+    assert status is None
+    assert cmd.env_overlay["CUDA_VISIBLE_DEVICES"].split(",")[0] == (
+        f"GPU-{U_A[4:].lower()}"
+    )
+    # ModelBench never passes --main-gpu (relies on the default 0).
+    assert "--main-gpu" not in cmd.argv
+
+
+def test_normalise_sha_matches_across_prefix_and_case_but_not_content():
+    hexd = "c" * 64
+    assert lsm._normalise_sha("SHA256:" + hexd.upper()) == lsm._normalise_sha(
+        "sha256:" + hexd
+    )
+    assert lsm._normalise_sha("sha256:" + hexd) != lsm._normalise_sha(
+        "sha256:" + "d" * 64
+    )
+
+
+def test_unknown_placement_class_fails_closed():
+    cmd, status, _ = build_llama_server_command(
+        _request(placement_class="something_new"),
+        executable_path="x",
+        model_path="m.gguf",
+        hardware_inventory=INVENTORY,
+    )
+    assert cmd is None
+    assert status is MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE
 
 
 def test_gpu_identity_untranslatable_when_uuid_absent_from_inventory():
@@ -310,6 +388,8 @@ def _spawn(request, **overrides):
         base_port=18080,
         endpoint_window=4,
         port_bindable=lambda host, port: True,
+        content_hasher=_matching_content_hasher,
+        cli_contract_probe=_ok_cli_probe,
     )
     kw.update(overrides)
     return spawn_managed_llama_server(request, **kw)
@@ -410,6 +490,88 @@ def test_missing_model_path_fails_closed():
 def test_missing_executable_fails_structurally():
     out = _spawn(_request(), executable_path=None)
     assert out.status is MaterialisationStatus.EXECUTABLE_UNAVAILABLE
+
+
+# --- artifact *content* binding: the claim check is not enough ------------
+def test_adversarial_ab_artifact_wrong_bytes_right_claimed_sha_zero_spawn(tmp_path):
+    """The audit's A/B construction: resolution refers to SHA_A; the caller
+    hands model_path = (a file that is really B) together with a *claimed*
+    supplied sha of SHA_A. The claim check passes -- the CONTENT check must
+    catch it, with zero spawn."""
+    artifact_b = tmp_path / "artifact_b.gguf"
+    artifact_b.write_bytes(b"these are the bytes of artifact B, not A")
+
+    spawned = {"n": 0}
+
+    def _counting_popen(argv, **kw):
+        spawned["n"] += 1
+        return _FakePopen(argv, **kw)
+
+    out = _spawn(
+        _request(model_primary_sha256=SHA),          # recipe SHA_A
+        model_path=str(artifact_b),
+        model_primary_sha256=SHA,                     # caller *claims* SHA_A
+        content_hasher=lsm._default_model_content_hasher,   # real hash of B
+        popen=_counting_popen,
+    )
+    assert out.status is MaterialisationStatus.MODEL_CONTENT_MISMATCH
+    assert out.launched_argv is None
+    assert spawned["n"] == 0
+
+
+def test_model_content_binding_accepts_bytes_that_really_hash_to_the_recipe(tmp_path):
+    from llm_modelbench.freeze import _sha256 as _real_sha
+
+    gguf = tmp_path / "real.gguf"
+    gguf.write_bytes(b"deterministic model bytes")
+    real_hex = _real_sha(gguf)
+
+    out = _spawn(
+        _request(model_primary_sha256="sha256:" + real_hex),
+        model_path=str(gguf),
+        model_primary_sha256="sha256:" + real_hex,
+        content_hasher=lsm._default_model_content_hasher,
+    )
+    assert out.status is MaterialisationStatus.SPAWNED_READY
+
+
+def test_unreadable_model_path_is_content_mismatch_not_a_crash():
+    out = _spawn(
+        _request(model_primary_sha256=SHA),
+        model_path="/no/such/model/file.gguf",
+        model_primary_sha256=SHA,
+        content_hasher=lsm._default_model_content_hasher,
+    )
+    assert out.status is MaterialisationStatus.MODEL_CONTENT_MISMATCH
+    assert out.launched_argv is None
+
+
+# --- CLI contract: fail closed on an incompatible binary -----------------
+def test_cli_contract_missing_launch_essential_option_fails_before_spawn():
+    spawned = {"n": 0}
+
+    def _counting_popen(argv, **kw):
+        spawned["n"] += 1
+        return _FakePopen(argv, **kw)
+
+    # a binary that lacks --fit (an older llama.cpp) -> the -ngl/--fit
+    # placement pinning cannot be trusted; do not launch it.
+    def _old_binary_probe(exe):
+        return frozenset(lsm.REQUIRED_LLAMA_SERVER_CLI_OPTIONS) - {"--fit"}
+
+    out = _spawn(
+        _request(),
+        cli_contract_probe=_old_binary_probe,
+        popen=_counting_popen,
+    )
+    assert out.status is MaterialisationStatus.CLI_CONTRACT_UNSUPPORTED
+    assert out.launched_argv is None
+    assert spawned["n"] == 0
+
+
+def test_cli_contract_probe_that_cannot_run_the_binary_fails_closed():
+    out = _spawn(_request(), cli_contract_probe=lambda exe: frozenset())
+    assert out.status is MaterialisationStatus.CLI_CONTRACT_UNSUPPORTED
 
 
 # ==========================================================================

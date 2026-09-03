@@ -31,6 +31,7 @@ from llm_modelbench.runtime_resolution import (
 from llm_modelbench.runtime_profiles import RuntimeCandidate, RuntimeProfile
 from llm_modelbench.runtime_lifecycle import MaterialisationRequest
 from llm_modelbench import runtime_process_linux as rpl
+from llm_modelbench import llama_server_materialisation as lsm
 from llm_modelbench.llama_server_materialisation import (
     MaterialisationStatus,
     lifecycle_controller_for,
@@ -65,7 +66,7 @@ def _recipe(*, requested_context=0, gpu_uuids=(U_A,), model_primary_sha256=SHA):
             backend="llama_cpp", execution_settings=settings
         ),
         selected_physical_gpu_uuids=tuple(gpu_uuids),
-        placement_class="single_gpu",
+        placement_class="full_gpu",
         requested_context=requested_context or None,
         allow_ram_spill=False,
         estimated_ram_spill_bytes=None,
@@ -159,6 +160,13 @@ def _spawn(request, *, behaviour="healthy", ctx=0, pids=None, **overrides):
         poll_interval_s=0.05,
         base_port=_free_port(),
         endpoint_window=8,
+        # This harness exercises the real Popen / /proc / readiness / cleanup
+        # path, not artifact-identity or CLI-contract checks -- stub those so
+        # the fake model path / fake executable do not short-circuit the run.
+        content_hasher=lambda model_path: SHA,
+        cli_contract_probe=lambda exe: frozenset(
+            lsm.REQUIRED_LLAMA_SERVER_CLI_OPTIONS
+        ),
     )
     kw.update(overrides)
     kw["popen"] = _fake_popen_factory(behaviour, ctx, pids=pids)

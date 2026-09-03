@@ -102,6 +102,8 @@ def main(argv=None) -> int:
     parser.add_argument("--model", default=None)
     parser.add_argument("--ctx-size", type=int, default=None)
     parser.add_argument("--split-mode", default=None)
+    parser.add_argument("--n-gpu-layers", default=None)
+    parser.add_argument("--fit", default=None)
     args = parser.parse_args(argv)
 
     behaviour = args.behaviour
