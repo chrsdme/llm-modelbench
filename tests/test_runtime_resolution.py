@@ -685,20 +685,35 @@ def test_shuffled_inventory_resolving_to_same_order_gives_same_request_identity_
     # inventory* that resolves to the same primary-first GPU order must yield
     # the same MaterialisationRequest.identity_key -- inventory enumeration
     # order is not identity, the resolved primary-first order is.
+    #
+    # DISCRIMINATING: ordinal order and UUID order *disagree* here -- U_A is
+    # at host ordinal 1, U_B at ordinal 0. The resolver's placement_order is
+    # ordinal-ascending, so the resolved primary-first order is (U_B, U_A);
+    # a naive sorted() key would lead with U_A. The second assertion breaks
+    # under a "sort the UUIDs" regression; the first breaks under a
+    # "discovery order leaks into the key" regression.
     from llm_modelbench.runtime_lifecycle import MaterialisationRequest
 
+    # ordinal 1 -> U_A, ordinal 0 -> U_B  (UUID sort would put U_A first)
     inv_fwd = (
-        GPUDevice(0, U_A, "0000:01:00.0", "A", 20000, None, None),
-        GPUDevice(1, U_B, "0000:02:00.0", "B", 12000, None, None),
+        GPUDevice(1, U_A, "0000:02:00.0", "A", 20000, None, None),
+        GPUDevice(0, U_B, "0000:01:00.0", "B", 12000, None, None),
     )
     inv_rev = tuple(reversed(inv_fwd))
     r1 = _resolve_multi(topology=topology_from_inventory(inv_fwd),
                         weight_bytes=24 * GB, kv_cache_bytes=1 * GB)
     r2 = _resolve_multi(topology=topology_from_inventory(inv_rev),
                         weight_bytes=24 * GB, kv_cache_bytes=1 * GB)
+    # the resolved primary-first order is (U_B, U_A) -- NOT UUID-sorted
+    assert r1.resolved.selected_physical_gpu_uuids == (U_B, U_A)
     k1 = MaterialisationRequest.from_resolution(r1).identity_key()
     k2 = MaterialisationRequest.from_resolution(r2).identity_key()
+    # inventory enumeration order does not reach the key
     assert k1 == k2
+    # and the key reflects the resolved primary-first order, not a sort:
+    # U_B's segment precedes U_A's in the gpu component
+    gpu_component = next(p for p in k1.split("|") if p.startswith("gpus:"))
+    assert gpu_component == f"gpus:{U_B},{U_A}"
 
 
 def test_same_gpu_set_different_resolved_primary_order_gives_different_identity_key():
