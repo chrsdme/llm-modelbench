@@ -254,22 +254,62 @@ class MaterialisationRequest:
         return self.recipe.selected_physical_gpu_uuids
 
     def identity_key(self) -> str:
-        """Structural identity of *what this request asks for*. Derived only
-        from resolved-recipe facts -- candidate discovery order, the
-        resolver's ``considered_candidate_endpoints`` list and the
-        (never-consulted) ``_recommended`` flag do not enter it, so the same
-        resolved recipe always yields the same key."""
+        """Structural identity of *what this request asks for* -- specifically,
+        of the resolved *launch recipe*. Derived only from resolved-recipe
+        facts: candidate discovery order, the resolver's
+        ``considered_candidate_endpoints`` list and the (never-consulted)
+        ``_recommended`` flag do not enter it, so the same resolved recipe
+        always yields the same key.
+
+        The key preserves every command-affecting difference. In particular
+        the *ordered* ``selected_physical_gpu_uuids`` tuple and the
+        ``tensor_split_weights`` are part of identity, because the generated
+        ``llama-server`` command binds them together:
+        ``CUDA_VISIBLE_DEVICES=<resolved UUID order>`` + ``--main-gpu 0`` +
+        ``--tensor-split <weights aligned to that order>``. Two resolutions
+        that select the same GPU *set* but in a different resolver-determined
+        primary-first order, or with a different split, are materially
+        different launches and get different keys.
+
+        This ordered tuple is *not* inventory-enumeration noise: Stage 3B.2's
+        resolver already fixes it in a canonical placement order (host ordinal
+        / primary-GPU first, capacity tie-break, physical UUID last) computed
+        over a UUID-sorted device list, so the order is a deterministic
+        function of the hardware, independent of the order devices were
+        discovered in. This module only reads that resolved order; it never
+        recomputes it.
+
+        ``main_gpu`` is not a separate component: the materialiser emits
+        ``--main-gpu 0`` for every multi-GPU launch and every ``ram_spill``
+        launch and omits it only for single-device ``full_gpu`` -- a pure
+        function of ``placement_class`` + the selected-UUID count, both of
+        which are already in the key. The GPU/CPU boundary policy
+        (``--fit off``/``-ngl all`` for ``full_gpu``/``multi_gpu`` vs
+        ``--fit on``/``-ngl auto`` for ``ram_spill``) is likewise a pure
+        function of ``placement_class`` + ``allow_ram_spill``, both present.
+        ``endpoint`` is part of request identity by the existing design.
+        """
         r = self.recipe
+        if r.tensor_split_weights is None:
+            split_component = "no_split"
+        else:
+            # Recipe order -- NEVER sorted: a (7,5) and a (5,7) split over the
+            # same ordered UUID set are different launch recipes.
+            split_component = "split:" + ",".join(str(w) for w in r.tensor_split_weights)
         return "|".join(
             (
-                "materialisation_request_v1",
+                "materialisation_request_v2",
                 r.backend,
                 r.endpoint,
                 r.runtime_profile_identity.stable_key(),
-                ",".join(sorted(r.selected_physical_gpu_uuids)),
+                # Ordered -- the resolver's canonical primary-GPU-first order,
+                # which the launch command aligns CUDA_VISIBLE_DEVICES and
+                # --tensor-split to. Not sorted.
+                "gpus:" + ",".join(r.selected_physical_gpu_uuids),
                 r.placement_class,
                 "" if r.requested_context is None else str(r.requested_context),
                 "spill" if r.allow_ram_spill else "no_spill",
+                split_component,
             )
         )
 

@@ -680,6 +680,55 @@ def test_shuffled_hardware_inventory_produces_identical_resolved_recipe():
     assert r1.resolved.to_dict() == r2.resolved.to_dict()
 
 
+def test_shuffled_inventory_resolving_to_same_order_gives_same_request_identity_key():
+    # 3B.3C FINAL IDENTITY CORRECTION, owner test #2: a shuffled *hardware
+    # inventory* that resolves to the same primary-first GPU order must yield
+    # the same MaterialisationRequest.identity_key -- inventory enumeration
+    # order is not identity, the resolved primary-first order is.
+    from llm_modelbench.runtime_lifecycle import MaterialisationRequest
+
+    inv_fwd = (
+        GPUDevice(0, U_A, "0000:01:00.0", "A", 20000, None, None),
+        GPUDevice(1, U_B, "0000:02:00.0", "B", 12000, None, None),
+    )
+    inv_rev = tuple(reversed(inv_fwd))
+    r1 = _resolve_multi(topology=topology_from_inventory(inv_fwd),
+                        weight_bytes=24 * GB, kv_cache_bytes=1 * GB)
+    r2 = _resolve_multi(topology=topology_from_inventory(inv_rev),
+                        weight_bytes=24 * GB, kv_cache_bytes=1 * GB)
+    k1 = MaterialisationRequest.from_resolution(r1).identity_key()
+    k2 = MaterialisationRequest.from_resolution(r2).identity_key()
+    assert k1 == k2
+
+
+def test_same_gpu_set_different_resolved_primary_order_gives_different_identity_key():
+    # 3B.3C FINAL IDENTITY CORRECTION, owner test #3: same physical cards,
+    # host ordinals swapped so the resolver's primary-first order genuinely
+    # flips (U_A first vs U_B first). The generated launch command differs
+    # (CUDA_VISIBLE_DEVICES order, --tensor-split alignment), so the identity
+    # key must differ.
+    from llm_modelbench.runtime_lifecycle import MaterialisationRequest
+
+    inv_a_primary = (
+        GPUDevice(0, U_A, "0000:01:00.0", "A", 20000, None, None),
+        GPUDevice(1, U_B, "0000:02:00.0", "B", 12000, None, None),
+    )
+    inv_b_primary = (
+        GPUDevice(1, U_A, "0000:01:00.0", "A", 20000, None, None),
+        GPUDevice(0, U_B, "0000:02:00.0", "B", 12000, None, None),
+    )
+    r_a = _resolve_multi(topology=topology_from_inventory(inv_a_primary),
+                         weight_bytes=24 * GB, kv_cache_bytes=1 * GB)
+    r_b = _resolve_multi(topology=topology_from_inventory(inv_b_primary),
+                         weight_bytes=24 * GB, kv_cache_bytes=1 * GB)
+    # sanity: the resolved primary-first order really did flip
+    assert r_a.resolved.selected_physical_gpu_uuids[0] == U_A
+    assert r_b.resolved.selected_physical_gpu_uuids[0] == U_B
+    k_a = MaterialisationRequest.from_resolution(r_a).identity_key()
+    k_b = MaterialisationRequest.from_resolution(r_b).identity_key()
+    assert k_a != k_b
+
+
 def test_transient_gpu_ordinal_changes_do_not_alter_the_per_uuid_split():
     # Same physical cards + capacities, host ordinals swapped. The pool is
     # ordered "primary (GPU0) first", so a genuine primary change legitimately

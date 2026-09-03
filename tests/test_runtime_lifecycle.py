@@ -64,6 +64,7 @@ def _resolved_recipe(
     requested_context=8192,
     allow_ram_spill=False,
     execution_settings=None,
+    tensor_split_weights=None,
 ):
     settings = execution_settings or _exec_settings(context_size=requested_context)
     return ResolvedRuntime(
@@ -79,6 +80,9 @@ def _resolved_recipe(
         requested_context=requested_context,
         allow_ram_spill=allow_ram_spill,
         estimated_ram_spill_bytes=None,
+        tensor_split_weights=(
+            None if tensor_split_weights is None else tuple(tensor_split_weights)
+        ),
     )
 
 
@@ -514,10 +518,102 @@ def test_recommended_flag_on_selected_candidate_has_no_lifecycle_influence():
     assert k1 == k2
 
 
-def test_gpu_uuid_order_in_recipe_does_not_change_request_identity():
-    k1 = _request(gpu_uuids=(U_A, U_B), placement_class="minimum_multi_gpu").identity_key()
-    k2 = _request(gpu_uuids=(U_B, U_A), placement_class="minimum_multi_gpu").identity_key()
-    assert k1 == k2
+def test_resolved_primary_first_gpu_order_is_part_of_request_identity():
+    # 3B.3C FINAL IDENTITY CORRECTION: the *resolved* primary-GPU-first order
+    # is command-affecting (CUDA_VISIBLE_DEVICES order + --main-gpu 0 +
+    # --tensor-split aligned to it). Two resolutions selecting the same GPU
+    # set but in a different primary-first order are different launch recipes
+    # and MUST get different identity keys.
+    #
+    # (Was: test_gpu_uuid_order_in_recipe_does_not_change_request_identity,
+    #  which asserted the opposite. That reasoning was wrong -- the split is
+    #  aligned to an order the key had discarded. See ANVIL_PROGRESS
+    #  DEFECT-3B.3C-11.)
+    k1 = _request(
+        gpu_uuids=(U_A, U_B), placement_class="multi_gpu",
+        tensor_split_weights=(1, 1),
+    ).identity_key()
+    k2 = _request(
+        gpu_uuids=(U_B, U_A), placement_class="multi_gpu",
+        tensor_split_weights=(1, 1),
+    ).identity_key()
+    assert k1 != k2
+
+
+def test_inventory_enumeration_noise_is_still_ignored_by_request_identity():
+    # The recipe carries the resolver's canonical primary-first order already;
+    # nothing about *discovery* order reaches identity_key. Two requests built
+    # from byte-identical resolved recipes are identical regardless of how the
+    # surrounding RuntimeResolution was populated.
+    recipe = _resolved_recipe(
+        gpu_uuids=(U_A, U_B), placement_class="multi_gpu",
+        tensor_split_weights=(7, 5),
+    )
+    res_a = RuntimeResolution(
+        status=RuntimeResolutionStatus.RESOLVED, reason="resolved", detail="a",
+        resolved=recipe, considered_candidate_endpoints=("http://z", "http://a"),
+    )
+    res_b = RuntimeResolution(
+        status=RuntimeResolutionStatus.RESOLVED, reason="resolved", detail="b",
+        resolved=recipe, considered_candidate_endpoints=("http://a", "http://z", "http://q"),
+    )
+    assert (
+        MaterialisationRequest.from_resolution(res_a).identity_key()
+        == MaterialisationRequest.from_resolution(res_b).identity_key()
+    )
+
+
+def test_same_gpu_set_and_order_different_tensor_split_gives_different_identity():
+    k1 = _request(
+        gpu_uuids=(U_A, U_B), placement_class="multi_gpu",
+        tensor_split_weights=(7, 5),
+    ).identity_key()
+    k2 = _request(
+        gpu_uuids=(U_A, U_B), placement_class="multi_gpu",
+        tensor_split_weights=(5, 7),
+    ).identity_key()
+    assert k1 != k2
+
+
+def test_full_gpu_multi_gpu_ram_spill_do_not_collapse_when_launch_policy_differs():
+    # full_gpu     -> --fit off / -ngl all / split-mode none  (single device)
+    # multi_gpu    -> --fit off / -ngl all / --tensor-split   (>=2 devices)
+    # ram_spill    -> --fit on  / -ngl auto                   (owner-sanctioned)
+    # placement_class and allow_ram_spill are both already in the key, so
+    # these three cannot share an identity even over the same UUID set.
+    full = _request(
+        gpu_uuids=(U_A,), placement_class="full_gpu",
+    ).identity_key()
+    multi = _request(
+        gpu_uuids=(U_A, U_B), placement_class="multi_gpu",
+        tensor_split_weights=(1, 1),
+    ).identity_key()
+    spill_single = _request(
+        gpu_uuids=(U_A,), placement_class="ram_spill",
+        allow_ram_spill=True, requested_context=4096,
+    ).identity_key()
+    # ram_spill over the *same* multi-GPU set as `multi` -- differs only by
+    # launch policy (fit on / ngl auto), must not collapse into `multi`.
+    spill_multi = _request(
+        gpu_uuids=(U_A, U_B), placement_class="ram_spill",
+        allow_ram_spill=True, requested_context=4096,
+        tensor_split_weights=(1, 1),
+    ).identity_key()
+    assert len({full, multi, spill_single, spill_multi}) == 4
+
+
+def test_request_identity_key_is_a_stable_serialisation_stable_string():
+    a = _request(
+        gpu_uuids=(U_A, U_B), placement_class="multi_gpu",
+        tensor_split_weights=(7, 5),
+    ).identity_key()
+    b = _request(
+        gpu_uuids=(U_A, U_B), placement_class="multi_gpu",
+        tensor_split_weights=(7, 5),
+    ).identity_key()
+    assert isinstance(a, str)
+    assert a == b  # byte-identical across independent construction
+    assert a.startswith("materialisation_request_v2|")
 
 
 def test_owned_runtime_recipe_identity_key_tracks_the_request():
