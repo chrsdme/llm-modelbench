@@ -81,6 +81,12 @@ class RuntimeResolutionStatus(str, Enum):
 
     # --- backend authority -------------------------------------------------
     NO_BACKEND_SELECTED = "no_backend_selected"
+    # Explicit backend selected, but it is not a backend ModelBench resolves
+    # runtimes for. Materially different from NO_BACKEND_SELECTED (the caller
+    # made a choice; the choice is unsupported) -- a downstream caller must
+    # distinguish these without parsing `detail` prose. (Stage 3B.3A
+    # carryover: the 3B.2 resolver conflated the two.)
+    UNSUPPORTED_BACKEND_SELECTED = "unsupported_backend_selected"
 
     # --- discovery / endpoint --------------------------------------------
     BACKEND_UNAVAILABLE = "backend_unavailable"
@@ -316,10 +322,33 @@ def _select_candidate(
                 ),
                 considered_endpoints,
             )
-        # Same endpoint, >1 candidate: provably equivalent on the
-        # authoritative (backend, endpoint) identity -- differ only in
-        # incidental metadata (name / provenance / source tuple). Stable
-        # tie-break on the profile name; documented and deterministic.
+        # Same endpoint, >1 candidate. Same (backend, endpoint) is NOT proof
+        # of runtime equivalence: RuntimeProfile.physical_gpu_uuids is an
+        # identity-bearing field that can genuinely diverge same-endpoint
+        # (DEFECT-3B.2-AUDIT-02). Compare it as a frozenset -- __post_init__
+        # dedups but does NOT sort physical_gpu_uuids (unlike RuntimeIdentity
+        # / runtime_fit which sort), so ("A","B") and ("B","A") are the same
+        # physical placement and must not read as divergent.
+        gpu_identity_sets = {
+            frozenset(c.profile.physical_gpu_uuids) for c in healthy
+        }
+        if len(gpu_identity_sets) >= 2:
+            return (
+                None,
+                _unresolved(
+                    RuntimeResolutionStatus.RUNTIME_AMBIGUOUS,
+                    "multiple healthy runtimes on the same endpoint for backend "
+                    f"{backend!r} with materially different physical GPU placement "
+                    f"({sorted(sorted(s) for s in gpu_identity_sets)}); an explicit "
+                    "runtime profile is required to disambiguate",
+                    considered_endpoints=considered_endpoints,
+                ),
+                considered_endpoints,
+            )
+        # Provably equivalent on (backend, endpoint, physical GPU identity):
+        # the remaining candidates differ only in incidental metadata
+        # (name / description / provenance / source tuple). Stable tie-break
+        # on the profile name; documented and deterministic.
         return sorted(healthy, key=lambda c: c.profile.name)[0], None, considered_endpoints
 
     # Zero healthy candidates for this backend.
@@ -453,13 +482,17 @@ def resolve_runtime(
     candidates = list(discovered_candidates)
 
     # --- 1. backend authority -------------------------------------------
-    if not selected_backend or selected_backend not in _KNOWN_BACKENDS:
+    if not selected_backend:
         return _unresolved(
             RuntimeResolutionStatus.NO_BACKEND_SELECTED,
             "no explicit backend was selected; the Stage 3B.2 resolver does not choose a "
-            "backend (it never consults _recommended or the recommended flag)"
-            if not selected_backend
-            else f"selected backend {selected_backend!r} is not a known ModelBench backend",
+            "backend (it never consults _recommended or the recommended flag)",
+        )
+    if selected_backend not in _KNOWN_BACKENDS:
+        return _unresolved(
+            RuntimeResolutionStatus.UNSUPPORTED_BACKEND_SELECTED,
+            f"selected backend {selected_backend!r} is not a backend ModelBench resolves "
+            f"runtimes for (known: {', '.join(_KNOWN_BACKENDS)})",
         )
 
     # --- 2. deterministic within-backend candidate resolution ----------

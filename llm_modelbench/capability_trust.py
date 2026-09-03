@@ -28,10 +28,23 @@ demonstrated by the observation itself:
   ``MEASURED_SUPPORTED`` or ``MEASURED_UNSUPPORTED`` (identically: the
   trust class is the trust/comparability of the evidence, not the sign of
   the result). ``PROBE_INCONCLUSIVE`` / ``BACKEND_UNSUPPORTED`` /
-  ``NOT_APPLICABLE`` never yield canonical;
-* the caller reports no unresolved ambiguity/conflict.
+  ``NOT_APPLICABLE`` never yield canonical.
 
 Anything short of that fails **closed** to ``UNKNOWN_LEGACY``.
+
+Stage 3B.3A note (DEFECT-3B.2-AUDIT-01): an ``unresolved_ambiguity``
+keyword was removed. It had no production producer -- the sole caller
+(:func:`capability_reprobe_execute._execute_one`) never passed it. Its only
+adjacent signal, a prior ``AMBIGUOUS_COMPATIBLE_OBSERVATIONS`` projection,
+is *resolved* by the fresh authoritative measurement (which supersedes every
+disagreeing predecessor, per ``stage-2.7C-execution.md`` decision 2), not
+carried forward as an unresolved conflict; a prior
+``SUPERSESSION_CONFLICT`` returns early with no write at all. There is no
+code path that reaches this classifier with a genuine unresolved write-time
+conflict, so advertising the parameter violated the "do not advertise
+config that is silently ignored" standard. The contract is unchanged: the
+completeness of the identity/provenance/measurement checks above is what
+fails a not-fully-demonstrated observation closed.
 
 Scope note (verified against ``capability_evidence_adapter.py`` before
 freezing, not assumed): the current probe path builds the observation's
@@ -84,7 +97,6 @@ def classify_fresh_capability_trust(
     *,
     expected_probe_protocol_version: str = PROBE_PROTOCOL_VERSION,
     expected_capability_schema_version: int = CAPABILITY_SCHEMA_VERSION,
-    unresolved_ambiguity: bool = False,
 ) -> EvidenceTrustClass:
     """Return the explicit :class:`EvidenceTrustClass` a freshly-written
     native capability observation must carry.
@@ -116,9 +128,6 @@ def classify_fresh_capability_trust(
         return EvidenceTrustClass.UNKNOWN_LEGACY
 
     if observation.result not in COMMITTING_MEASURED_STATES:
-        return EvidenceTrustClass.UNKNOWN_LEGACY
-
-    if unresolved_ambiguity:
         return EvidenceTrustClass.UNKNOWN_LEGACY
 
     return EvidenceTrustClass.CANONICAL_COMPATIBLE

@@ -43,9 +43,12 @@ GB = 1024 * 1024 * 1024
 # fixtures
 # --------------------------------------------------------------------------
 def _candidate(*, name="ollama-local", backend="ollama", endpoint="http://127.0.0.1:11434",
-               health="healthy", recommended=False, source=("saved_profile",)):
+               health="healthy", recommended=False, source=("saved_profile",),
+               physical_gpu_uuids=()):
     return RuntimeCandidate(
-        profile=RuntimeProfile(name=name, backend=backend, endpoint=endpoint, provenance="configured"),
+        profile=RuntimeProfile(name=name, backend=backend, endpoint=endpoint,
+                               provenance="configured",
+                               physical_gpu_uuids=tuple(physical_gpu_uuids)),
         health=health, source=tuple(source), detail=f"{health} fixture", recommended=recommended,
     )
 
@@ -96,9 +99,22 @@ def test_missing_backend_authority_does_not_guess():
     assert res.resolved is None
 
 
-def test_unknown_backend_is_structured_not_guessed():
-    res = _resolve(selected_backend="vllm")
-    assert res.status is RuntimeResolutionStatus.NO_BACKEND_SELECTED
+def test_unknown_backend_is_distinct_from_no_backend_selected():
+    """Stage 3B.3A carryover 3: an explicit unsupported backend is a
+    materially different state from 'no backend selected' -- callers must
+    distinguish them without reading `detail` prose."""
+    none_selected = _resolve(selected_backend=None)
+    unsupported = _resolve(selected_backend="vllm")
+    assert none_selected.status is RuntimeResolutionStatus.NO_BACKEND_SELECTED
+    assert unsupported.status is RuntimeResolutionStatus.UNSUPPORTED_BACKEND_SELECTED
+    assert none_selected.status is not unsupported.status
+    assert unsupported.resolved is None
+
+
+def test_unknown_backend_string_variants_all_unsupported():
+    for name in ("vllm", "tensorrt_llm", "unknown_backend", "OLLAMA"):
+        res = _resolve(selected_backend=name)
+        assert res.status is RuntimeResolutionStatus.UNSUPPORTED_BACKEND_SELECTED, name
 
 
 def test_recommended_flag_has_no_authority_over_resolution():
@@ -180,6 +196,69 @@ def test_multiple_healthy_distinct_endpoints_is_ambiguous_not_guessed():
     # order-independent
     res_rev = _resolve(discovered_candidates=list(reversed(cands)))
     assert res_rev.status is RuntimeResolutionStatus.RUNTIME_AMBIGUOUS
+
+
+# --------------------------------------------------------------------------
+# same-endpoint physical-GPU divergence (DEFECT-3B.2-AUDIT-02)
+# --------------------------------------------------------------------------
+def test_same_endpoint_equivalent_gpu_identity_resolves_deterministically():
+    """Two healthy candidates, same endpoint, same physical GPU set (even
+    with the UUID tuple written in a different order -- RuntimeProfile
+    dedups but does not sort). Provably equivalent -> stable name tie-break,
+    deterministic RESOLVED."""
+    a = _candidate(name="bbb", physical_gpu_uuids=(U_A, U_B))
+    b = _candidate(name="aaa", physical_gpu_uuids=(U_B, U_A))  # same set, reordered
+    res = _resolve(discovered_candidates=[a, b], topology=_dual_gpu_topology(),
+                   weight_bytes=4 * GB, kv_cache_bytes=512 * 1024 * 1024)
+    assert res.is_resolved
+    assert res.resolved.runtime_profile_name == "aaa"  # tie-break winner
+    # candidate order independent
+    res_rev = _resolve(discovered_candidates=[b, a], topology=_dual_gpu_topology(),
+                       weight_bytes=4 * GB, kv_cache_bytes=512 * 1024 * 1024)
+    assert res_rev.to_dict() == res.to_dict()
+
+
+def test_same_endpoint_divergent_gpu_identity_is_ambiguous():
+    """Same endpoint, materially different physical GPU placement -> the
+    (backend, endpoint) pair is NOT proof of equivalence. Must fail closed
+    as RUNTIME_AMBIGUOUS, never resolved by lexical profile.name."""
+    a = _candidate(name="aaa", physical_gpu_uuids=(U_A,))
+    b = _candidate(name="bbb", physical_gpu_uuids=(U_B,))
+    res = _resolve(discovered_candidates=[a, b], topology=_dual_gpu_topology(),
+                   weight_bytes=4 * GB, kv_cache_bytes=512 * 1024 * 1024)
+    assert res.status is RuntimeResolutionStatus.RUNTIME_AMBIGUOUS
+    assert res.resolved is None
+    # candidate order independent
+    res_rev = _resolve(discovered_candidates=[b, a], topology=_dual_gpu_topology(),
+                       weight_bytes=4 * GB, kv_cache_bytes=512 * 1024 * 1024)
+    assert res_rev.status is RuntimeResolutionStatus.RUNTIME_AMBIGUOUS
+
+
+def test_same_endpoint_gpu_divergence_not_hidden_by_uuid_ordering():
+    """The existing 'candidate order' tests vary candidate order, not the
+    within-profile UUID tuple order. This pins that ("A","B") vs ("B","A")
+    is treated as the SAME placement (frozenset compare), so a genuinely
+    divergent case ((A,) vs (B,)) is what trips ambiguity -- not tuple
+    ordering noise."""
+    same = _resolve(
+        discovered_candidates=[
+            _candidate(name="p1", physical_gpu_uuids=(U_A, U_B)),
+            _candidate(name="p2", physical_gpu_uuids=(U_B, U_A)),
+        ],
+        topology=_dual_gpu_topology(), weight_bytes=4 * GB,
+        kv_cache_bytes=512 * 1024 * 1024,
+    )
+    assert same.is_resolved  # reordered UUIDs are NOT divergence
+
+    divergent = _resolve(
+        discovered_candidates=[
+            _candidate(name="p1", physical_gpu_uuids=(U_A,)),
+            _candidate(name="p2", physical_gpu_uuids=(U_A, U_B)),
+        ],
+        topology=_dual_gpu_topology(), weight_bytes=4 * GB,
+        kv_cache_bytes=512 * 1024 * 1024,
+    )
+    assert divergent.status is RuntimeResolutionStatus.RUNTIME_AMBIGUOUS
 
 
 def test_explicit_profile_disambiguates_multiple_endpoints():

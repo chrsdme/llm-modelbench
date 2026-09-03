@@ -30,21 +30,28 @@ from llm_modelbench.ollama import MockClient
 
 
 # Anvil Stage 3B.2: append_capability_observation now requires an explicit
-# EvidenceTrustClass (owner's frozen rule). These tests exercise ledger /
-# projection behaviour, not trust classification, so they pass an explicit
-# CANONICAL_COMPATIBLE via this thin shim rather than at every call site.
+# EvidenceTrustClass (owner's frozen rule). A handful of tests in this file
+# exercise ledger / projection behaviour, not trust classification, so they
+# pass an explicit CANONICAL_COMPATIBLE via this named helper.
+#
+# Anvil Stage 3B.3A (carryover 4 / DEFECT-3B.2-AUDIT shim hygiene): the
+# module-global `append_capability_observation = _append_with_explicit_canonical_trust`
+# rebind was removed. It shadowed the real symbol *in the same file* as the
+# three real trust-writer tests (test_reprobe_writes_*), so a future trust
+# test added here would have silently inherited CANONICAL_COMPATIBLE. Call
+# sites that only need a ledger row now call the helper *by name*; the
+# trust-writer tests go through the real `execute_reprobe_actions` path and
+# are unaffected.
 from llm_modelbench.capability_observation import append_capability_observation as _acobs_real
 from llm_modelbench.evidence import EvidenceTrustClass as _ETC
-# These files exercise ledger / projection / adapter behaviour, not the
-# trust decision itself -- so they pin an explicit CANONICAL_COMPATIBLE
-# rather than thread a trust class through every call site. The write-time
-# trust decision is proven in tests/test_capability_trust.py and the three
-# writer tests in tests/test_capability_reprobe_execute.py. The helper is
-# deliberately NOT named like the real function so it cannot be mistaken
-# for the production writer (which has no default and never assumes canonical).
+
+
 def _append_with_explicit_canonical_trust(ledger, observation, *, trust_class=_ETC.CANONICAL_COMPATIBLE, provenance=()):
+    """Ledger/projection-behaviour test helper only -- NOT the production
+    writer (which has no default and never assumes canonical). Named
+    distinctly so it cannot be mistaken for `append_capability_observation`.
+    """
     return _acobs_real(ledger, observation, trust_class=trust_class, provenance=provenance)
-append_capability_observation = _append_with_explicit_canonical_trust
 
 def _model_identity(*, digest="digest-1"):
     return ModelArtifactIdentity(
@@ -226,8 +233,8 @@ def test_ambiguous_prior_is_resolved_by_superseding_every_predecessor(tmp_path, 
     ledger = EvidenceLedger(tmp_path / "ledger.jsonl")
     # Two disagreeing, mutually-compatible observations with no supersession
     # link between them -- a standing AMBIGUOUS_COMPATIBLE_OBSERVATIONS prior.
-    a = append_capability_observation(ledger, _observation(timestamp="2026-08-10T00:00:00Z", result=MeasuredCapabilityState.MEASURED_SUPPORTED))
-    b = append_capability_observation(ledger, _observation(timestamp="2026-08-11T00:00:00Z", result=MeasuredCapabilityState.MEASURED_UNSUPPORTED))
+    a = _append_with_explicit_canonical_trust(ledger, _observation(timestamp="2026-08-10T00:00:00Z", result=MeasuredCapabilityState.MEASURED_SUPPORTED))
+    b = _append_with_explicit_canonical_trust(ledger, _observation(timestamp="2026-08-11T00:00:00Z", result=MeasuredCapabilityState.MEASURED_UNSUPPORTED))
     projection = project_capability_from_ledger(ledger, capability="text", **_current_identity_kwargs(_observation()))
     assert projection.status == CapabilityProjectionStatus.AMBIGUOUS_COMPATIBLE_OBSERVATIONS
     assert {a.record_id, b.record_id} == set(projection.considered_observation_ids)
@@ -247,12 +254,12 @@ def test_ambiguous_prior_is_resolved_by_superseding_every_predecessor(tmp_path, 
 def test_preexisting_supersession_conflict_is_skipped_not_repaired(tmp_path, monkeypatch):
     ledger = EvidenceLedger(tmp_path / "ledger.jsonl")
     # A genuine fork: two records both claim to supersede the same predecessor.
-    root = append_capability_observation(ledger, _observation(timestamp="2026-08-10T00:00:00Z"))
-    append_capability_observation(
+    root = _append_with_explicit_canonical_trust(ledger, _observation(timestamp="2026-08-10T00:00:00Z"))
+    _append_with_explicit_canonical_trust(
         ledger, _observation(timestamp="2026-08-11T00:00:00Z"),
         provenance=(ProvenanceLink(ProvenanceRelation.SUPERSEDES, root.record_id),),
     )
-    append_capability_observation(
+    _append_with_explicit_canonical_trust(
         ledger, _observation(timestamp="2026-08-12T00:00:00Z"),
         provenance=(ProvenanceLink(ProvenanceRelation.SUPERSEDES, root.record_id),),
     )
@@ -357,7 +364,7 @@ def test_native_probe_inconclusive_remains_reprobe_worthy_not_a_terminal_status(
     runs_dir.mkdir()
     ledger = EvidenceLedger(default_ledger_path(runs_dir))
     inconclusive = _observation(result=MeasuredCapabilityState.PROBE_INCONCLUSIVE)
-    append_capability_observation(ledger, inconclusive)
+    _append_with_explicit_canonical_trust(ledger, inconclusive)
 
     cell = classify_model_capability(
         "probe-model", "text", [], current_identity=None, ledger=ledger,
@@ -391,7 +398,7 @@ def test_native_probe_inconclusive_remains_reprobe_worthy_not_a_terminal_status(
         endpoint_identity=typed.endpoint_identity,
     )
     ledger2 = EvidenceLedger(default_ledger_path(runs_dir).with_name("ledger2.jsonl"))
-    append_capability_observation(ledger2, matching_observation)
+    _append_with_explicit_canonical_trust(ledger2, matching_observation)
 
     report = classify_fleet(client, runs_dir=runs_dir, campaigns_root=tmp_path / "campaigns", ledger=ledger2)
     cell2 = next(c for c in report.cells if c.model == "probe-model" and c.capability == "text")

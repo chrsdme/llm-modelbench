@@ -116,11 +116,22 @@ def test_non_committing_measured_state_is_not_canonical(state):
     assert classify_fresh_capability_trust(obs) is EvidenceTrustClass.UNKNOWN_LEGACY
 
 
-def test_unresolved_ambiguity_fails_closed():
-    assert (
-        classify_fresh_capability_trust(_observation(), unresolved_ambiguity=True)
-        is EvidenceTrustClass.UNKNOWN_LEGACY
-    )
+def test_classifier_signature_has_no_ambiguity_parameter():
+    """Stage 3B.3A (DEFECT-3B.2-AUDIT-01): the ``unresolved_ambiguity``
+    keyword was removed -- it had no production producer, and advertising an
+    ignored parameter violates the config standard. This guard is the
+    genuinely new coverage: nothing previously prevented the parameter from
+    silently reappearing. The 'an incomplete but current-looking observation
+    still fails closed' guarantee that the removed
+    ``test_unresolved_ambiguity_fails_closed`` gestured at is already proven
+    by ``test_fresh_schema_alone_cannot_create_canonical_trust`` (name-hash
+    identity, no ``primary_sha256``) and the non-committing-measured-state
+    cases above.
+    """
+    import inspect
+
+    params = set(inspect.signature(classify_fresh_capability_trust).parameters)
+    assert "unresolved_ambiguity" not in params
 
 
 def test_no_trust_inference_from_timestamp_or_recency():
