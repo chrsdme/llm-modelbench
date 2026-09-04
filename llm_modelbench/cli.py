@@ -958,6 +958,15 @@ def cmd_run(args, cfg):
         # nothing to clean and no lifecycle scope to enter. (This matches the
         # pre-3B.3D-corrective-3 shape -- only an *ok* outcome opens the scope.)
         if not materialisation.ok:
+            # A failed *attempted* materialisation can contain the only audit
+            # evidence of candidate ports, argv/CVD, diagnostics and direct
+            # child reaping.  Persist it before refusing; a resolver-only
+            # refusal still has no materialisation evidence to write.
+            if materialisation.materialisation is not None:
+                _persist_materialisation_evidence(
+                    out_dir, materialisation, benchmark_completed=False,
+                    failure_stage="materialisation",
+                )
             raise SystemExit(f"run refused: {materialisation.refusal_reason}")
     # Anvil Stage 3B.3D corrective 3 (DEFECT-3B.3D-03): the runtime lifecycle
     # scope opens the moment an owned runtime exists -- before client

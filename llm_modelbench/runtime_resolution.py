@@ -806,8 +806,37 @@ def resolve_runtime(
             considered_endpoints=considered_endpoints,
         )
 
+    # An explicit saved-profile GPU list is an operator placement constraint
+    # for a cold managed llama.cpp run, not merely profile metadata.  Validate
+    # it before fit (and therefore before any possible spawn), then pass only
+    # that physical subset into the frozen fitter.  The subset keeps the
+    # topology's deterministic primary-first ordering; profile input order
+    # never becomes an execution order.
+    fit_topology = topology
+    constrained_uuids = tuple(candidate.profile.physical_gpu_uuids)
+    if (
+        selected_backend == "llama_cpp"
+        and owned_placement_required
+        and getattr(candidate, "health", None) != "healthy"
+        and constrained_uuids
+    ):
+        known_uuids = {device.uuid for device in topology.devices}
+        missing_uuids = tuple(uuid for uuid in constrained_uuids if uuid not in known_uuids)
+        if missing_uuids:
+            return _unresolved(
+                RuntimeResolutionStatus.ENVIRONMENT_INFEASIBLE,
+                "configured managed GPU constraint is absent from discovered topology: "
+                + ", ".join(missing_uuids),
+                selected_candidate=candidate,
+                considered_endpoints=considered_endpoints,
+            )
+        fit_topology = TopologyBudget(
+            tuple(device for device in topology.devices if device.uuid in constrained_uuids),
+            aggregate_policy_cap_bytes=topology.aggregate_policy_cap_bytes,
+        )
+
     fit = evaluate_workload_fit(
-        topology,
+        fit_topology,
         weight_bytes=weight_bytes,
         kv_cache_bytes=kv_cache_bytes,
         runtime_overhead_bytes=runtime_overhead_bytes,
@@ -835,7 +864,7 @@ def resolve_runtime(
     spill = resolve_spill_preflight(
         fit,
         safe_selected_gpu_capacity_bytes=_safe_selected_pool_capacity_bytes(
-            topology, fit.selected_gpu_uuids
+            fit_topology, fit.selected_gpu_uuids
         ),
         allow_ram_spill=allow_ram_spill,
         host_meminfo=host_meminfo,
@@ -878,7 +907,7 @@ def resolve_runtime(
     # rather than shipping a recipe the materialiser would have to guess at.
     try:
         tensor_split_weights = _deterministic_tensor_split_weights(
-            topology, selected_uuids
+            fit_topology, selected_uuids
         )
     except _SplitUnresolvable as exc:
         return _unresolved(

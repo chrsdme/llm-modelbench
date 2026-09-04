@@ -74,7 +74,7 @@ import re
 import socket
 import subprocess  # noqa: S404 -- argv-list Popen, shell=False only; see _launch()
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Callable, Mapping, Optional, Sequence, Tuple
 
@@ -774,6 +774,9 @@ class ManagedMaterialisationOutcome:
     #: drain thread and the output pipe do not outlive the process. None for
     #: every non-owned / failed outcome (those close their sink immediately).
     diagnostic_sink: object = field(default=None, repr=False)
+    #: Per-endpoint audit records retained when a managed launch cannot be
+    #: materialised.  They are intentionally evidence, not retry authority.
+    candidate_attempts: Tuple[Mapping[str, object], ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -1006,10 +1009,19 @@ def spawn_managed_llama_server(
     _popen = popen if popen is not None else _default_popen
     candidates = candidate_endpoints(base_port=base_port, window=endpoint_window)
     last_detail = "no candidate endpoint was available"
+    candidate_attempts: list[Mapping[str, object]] = []
 
     for cand in candidates:
         if not port_bindable(cand.host, cand.port):
             last_detail = f"candidate {cand.url} is occupied"
+            candidate_attempts.append({
+                "endpoint": cand.url,
+                "ownership_state": "not_spawned_port_unavailable",
+                "launched_argv": None,
+                "env_overlay": None,
+                "diagnostic_tail": "",
+                "reap": {"attempted": False, "ok": None, "detail": "no child launched"},
+            })
             continue
 
         cmd = base_cmd.with_port(cand.port)
@@ -1024,6 +1036,15 @@ def spawn_managed_llama_server(
                 diagnostic_tail=sink.tail(),
                 launched_argv=cmd.argv,
                 env_overlay=cmd.env_overlay,
+                endpoint=cand.url,
+                candidate_attempts=tuple(candidate_attempts + [{
+                    "endpoint": cand.url,
+                    "ownership_state": "spawn_failed",
+                    "launched_argv": list(cmd.argv),
+                    "env_overlay": dict(cmd.env_overlay),
+                    "diagnostic_tail": sink.tail(),
+                    "reap": {"attempted": False, "ok": None, "detail": "spawn failed before child existed"},
+                }]),
             )
 
         outcome = _verify_and_own(
@@ -1048,8 +1069,22 @@ def spawn_managed_llama_server(
 
         # This candidate failed. Ensure the owned child is gone before the
         # next candidate (no leaked children).
-        _reap(proc)
+        reap = _reap(proc)
         sink.close()
+        attempt = {
+            "endpoint": cand.url,
+            "ownership_state": "not_conferred",
+            "launched_argv": list(cmd.argv),
+            "env_overlay": dict(cmd.env_overlay),
+            "diagnostic_tail": outcome.diagnostic_tail,
+            "reap": reap,
+        }
+        candidate_attempts.append(attempt)
+        outcome = replace(
+            outcome,
+            endpoint=cand.url,
+            candidate_attempts=tuple(candidate_attempts),
+        )
         if outcome.status is MaterialisationStatus.ENDPOINT_CONFLICT:
             last_detail = outcome.detail
             continue
@@ -1062,6 +1097,7 @@ def spawn_managed_llama_server(
             f"no free managed endpoint in {candidates[0].url}..+{endpoint_window}: "
             f"{last_detail}"
         ),
+        candidate_attempts=tuple(candidate_attempts),
     )
 
 
@@ -1306,7 +1342,7 @@ def _launch(popen, cmd: LlamaServerCommand, sink: DiagnosticSink):
     return proc
 
 
-def _reap(proc) -> None:
+def _reap(proc) -> Mapping[str, object]:
     """Best-effort ensure a failed candidate child is not left running.
 
     Only reached for a child WE just launched that has NOT been conferred an
@@ -1322,8 +1358,9 @@ def _reap(proc) -> None:
                 proc.wait(timeout=MANAGED_FORCED_TIMEOUT_S)
         else:
             proc.wait(timeout=1.0)
-    except (OSError, subprocess.TimeoutExpired, ValueError):
-        pass
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        return {"attempted": True, "ok": False, "detail": f"{type(exc).__name__}: {exc}"}
+    return {"attempted": True, "ok": True, "detail": "child reaped"}
 
 
 # ---------------------------------------------------------------------------

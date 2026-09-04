@@ -167,6 +167,48 @@ def test_recommended_function_mutation_has_no_authority(monkeypatch):
     assert after == baseline
 
 
+def test_llama_cpp_profile_gpu_constraint_is_a_hard_fit_subset():
+    """A managed profile that names GPU1 may not silently use primary GPU0."""
+    res = _resolve(
+        selected_backend="llama_cpp",
+        discovered_candidates=[_candidate(
+            backend="llama_cpp", health="unreachable", physical_gpu_uuids=(U_B,)
+        )],
+        topology=_dual_gpu_topology(),
+        backend_executables=[type("Exe", (), {"backend": "llama_cpp", "state": "installed"})()],
+    )
+    assert res.status is RuntimeResolutionStatus.RESOLVED
+    assert res.resolved.selected_physical_gpu_uuids == (U_B,)
+    assert U_A not in res.resolved.selected_physical_gpu_uuids
+
+
+def test_llama_cpp_profile_gpu_constraint_never_falls_back_to_excluded_gpu():
+    """GPU0 has capacity, but profile-constrained GPU1 does not: fail closed."""
+    res = _resolve(
+        selected_backend="llama_cpp",
+        discovered_candidates=[_candidate(
+            backend="llama_cpp", health="unreachable", physical_gpu_uuids=(U_B,)
+        )],
+        topology=_dual_gpu_topology(a_mb=24000, b_mb=4000),
+        backend_executables=[type("Exe", (), {"backend": "llama_cpp", "state": "installed"})()],
+    )
+    assert res.status is RuntimeResolutionStatus.ENVIRONMENT_INFEASIBLE
+    assert res.resolved is None
+
+
+def test_llama_cpp_profile_unknown_gpu_constraint_fails_before_fit():
+    res = _resolve(
+        selected_backend="llama_cpp",
+        discovered_candidates=[_candidate(
+            backend="llama_cpp", health="unreachable", physical_gpu_uuids=(U_C,)
+        )],
+        topology=_dual_gpu_topology(),
+        backend_executables=[type("Exe", (), {"backend": "llama_cpp", "state": "installed"})()],
+    )
+    assert res.status is RuntimeResolutionStatus.ENVIRONMENT_INFEASIBLE
+    assert "absent from discovered topology" in res.detail
+
+
 def test_recommended_gpu_count_heuristic_is_never_consulted():
     """A dual-GPU host would make runtime_profiles._recommended prefer
     llama_cpp -- but with selected_backend='ollama' and a healthy ollama

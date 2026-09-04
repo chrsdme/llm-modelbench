@@ -310,6 +310,46 @@ def test_non_ok_outcome_is_a_structured_systemexit_with_no_rows(monkeypatch, tmp
     assert not (tmp_path / "r" / "materialisation_evidence.json").exists()  # nothing materialised
 
 
+def test_attempted_materialisation_refusal_persists_evidence_before_exit(monkeypatch, tmp_path):
+    failed = ManagedMaterialisationOutcome(
+        status=MaterialisationStatus.ENDPOINT_CONFLICT,
+        detail="all managed endpoints conflicted",
+        endpoint="http://127.0.0.1:8081",
+        diagnostic_tail="bind: address already in use",
+        launched_argv=("/opt/llama-server", "--port", "8081"),
+        env_overlay={"CUDA_VISIBLE_DEVICES": U_A},
+        candidate_attempts=({
+            "endpoint": "http://127.0.0.1:8080",
+            "ownership_state": "not_conferred",
+            "launched_argv": ["/opt/llama-server", "--port", "8080"],
+            "env_overlay": {"CUDA_VISIBLE_DEVICES": U_A},
+            "diagnostic_tail": "first bind failure",
+            "reap": {"attempted": True, "ok": True, "detail": "child reaped"},
+        },),
+    )
+    outcome = rm.RuntimeMaterialisationOutcome(
+        ok=False, backend="llama_cpp", resolution_status="resolved",
+        resolution=_resolution(), materialisation_status=failed.status.value,
+        materialisation=failed, identity_key="recipe-key",
+        artifact_resolution={"status": "resolved", "size": 12, "verified_sha256": SHA},
+        refusal_reason="runtime_not_materialised: endpoint_conflict: all managed endpoints conflicted",
+    )
+    monkeypatch.setattr(cli, "_resolve_and_materialise_for_run", lambda *a, **k: outcome)
+    with pytest.raises(SystemExit, match="run refused: runtime_not_materialised"):
+        cli.cmd_run(_run_args(tmp_path), Config())
+    evidence_path = tmp_path / "r" / "materialisation_evidence.json"
+    evidence = json.loads(evidence_path.read_text())
+    assert evidence["ok"] is False
+    assert evidence["backend_selected"] == "llama_cpp"
+    assert evidence["artifact_resolution"] == outcome.artifact_resolution
+    assert evidence["materialisation"]["attempted_endpoint"] == "http://127.0.0.1:8081"
+    assert evidence["materialisation"]["launched_argv"][-1] == "8081"
+    assert evidence["materialisation"]["env_overlay"]["CUDA_VISIBLE_DEVICES"] == U_A
+    assert evidence["materialisation"]["diagnostic_tail"] == "bind: address already in use"
+    assert evidence["materialisation"]["candidate_attempts"][0]["reap"]["ok"] is True
+    assert not (tmp_path / "r" / "raw_results.jsonl").exists()
+
+
 # --- lifecycle scope + evidence: drive cmd_run through a fake runner.run ----
 def _wire_full_run(monkeypatch, outcome, *, run_impl):
     monkeypatch.setattr(cli, "_resolve_and_materialise_for_run",

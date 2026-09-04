@@ -487,6 +487,7 @@ def materialisation_evidence(
             record["materialisation"] = {
                 "status": outcome.materialisation.status.value,
                 "detail": outcome.materialisation.detail,
+                "attempted_endpoint": outcome.materialisation.endpoint,
                 "diagnostic_tail": outcome.materialisation.diagnostic_tail,
                 "launched_argv": (
                     list(outcome.materialisation.launched_argv)
@@ -494,6 +495,11 @@ def materialisation_evidence(
                     else None
                 ),
                 "attribution": outcome.materialisation.attribution,
+                "env_overlay": (
+                    dict(outcome.materialisation.env_overlay)
+                    if outcome.materialisation.env_overlay is not None else None
+                ),
+                "candidate_attempts": [dict(item) for item in outcome.materialisation.candidate_attempts],
             }
         # Anvil Stage 3B.5: an actual-placement block is present on EVERY
         # returned record, refusal included -- an additive block placed only

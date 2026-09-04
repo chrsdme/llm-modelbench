@@ -1181,6 +1181,26 @@ def test_endpoint_conflict_retries_reap_every_failed_child():
     assert out.status is MaterialisationStatus.ENDPOINT_CONFLICT
     assert len(made) == 3
     assert all(p.terminated or p.killed or p.returncode is not None for p in made)
+    assert [item["endpoint"] for item in out.candidate_attempts] == [
+        "http://127.0.0.1:18080", "http://127.0.0.1:18081", "http://127.0.0.1:18082",
+    ]
+    assert all(item["reap"]["ok"] is True for item in out.candidate_attempts)
+    assert all(item["env_overlay"]["CUDA_VISIBLE_DEVICES"] for item in out.candidate_attempts)
+
+
+def test_endpoint_conflict_records_failed_reap_distinctly(monkeypatch):
+    import llm_modelbench.llama_server_materialisation as lsm
+
+    monkeypatch.setattr(lsm, "_reap", lambda proc: {
+        "attempted": True, "ok": False, "detail": "forced reap failed",
+    })
+    out = _spawn(
+        _request(), readiness_probe=lambda url: "wrong_service", endpoint_window=1,
+    )
+    assert out.status is MaterialisationStatus.ENDPOINT_CONFLICT
+    assert out.candidate_attempts[0]["reap"] == {
+        "attempted": True, "ok": False, "detail": "forced reap failed",
+    }
 
 
 # ==========================================================================

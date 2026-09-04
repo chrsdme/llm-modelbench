@@ -184,6 +184,17 @@ def test_cuda_visible_devices_reads_the_real_env_overlay_not_a_guess():
     assert cvd == {"value": f"{U_A},{U_B}", "reason": "observed_at_launch"}
 
 
+def test_cuda_visible_devices_evidence_can_pin_only_gpu1_uuid():
+    """The managed evidence shape preserves a GPU1-only launch verbatim."""
+    out = _ok_managed_outcome(
+        gpu_uuids=(U_B,),
+        env_overlay={"CUDA_VISIBLE_DEVICES": U_B},
+    )
+    assert materialisation_evidence(out)["materialisation"]["cuda_visible_devices"] == {
+        "value": U_B, "reason": "observed_at_launch",
+    }
+
+
 def test_cuda_visible_devices_no_gpu_pinning_has_explicit_reason_not_bare_none():
     out = _ok_managed_outcome(env_overlay={})
     ev = materialisation_evidence(out)
