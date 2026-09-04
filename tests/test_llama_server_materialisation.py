@@ -12,6 +12,7 @@ import io
 import pytest
 
 from llm_modelbench.hardware import GPUDevice
+from llm_modelbench import runtime_materialisation as rm
 from llm_modelbench.identity import resolve_runtime_profile_identity
 from llm_modelbench.runtime_identity import RuntimeExecutionSettings
 from llm_modelbench.runtime_lifecycle import (
@@ -1187,6 +1188,20 @@ def test_model_load_oom_is_terminal_not_endpoint_conflict_and_preserves_attempt_
     assert attempt["env_overlay"]["CUDA_VISIBLE_DEVICES"]
     assert "cudaMalloc failed" in attempt["diagnostic_tail"]
     assert attempt["reap"]["ok"] is True
+
+    evidence = rm.materialisation_evidence(rm.RuntimeMaterialisationOutcome(
+        ok=False,
+        backend="llama_cpp",
+        resolution_status="resolved",
+        materialisation_status=out.status.value,
+        materialisation=out,
+        refusal_reason="runtime_not_materialised: model_load_failed",
+    ))
+    persisted = evidence["materialisation"]["candidate_attempts"][0]
+    assert persisted["launched_argv"] == attempt["launched_argv"]
+    assert persisted["env_overlay"] == attempt["env_overlay"]
+    assert persisted["diagnostic_tail"] == attempt["diagnostic_tail"]
+    assert persisted["reap"] == attempt["reap"]
 
 
 # ==========================================================================
