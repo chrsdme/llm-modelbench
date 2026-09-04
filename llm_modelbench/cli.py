@@ -189,17 +189,28 @@ def _resolve_and_materialise_for_run(args, cfg: Config, *, inventory=None):
     def now_iso() -> str:
         return _dt.now(_tz.utc).isoformat()
 
+    # Anvil Stage 3B.3E: for a managed llama_cpp spawn, resolve the selected
+    # benchmark model to an authoritative *local* GGUF path + a SHA-256 hashed
+    # from the actual bytes. A managed llama-server serves exactly one model,
+    # and this runs before the client, so the only model reference available
+    # is a single explicit `--models` entry (owner decision 3B.3E-OD1). Any
+    # other shape -- multi-model, all-installed default, --select, a non-llama
+    # backend -- leaves the artifact unresolved; the managed spawn then stays
+    # fail-closed at RESOLVED_RECIPE_INCOMPLETE exactly as in 3B.3D. External
+    # reuse and Ollama reuse need no local artifact and are never blocked here.
+    artifact = _resolve_managed_llama_artifact(args, cfg, selected_backend)
+    model_path = artifact.resolved_path if artifact.ok else None
+    model_sha = artifact.verified_sha256 if artifact.ok else None
+    artifact_snapshot = _artifact_resolution_snapshot(artifact, selected_backend)
+
     seams = production_seams(
         executable_path=_llama_server_executable_path(backend_executables),
-        # Stage 3B.3D blocker (documented): no benchmark-model -> local GGUF
-        # resolution exists yet. Managed spawn fails closed at
-        # RESOLVED_RECIPE_INCOMPLETE; external reuse is unaffected.
-        model_path=None,
-        model_primary_sha256=None,
+        model_path=model_path,
+        model_primary_sha256=model_sha,
         hardware_inventory=list(preflight.gpu_inventory),
         now_iso=now_iso,
     )
-    return resolve_and_materialise_runtime(
+    outcome = resolve_and_materialise_runtime(
         selected_backend=selected_backend,
         discovered_candidates=list(preflight.candidates),
         topology=preflight.topology,
@@ -209,7 +220,59 @@ def _resolve_and_materialise_for_run(args, cfg: Config, *, inventory=None):
         requested_context=getattr(cfg, "ctx_override", None),
         explicit_profile_name=explicit_profile_name,
         backend_executables=backend_executables,
+        model_primary_sha256=model_sha,
+        artifact_resolution=artifact_snapshot,
     )
+    # When a managed llama_cpp spawn was refused *and* the local artifact was
+    # unresolved, make the operator-visible refusal name the artifact cause --
+    # the generic RESOLVED_RECIPE_INCOMPLETE otherwise hides it (the full
+    # artifact-resolution status is always in materialisation_evidence.json's
+    # artifact_resolution block on the ok path; this covers the refusal path,
+    # which writes no evidence file).
+    if not outcome.ok and artifact_snapshot.get("blocked_managed_spawn"):
+        from dataclasses import replace as _dc_replace
+        outcome = _dc_replace(
+            outcome,
+            refusal_reason=(
+                f"{outcome.refusal_reason} "
+                f"[local GGUF artifact unresolved: {artifact_snapshot.get('status')} -- "
+                f"{artifact.detail}]"
+            ),
+        )
+    return outcome
+
+
+def _resolve_managed_llama_artifact(args, cfg: Config, selected_backend):
+    """Stage 3B.3E local GGUF artifact resolution for the managed llama_cpp
+    path. Returns a :class:`local_artifact_resolver.LocalArtifactResolution`
+    -- always, never raising: a not-``ok`` result (including NO_MODEL_REF for a
+    non-llama backend / multi-model / default selection) leaves the managed
+    spawn fail-closed while external / Ollama reuse proceeds untouched."""
+    from .local_artifact_resolver import resolve_local_gguf_artifact
+    from .selection import parse_models_spec
+
+    if selected_backend != "llama_cpp":
+        return resolve_local_gguf_artifact(None)
+    try:
+        requested = parse_models_spec(getattr(args, "models", None))
+    except ValueError:
+        requested = None
+    single = requested[0] if requested and len(requested) == 1 else None
+    return resolve_local_gguf_artifact(
+        single,
+        artifacts_map=getattr(cfg, "gguf_artifacts", None),
+        root_dir=getattr(cfg, "gguf_root", None),
+    )
+
+
+def _artifact_resolution_snapshot(artifact, selected_backend) -> dict:
+    """A JSON-serialisable evidence snapshot of the Stage 3B.3E artifact
+    resolution, tagged with whether it blocked a managed llama_cpp spawn."""
+    snapshot = artifact.to_dict()
+    snapshot["blocked_managed_spawn"] = bool(
+        selected_backend == "llama_cpp" and not artifact.ok
+    )
+    return snapshot
 
 
 def _llama_server_executable_path(backend_executables) -> "str | None":
@@ -281,6 +344,13 @@ def _persist_materialisation_evidence(
             "warning: client construction failed before the benchmark ran and "
             f"the owned runtime cleanup then also did not succeed ({detail}); "
             "the managed llama-server may still be running -- check and stop it "
+            "manually."
+        )
+    if "cleanup_failed_before_benchmark" in warnings:
+        print(
+            "warning: the run was refused before the benchmark started and the "
+            f"owned runtime cleanup then also did not succeed ({detail}); the "
+            "managed llama-server may still be running -- check and stop it "
             "manually."
         )
 

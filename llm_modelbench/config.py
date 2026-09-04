@@ -72,6 +72,34 @@ def _validate_ollama_url(value: Any) -> str:
     return url.rstrip("/")
 
 
+def _validated_gguf_artifacts(value: Any) -> Dict[str, str]:
+    if not isinstance(value, Mapping):
+        raise SystemExit("gguf_artifacts must map model references to absolute GGUF file paths")
+    result: Dict[str, str] = {}
+    for model_ref, raw in value.items():
+        ref = str(model_ref).strip()
+        path = str(raw).strip() if raw is not None else ""
+        if not ref:
+            raise SystemExit("gguf_artifacts keys must be non-empty model references")
+        if not path:
+            raise SystemExit(f"gguf_artifacts[{ref!r}] must be a non-empty file path")
+        if not os.path.isabs(path):
+            raise SystemExit(f"gguf_artifacts[{ref!r}] must be an absolute path, got {path!r}")
+        result[ref] = path
+    return result
+
+
+def _validated_gguf_root(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    path = str(value).strip()
+    if not path:
+        raise SystemExit("gguf_root must be a non-empty directory path or omitted")
+    if not os.path.isabs(path):
+        raise SystemExit(f"gguf_root must be an absolute path, got {path!r}")
+    return path
+
+
 def _validated_mib_mapping(value: Any) -> Dict[str, float]:
     if not isinstance(value, Mapping):
         raise SystemExit("gpu_policy_ceilings_mib must map physical GPU UUIDs to non-negative MiB values")
@@ -123,6 +151,14 @@ class Config:
     needle_min_available_ram_gb: float = 2.0   # do not start another tier below this host-RAM floor
     context_profile_mode: bool = False         # watcher/status hint; diagnostic only
     context_profile_behavior_probe: bool = True
+    # Anvil Stage 3B.3E -- local GGUF artifact sources for the managed
+    # llama-server path. gguf_artifacts is an explicit {model_ref: absolute
+    # path} map (highest precedence); gguf_root is a single directory scanned
+    # one level deep for exactly one match. Neither is a hash source -- the
+    # resolver always hashes the actual bytes. Config-file only (host paths),
+    # not exposed as environment variables.
+    gguf_artifacts: Dict[str, str] = field(default_factory=dict)
+    gguf_root: Optional[str] = None
     weights: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
 
     @classmethod
@@ -150,6 +186,10 @@ class Config:
                 cfg.weights = _validated_weights(value)
             elif key == "gpu_policy_ceilings_mib":
                 cfg.gpu_policy_ceilings_mib = _validated_mib_mapping(value)
+            elif key == "gguf_artifacts":
+                cfg.gguf_artifacts = _validated_gguf_artifacts(value)
+            elif key == "gguf_root":
+                cfg.gguf_root = _validated_gguf_root(value)
             else:
                 setattr(cfg, key, value)
         env_map = {
@@ -175,6 +215,8 @@ class Config:
         cfg.ollama_url = _validate_ollama_url(cfg.ollama_url)
         cfg.weights = _validated_weights(cfg.weights)
         cfg.gpu_policy_ceilings_mib = _validated_mib_mapping(cfg.gpu_policy_ceilings_mib)
+        cfg.gguf_artifacts = _validated_gguf_artifacts(cfg.gguf_artifacts)
+        cfg.gguf_root = _validated_gguf_root(cfg.gguf_root)
         if cfg.aggregate_policy_ceiling_mib is not None and (not isinstance(cfg.aggregate_policy_ceiling_mib, (int, float)) or isinstance(cfg.aggregate_policy_ceiling_mib, bool) or not math.isfinite(float(cfg.aggregate_policy_ceiling_mib)) or cfg.aggregate_policy_ceiling_mib < 0):
             raise SystemExit("aggregate_policy_ceiling_mib must be finite and non-negative")
         # Compatibility scalar: an auto value is the best single physical GPU,

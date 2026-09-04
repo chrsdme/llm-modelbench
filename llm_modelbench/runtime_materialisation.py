@@ -29,7 +29,7 @@ real inference). Production wiring supplies the real adapters via
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Tuple
 
 from .llama_server_materialisation import (
@@ -102,6 +102,13 @@ class RuntimeMaterialisationOutcome:
     #: first ``:``-delimited token is the machine key; downstream never parses
     #: the prose that follows.
     refusal_reason: Optional[str] = None
+    #: Anvil Stage 3B.3E -- the local GGUF artifact resolution snapshot for a
+    #: managed ``llama_cpp`` run (``LocalArtifactResolution.to_dict()`` plus a
+    #: ``blocked_managed_spawn`` bool). ``None`` for external / Ollama reuse
+    #: (no local artifact needed) and for a ``--mock`` run. Echoed verbatim
+    #: onto every outcome this step returns so the evidence / refusal reason
+    #: can report whether artifact resolution blocked the managed spawn.
+    artifact_resolution: Optional[Mapping[str, Any]] = None
 
     @property
     def ownership(self) -> Optional[str]:
@@ -220,6 +227,28 @@ def production_seams(
 # ---------------------------------------------------------------------------
 def resolve_and_materialise_runtime(
     *,
+    artifact_resolution: Optional[Mapping[str, Any]] = None,
+    **kwargs: Any,
+) -> RuntimeMaterialisationOutcome:
+    """Resolve the runtime, then reuse-or-materialise it. Pure orchestration.
+
+    Thin wrapper over :func:`_compose_resolve_and_materialise` that stamps the
+    Stage 3B.3E ``artifact_resolution`` snapshot onto whatever outcome the
+    composition returns (every early-return path included), so the caller sees
+    it uniformly. ``artifact_resolution`` is also forwarded so the composition
+    can key its own decisions off it if a later stage needs to; today it is
+    purely evidence.
+    """
+    outcome = _compose_resolve_and_materialise(
+        artifact_resolution=artifact_resolution, **kwargs
+    )
+    if artifact_resolution is None or outcome.artifact_resolution is not None:
+        return outcome
+    return replace(outcome, artifact_resolution=artifact_resolution)
+
+
+def _compose_resolve_and_materialise(
+    *,
     selected_backend: Optional[str],
     discovered_candidates: Iterable[Any],
     topology: Any,
@@ -235,6 +264,7 @@ def resolve_and_materialise_runtime(
     model_primary_sha256: Optional[str] = None,
     backend_version: Optional[str] = None,
     runtime_overhead_bytes: Optional[int] = None,
+    artifact_resolution: Optional[Mapping[str, Any]] = None,
     resolve_fn: Callable[..., RuntimeResolution] = resolve_runtime,
     materialise_fn: Callable[..., ManagedMaterialisationOutcome] = materialise,
 ) -> RuntimeMaterialisationOutcome:
@@ -415,6 +445,8 @@ def materialisation_evidence(
         ),
         "identity_key": outcome.identity_key,
     }
+    if outcome.artifact_resolution is not None:
+        record["artifact_resolution"] = dict(outcome.artifact_resolution)
     if not outcome.ok:
         record["ok"] = False
         record["refusal_reason"] = outcome.refusal_reason
@@ -479,6 +511,20 @@ def materialisation_evidence(
         and owned_cleanup_failed
     ):
         warnings.append("cleanup_failed_after_client_construction_failure")
+    # Anvil Stage 3B.3E (owner-accepted DEFECT-3B.3D-03 debt): the
+    # client-construction key above only fires for that one stage. Generalise
+    # the operator-visible warning so ANY non-success owned cleanup on a
+    # non-completed run at a pre-benchmark stage other than client construction
+    # (``pre_run_gates`` today, any future one) is surfaced too. Distinct key
+    # so the existing 3B.3D key/test is untouched; the ``failure_stage`` split
+    # keeps the two mutually exclusive -- exactly one message per condition.
+    if (
+        not benchmark_completed
+        and failure_stage is not None
+        and failure_stage != "client_construction"
+        and owned_cleanup_failed
+    ):
+        warnings.append("cleanup_failed_before_benchmark")
     if warnings:
         record["warnings"] = warnings
     return record
