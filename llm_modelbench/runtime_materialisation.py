@@ -380,6 +380,7 @@ def materialisation_evidence(
     *,
     cleanup_result: Optional[Any] = None,
     benchmark_completed: Optional[bool] = None,
+    failure_stage: Optional[str] = None,
 ) -> dict:
     """Build the auditable, JSON-serialisable materialisation evidence record.
 
@@ -394,6 +395,14 @@ def materialisation_evidence(
     ``pid`` / ``process_start_time_ticks`` / ``endpoint`` are recorded as
     launch *evidence*, explicitly not as durable semantic identity: a managed
     runtime restarted later is not the same process merely because these match.
+
+    ``benchmark_completed`` is recorded verbatim on an ``ok`` record.
+    ``failure_stage`` (e.g. ``"client_construction"`` / ``"pre_run_gates"``)
+    names the phase that raised *after* an owned runtime was materialised but
+    *before* any benchmark row -- persisted so a client-construction failure is
+    never later misread as a model-quality failure, and used to arm the
+    client-construction cleanup-failure warning (schema stays version 1: both
+    are additive fields).
     """
     record: dict = {
         "schema_version": 1,
@@ -410,6 +419,9 @@ def materialisation_evidence(
         record["ok"] = False
         record["refusal_reason"] = outcome.refusal_reason
         record["materialisation_status"] = outcome.materialisation_status
+        record["benchmark_completed"] = False
+        if failure_stage is not None:
+            record["failure_stage"] = failure_stage
         if outcome.materialisation is not None:
             record["materialisation"] = {
                 "status": outcome.materialisation.status.value,
@@ -450,14 +462,23 @@ def materialisation_evidence(
         ),
     }
     record["cleanup"] = _cleanup_evidence(cleanup_result)
-    warnings = []
-    if (
-        benchmark_completed
-        and result.ownership is RuntimeOwnership.MODELBENCH_OWNED
+    record["benchmark_completed"] = bool(benchmark_completed)
+    if failure_stage is not None:
+        record["failure_stage"] = failure_stage
+    owned_cleanup_failed = (
+        result.ownership is RuntimeOwnership.MODELBENCH_OWNED
         and cleanup_result is not None
         and not getattr(cleanup_result, "ok", True)
-    ):
+    )
+    warnings = []
+    if benchmark_completed and owned_cleanup_failed:
         warnings.append("cleanup_failed_on_successful_benchmark")
+    if (
+        not benchmark_completed
+        and failure_stage == "client_construction"
+        and owned_cleanup_failed
+    ):
+        warnings.append("cleanup_failed_after_client_construction_failure")
     if warnings:
         record["warnings"] = warnings
     return record

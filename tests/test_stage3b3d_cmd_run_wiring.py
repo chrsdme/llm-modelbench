@@ -145,11 +145,13 @@ class _StubClient:
 
 
 def _stop_after_client(monkeypatch, *, capture=None):
-    """Make cmd_run raise _STOP right after the client is built. The first step
-    inside the runtime-lifecycle scope is ``_ranking_dir_for`` (see cmd_run);
-    stopping there proves the client was already constructed against the
-    materialised endpoint without running any benchmark work. (`_run_dir` is
-    now computed *before* materialisation, so it can't be the stop point.)"""
+    """Make cmd_run raise _STOP right after the client is built. As of Stage
+    3B.3D corrective 3 the client is constructed *inside* the runtime-lifecycle
+    scope; ``_ranking_dir_for`` is the first step after client construction
+    (see cmd_run), so stopping there proves the client was already built
+    against the materialised endpoint -- inside cleanup scope -- without running
+    any benchmark work. (`_run_dir` is computed *before* materialisation, so it
+    can't be the stop point.)"""
     orig = cli._ranking_dir_for
 
     def _boom(args, **kw):
@@ -426,6 +428,97 @@ def test_owned_runtime_cleaned_when_plan_confirmation_is_declined(monkeypatch, t
     assert ev["ok"] is True
     assert ev["cleanup"]["observed"] is True
     assert ev["materialisation"]["ownership"] == "modelbench_owned"
+
+
+# --- DEFECT-3B.3D-03: client construction is inside the lifecycle scope -----
+class _ClientBoom(RuntimeError):
+    pass
+
+
+def test_owned_runtime_cleaned_when_client_construction_raises(monkeypatch, tmp_path):
+    """DEFECT-3B.3D-03 regression: the lifecycle scope must open *before*
+    ``_client_for_materialised_endpoint``. If client construction raises after
+    the materialiser has spawned an owned llama-server, the owned runtime must
+    still be cleaned exactly once, evidence must be persisted with
+    ``benchmark_completed`` false and a ``client_construction`` failure stage,
+    and the surfaced failure must remain a runtime/client failure -- never a
+    model-quality failure."""
+    outcome = _owned_outcome()
+
+    def _run(client, cfg, **kw):  # pragma: no cover - must never be reached
+        raise AssertionError("runner.run must not run when client construction fails")
+
+    _wire_full_run(monkeypatch, outcome, run_impl=_run)
+    # Patch the raiser AFTER _wire_full_run so the helper's own stub cannot
+    # silently overwrite it (the non-discriminating-test class 73086fe killed).
+    monkeypatch.setattr(
+        cli, "_client_for_materialised_endpoint",
+        lambda endpoint, cfg, *, backend: (_ for _ in ()).throw(_ClientBoom("adapter down")),
+        raising=False,
+    )
+    with pytest.raises(_ClientBoom, match="adapter down"):
+        cli.cmd_run(_run_args(tmp_path), Config())
+    assert outcome.controller.cleanup_calls == 1
+    ev = json.loads((tmp_path / "r" / "materialisation_evidence.json").read_text())
+    assert ev["ok"] is True
+    assert ev["cleanup"]["observed"] is True
+    assert ev["materialisation"]["ownership"] == "modelbench_owned"
+    assert ev["benchmark_completed"] is False
+    assert ev["failure_stage"] == "client_construction"
+    # Not a model-quality failure: no benchmark rows were written.
+    assert not (tmp_path / "r" / "raw_results.jsonl").exists()
+
+
+def test_client_construction_failure_with_failing_cleanup_keeps_the_primary_error(monkeypatch, tmp_path):
+    """If client construction raises and cleanup *also* fails, the original
+    client-construction exception must propagate (cleanup failure is structured
+    evidence, not exception-string control flow), the non-success cleanup
+    outcome must be persisted, and a distinct warning must be emitted."""
+    outcome = _owned_outcome(cleanup_exc=RuntimeError("teardown failed"))
+
+    def _run(client, cfg, **kw):  # pragma: no cover - must never be reached
+        raise AssertionError("runner.run must not run")
+
+    _wire_full_run(monkeypatch, outcome, run_impl=_run)
+    monkeypatch.setattr(
+        cli, "_client_for_materialised_endpoint",
+        lambda endpoint, cfg, *, backend: (_ for _ in ()).throw(_ClientBoom("adapter down")),
+        raising=False,
+    )
+    with pytest.raises(_ClientBoom, match="adapter down"):
+        cli.cmd_run(_run_args(tmp_path), Config())
+    assert outcome.controller.cleanup_calls == 1
+    ev = json.loads((tmp_path / "r" / "materialisation_evidence.json").read_text())
+    assert ev["benchmark_completed"] is False
+    assert ev["failure_stage"] == "client_construction"
+    assert ev["cleanup"]["outcome"] == CleanupOutcome.GRACEFUL_FAILED.value
+    assert ev["cleanup"]["ok"] is False
+    assert "cleanup_failed_after_client_construction_failure" in ev.get("warnings", [])
+
+
+def test_external_reuse_client_construction_failure_never_cleans(monkeypatch, tmp_path):
+    """A client-construction failure on an *external-reuse* runtime must invoke
+    no cleanup callback (the runtime is not ours), yet materialisation evidence
+    must still be persisted."""
+    outcome = _reuse_outcome()
+
+    def _run(client, cfg, **kw):  # pragma: no cover - must never be reached
+        raise AssertionError("runner.run must not run")
+
+    _wire_full_run(monkeypatch, outcome, run_impl=_run)
+    monkeypatch.setattr(
+        cli, "_client_for_materialised_endpoint",
+        lambda endpoint, cfg, *, backend: (_ for _ in ()).throw(_ClientBoom("adapter down")),
+        raising=False,
+    )
+    with pytest.raises(_ClientBoom, match="adapter down"):
+        cli.cmd_run(_run_args(tmp_path), Config())
+    assert outcome.controller.cleanup_calls == 0
+    ev = json.loads((tmp_path / "r" / "materialisation_evidence.json").read_text())
+    assert ev["ok"] is True
+    assert ev["materialisation"]["ownership"] == "external_reused"
+    assert ev["benchmark_completed"] is False
+    assert ev["failure_stage"] == "client_construction"
 
 
 def test_keyboardinterrupt_in_runner_cleans_owned_runtime_and_exits_130(monkeypatch, tmp_path):

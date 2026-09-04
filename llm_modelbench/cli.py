@@ -19,6 +19,7 @@ Every run writes to runs/<run-id>/ so --resume can pick up an interrupted run ex
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 import time
@@ -236,17 +237,29 @@ def _client_for_materialised_endpoint(endpoint: str, cfg: Config, *, backend: st
     )
 
 
-def _persist_materialisation_evidence(out_dir: Path, materialisation, *, benchmark_completed: bool) -> None:
+def _persist_materialisation_evidence(
+    out_dir: Path, materialisation, *, benchmark_completed: bool, failure_stage: str | None = None
+) -> None:
     """Write ``materialisation_evidence.json`` after the lifecycle scope has
     exited. Observes the (structurally-recorded, never-raised) cleanup outcome
     so a clean benchmark with a failed cleanup is not lost -- persisted as an
-    evidence field and surfaced as a printed warning."""
+    evidence field and surfaced as a printed warning.
+
+    ``failure_stage`` names the phase that raised *after* an owned runtime had
+    been materialised but *before* the benchmark ran -- ``"client_construction"``
+    (building the backend client) or ``"pre_run_gates"`` (runtime-identity /
+    resume-identity / ranking-scope / plan / confirmation). It is persisted so
+    such a failure is never later mistaken for a model-quality failure. Only
+    ``"client_construction"`` additionally arms a cleanup-failure warning today
+    (the ``"pre_run_gates"`` cleanup-failure-warning gap is recorded as accepted
+    debt -- see ANVIL_PROGRESS DEFECT-3B.3D-03)."""
     from .runtime_materialisation import materialisation_evidence
 
     controller = getattr(materialisation, "controller", None)
     cleanup_result = getattr(controller, "last_cleanup", None) if controller is not None else None
     record = materialisation_evidence(
-        materialisation, cleanup_result=cleanup_result, benchmark_completed=benchmark_completed
+        materialisation, cleanup_result=cleanup_result,
+        benchmark_completed=benchmark_completed, failure_stage=failure_stage,
     )
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -255,12 +268,20 @@ def _persist_materialisation_evidence(out_dir: Path, materialisation, *, benchma
         )
     except OSError as exc:
         print(f"warning: could not persist materialisation evidence: {exc}")
-    if "cleanup_failed_on_successful_benchmark" in record.get("warnings", []):
-        detail = (record.get("cleanup") or {}).get("detail") or "see materialisation_evidence.json"
+    warnings = record.get("warnings", [])
+    detail = (record.get("cleanup") or {}).get("detail") or "see materialisation_evidence.json"
+    if "cleanup_failed_on_successful_benchmark" in warnings:
         print(
             "warning: the benchmark completed but the owned runtime cleanup "
             f"did not succeed ({detail}); the managed llama-server may still be "
             "running -- check and stop it manually."
+        )
+    if "cleanup_failed_after_client_construction_failure" in warnings:
+        print(
+            "warning: client construction failed before the benchmark ran and "
+            f"the owned runtime cleanup then also did not succeed ({detail}); "
+            "the managed llama-server may still be running -- check and stop it "
+            "manually."
         )
 
 
@@ -730,45 +751,57 @@ def cmd_run(args, cfg):
     # materialiser.
     out_dir = _run_dir(args)
     materialisation = None
-    if getattr(args, "mock", False):
-        client = _client(args, cfg, gpu_inventory=inventory)
-    else:
+    if not getattr(args, "mock", False):
         materialisation = _resolve_and_materialise_for_run(args, cfg, inventory=inventory)
+        # A refusal / resolve / materialise failure is a plain pre-row
+        # SystemExit: no usable owned runtime was ever handed to us, so there is
+        # nothing to clean and no lifecycle scope to enter. (This matches the
+        # pre-3B.3D-corrective-3 shape -- only an *ok* outcome opens the scope.)
         if not materialisation.ok:
             raise SystemExit(f"run refused: {materialisation.refusal_reason}")
-        client = _client_for_materialised_endpoint(
-            materialisation.endpoint, cfg, backend=materialisation.backend
-        )
-        # Runtime-identity collection reads args._runtime_profile.endpoint; for
-        # a managed (owned) llama-server that endpoint is the *materialised*
-        # one, not the resolver's pre-launch endpoint, so identity evidence and
-        # the client agree on where the runtime actually is.
-        _existing = getattr(args, "_runtime_profile", None)
-        if _existing is not None and _existing.endpoint != materialisation.endpoint:
-            from dataclasses import replace as _dc_replace
-            try:
-                setattr(args, "_runtime_profile",
-                        _dc_replace(_existing, endpoint=materialisation.endpoint))
-            except TypeError:
-                pass  # not a dataclass profile -- leave as-is
-    # Anvil Stage 3B.3D: the runtime lifecycle scope opens *immediately* after
-    # client construction -- before runtime-identity collection, resume-identity
-    # validation, ranking scope, plan construction, the host-code opt-in and the
-    # interactive plan confirmation. Every one of those steps can raise
-    # SystemExit (or the operator can decline the plan prompt) *after* an owned
-    # llama-server has already been spawned by the materialiser; wrapping only
-    # runner.run would leak that process on every such early exit and would also
-    # skip the evidence `finally`. `_run_dir` is a pure path join, so it is
-    # hoisted above the materialisation call and is safe to compute eagerly.
-    import contextlib as _contextlib
+    # Anvil Stage 3B.3D corrective 3 (DEFECT-3B.3D-03): the runtime lifecycle
+    # scope opens the moment an owned runtime exists -- before client
+    # construction, the runtime-profile endpoint mutation, runtime-identity
+    # collection, resume-identity validation, ranking scope, plan construction,
+    # the host-code opt-in and the interactive plan confirmation. Client
+    # construction can raise (bad endpoint, adapter import failure) *after* the
+    # materialiser has already spawned an owned llama-server; the earlier shape
+    # built the client between materialisation and `with _lifecycle:`, so that
+    # exception leaked the process and skipped the evidence `finally`. Every
+    # post-materialisation operation is now inside cleanup scope or the
+    # cleanup-protected `finally`.
     _lifecycle = (
         materialisation.controller
         if materialisation is not None and materialisation.controller is not None
-        else _contextlib.nullcontext()
+        else contextlib.nullcontext()
     )
     _benchmark_completed = False
+    _failure_stage: str | None = None
     try:
         with _lifecycle:
+            if materialisation is None:
+                client = _client(args, cfg, gpu_inventory=inventory)
+            else:
+                # A failure between here and the first benchmark row is a
+                # runtime/client failure, never a model-quality failure -- record
+                # the stage so the persisted evidence cannot be misread.
+                _failure_stage = "client_construction"
+                client = _client_for_materialised_endpoint(
+                    materialisation.endpoint, cfg, backend=materialisation.backend
+                )
+                # Runtime-identity collection reads args._runtime_profile.endpoint;
+                # for a managed (owned) llama-server that endpoint is the
+                # *materialised* one, not the resolver's pre-launch endpoint, so
+                # identity evidence and the client agree on where the runtime is.
+                _existing = getattr(args, "_runtime_profile", None)
+                if _existing is not None and _existing.endpoint != materialisation.endpoint:
+                    from dataclasses import replace as _dc_replace
+                    try:
+                        setattr(args, "_runtime_profile",
+                                _dc_replace(_existing, endpoint=materialisation.endpoint))
+                    except TypeError:
+                        pass  # not a dataclass profile -- leave as-is
+                _failure_stage = "pre_run_gates"
             rankings_dir = _ranking_dir_for(args, run_id=out_dir.name)
             task_ids = _task_ids(args)
             selected_models = getattr(args, "_selected_models", None)
@@ -800,6 +833,9 @@ def cmd_run(args, cfg):
             )
             _require_host_code_opt_in(args, plan)
             _confirm_plan(args, plan)
+            # Past every early-exit gate: from here a failure is the runner's,
+            # not a client-construction / pre-run-gate failure.
+            _failure_stage = None
             try:
                 runner.run(client, cfg, level=args.level, out_dir=out_dir,
                        include=args.include_regex, exclude=args.exclude_regex,
@@ -850,7 +886,8 @@ def cmd_run(args, cfg):
     finally:
         if materialisation is not None:
             _persist_materialisation_evidence(
-                out_dir, materialisation, benchmark_completed=_benchmark_completed
+                out_dir, materialisation, benchmark_completed=_benchmark_completed,
+                failure_stage=_failure_stage,
             )
 
 
