@@ -197,3 +197,39 @@ def test_to_dict_is_json_serialisable(gguf_file):
         "my-model", artifacts_map={"my-model": str(gguf_file)}, root_dir=None
     )
     json.dumps(out.to_dict())
+
+
+# ---------------------------------------------------------------------------
+# brief-required: the resolver has NO download / delete / filesystem-wide
+# scan capability -- it never imports subprocess/shutil/urllib/os.remove and
+# resolves fine with those hard-patched to raise (3B.3C import-absence
+# precedent).
+# ---------------------------------------------------------------------------
+def test_resolver_has_no_destructive_or_network_capability(gguf_file, monkeypatch):
+    import os as _os
+    import shutil
+    import subprocess
+    import urllib.request
+
+    from llm_modelbench import local_artifact_resolver as mod
+
+    for name in ("subprocess", "shutil", "urllib", "requests", "socket", "httpx"):
+        assert not hasattr(mod, name), f"resolver must not import {name}"
+    for name in ("remove", "unlink", "rmdir", "walk", "system"):
+        assert not hasattr(mod, name), f"resolver must not bind os.{name}"
+
+    def _boom(*a, **k):
+        raise AssertionError("resolver invoked a destructive/network primitive")
+
+    monkeypatch.setattr(subprocess, "Popen", _boom)
+    monkeypatch.setattr(subprocess, "run", _boom)
+    monkeypatch.setattr(shutil, "rmtree", _boom)
+    monkeypatch.setattr(shutil, "copy", _boom)
+    monkeypatch.setattr(_os, "remove", _boom)
+    monkeypatch.setattr(_os, "unlink", _boom)
+    monkeypatch.setattr(urllib.request, "urlopen", _boom)
+
+    out = resolve_local_gguf_artifact(
+        "my-model", artifacts_map={"my-model": str(gguf_file)}, root_dir=None
+    )
+    assert out.ok and out.verified_sha256 == _SHA

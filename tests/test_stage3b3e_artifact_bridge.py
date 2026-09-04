@@ -524,3 +524,43 @@ def test_config_accepts_valid_gguf_config(tmp_path):
     assert cfg.gguf_artifacts == {"m": "/opt/models/m.gguf"}
     assert cfg.gguf_root == "/opt/models"
     assert "gguf_artifacts" in cfg.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# DEFECT-3B.3E-01 characterization: the production composition-seam kwargs
+# (`cli._resolve_and_materialise_for_run` supplies no weight_bytes /
+# kv_cache_bytes) resolve to FIT_UNKNOWN, so NO non-mock run -- managed
+# spawn, external llama_cpp reuse, or ollama reuse -- reaches materialise().
+# This is pre-existing at baseline e49ffe8 and out of 3B.3E scope; the test
+# pins it so a 3B.4 workload-estimate wiring change fails here loudly.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("backend", ["llama_cpp", "ollama"])
+def test_production_composition_kwargs_refuse_at_fit_unknown(backend):
+    from llm_modelbench.topology_budget import topology_from_inventory
+
+    cand = RuntimeCandidate(
+        profile=RuntimeProfile(
+            name="p", backend=backend,
+            endpoint="http://127.0.0.1:8081", provenance="configured",
+        ),
+        health="healthy", source=("saved_profile",), detail="fx",
+    )
+    outcome = rm.resolve_and_materialise_runtime(
+        selected_backend=backend,
+        discovered_candidates=[cand],
+        topology=topology_from_inventory([]),
+        host_meminfo={},
+        seams=rm.production_seams(
+            executable_path=None, model_path=None, model_primary_sha256=None,
+            hardware_inventory=[], now_iso=lambda: "2026-09-04T00:00:00+00:00",
+        ),
+        allow_ram_spill=False,
+        requested_context=None,
+        explicit_profile_name="p",
+        backend_executables=None,
+        model_primary_sha256=None,
+        # NB: no weight_bytes / kv_cache_bytes -- exactly cli's production shape
+    )
+    assert not outcome.ok
+    assert outcome.resolution_status == RuntimeResolutionStatus.FIT_UNKNOWN.value
+    assert "fit_unknown" in (outcome.refusal_reason or "")
