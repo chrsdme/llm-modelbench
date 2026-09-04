@@ -58,7 +58,7 @@ from .capabilities import MeasuredCapabilityState
 from .identity import RuntimeProfileIdentity, resolve_runtime_profile_identity
 from .ram_spill_preflight import PLACEMENT_LABELS, resolve_spill_preflight
 from .runtime_identity import RuntimeExecutionSettings
-from .runtime_profiles import RuntimeCandidate
+from .runtime_profiles import RuntimeCandidate, _is_local
 from .topology_budget import TopologyBudget, WorkloadFit, evaluate_workload_fit
 
 __all__ = [
@@ -499,6 +499,11 @@ def _managed_launch_candidate(
       serving. A *missing* candidate (no configured ``llama_cpp`` profile at
       all -- ``failure.selected_candidate is None``) is not eligible: there
       is no authoritative endpoint to name and no declared intent;
+    * the configured endpoint is **local** -- a managed ``llama-server`` is
+      always spawned on loopback (``llama_server_materialisation`` allocates
+      from ``127.0.0.1``); a remote-host profile (health ``"unsupported"``:
+      "non-local endpoint discovery is disabled") must never silently become
+      a local spawn whose evidence then records the remote address;
     * the ``llama-server`` launch executable is authoritatively installed.
 
     No healthy endpoint is fabricated: the returned candidate carries its
@@ -508,6 +513,8 @@ def _managed_launch_candidate(
         return None
     candidate = failure.selected_candidate if failure is not None else None
     if candidate is None or getattr(candidate, "health", None) == "healthy":
+        return None
+    if not _is_local(candidate.profile.endpoint):
         return None
     exec_state = _backend_executable_state(backend_executables, "llama_cpp")
     if exec_state != "installed":

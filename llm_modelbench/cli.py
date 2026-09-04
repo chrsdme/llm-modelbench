@@ -146,6 +146,11 @@ def _resolve_and_materialise_for_run(args, cfg: Config, *, inventory=None):
     except RuntimeProfileError as exc:
         raise SystemExit(f"runtime selection failed: {exc}") from exc
 
+    # Anvil Stage 3B.4: an artifact resolved during managed-launch
+    # eligibility on the blocked path, reused below to avoid a second
+    # full-file content hash.
+    _managed_artifact = None
+
     if preflight.blocked:
         blocker = preflight.blocker
         # Stage 3B.3D behaviour change (owner-visible): the pre-3B.3D no-profile
@@ -177,7 +182,7 @@ def _resolve_and_materialise_for_run(args, cfg: Config, *, inventory=None):
         ) if _target else None
         _managed_eligible = False
         if _managed_profile is not None:
-            _peek_artifact = _resolve_managed_llama_artifact(args, cfg, "llama_cpp")
+            _managed_artifact = _resolve_managed_llama_artifact(args, cfg, "llama_cpp")
             _peek_exes = None
             try:
                 _peek_exes = discover_backend_executables()
@@ -189,7 +194,7 @@ def _resolve_and_materialise_for_run(args, cfg: Config, *, inventory=None):
                 for e in (_peek_exes or ())
             )
             _managed_eligible = bool(
-                _peek_artifact.ok and _llama_installed and preflight.topology
+                _managed_artifact.ok and _llama_installed and preflight.topology
             )
         if not _managed_eligible:
             if blocker.reason != "no_healthy_candidates" or explicit or default or profiles:
@@ -233,7 +238,13 @@ def _resolve_and_materialise_for_run(args, cfg: Config, *, inventory=None):
     # is a single explicit `--models` entry (owner decision 3B.3E-OD1). Any
     # other shape -- multi-model, all-installed default, --select, a non-llama
     # backend -- leaves the artifact unresolved.
-    artifact = _resolve_managed_llama_artifact(args, cfg, selected_backend)
+    # Reuse the artifact already resolved during managed-launch eligibility
+    # (same inputs -> same result; avoids a second full-file content hash of
+    # a multi-GB GGUF on the managed-launch-from-blocked path).
+    if _managed_artifact is not None and selected_backend == "llama_cpp":
+        artifact = _managed_artifact
+    else:
+        artifact = _resolve_managed_llama_artifact(args, cfg, selected_backend)
     model_path = artifact.resolved_path if artifact.ok else None
     model_sha = artifact.verified_sha256 if artifact.ok else None
 

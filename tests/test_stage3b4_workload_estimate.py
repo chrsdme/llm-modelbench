@@ -269,6 +269,25 @@ def test_managed_llama_cpp_no_healthy_external_then_materialise_spawns():
     assert spawned["n"] == 1
 
 
+def test_managed_llama_cpp_remote_endpoint_is_never_a_local_managed_launch():
+    """A remote-host llama_cpp profile probes as health 'unsupported'
+    ('non-local endpoint discovery is disabled'). A managed llama-server is
+    always spawned on loopback -- a remote profile must NOT silently become a
+    local spawn whose evidence then records the remote address."""
+    res = _resolve(
+        selected_backend="llama_cpp",
+        discovered_candidates=[_candidate(backend="llama_cpp",
+                                          endpoint="http://192.168.1.50:8080",
+                                          health="unsupported")],
+        topology=_single_gpu_topology(installed_mb=24000),
+        weight_bytes=4 * GB,
+        owned_placement_required=True,
+        backend_executables=_LLAMA_INSTALLED,
+    )
+    assert res.status is not RuntimeResolutionStatus.RESOLVED
+    assert res.resolved is None
+
+
 def test_managed_llama_cpp_no_external_missing_executable_fails_structurally():
     """No reusable external + missing llama-server executable -> structural
     refusal, NOT a managed launch."""
