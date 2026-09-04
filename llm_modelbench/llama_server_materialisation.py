@@ -833,6 +833,25 @@ def materialise(
             endpoint=request.endpoint,
         )
 
+    # Anvil Stage 3B.4: a reuse-only recipe (the resolver made no managed
+    # placement decision -- Ollama per §23, or llama_cpp with no resolved
+    # local GGUF) carries no launch recipe. If the external endpoint is not
+    # (or no longer) reusable, this is a structured refusal -- NEVER a spawn.
+    # No recipe => no launch. This guard is the plan;
+    # ``spawn_managed_llama_server``'s unrecognised-placement refusal is only
+    # the net.
+    if not request.recipe.owned_placement:
+        return ManagedMaterialisationOutcome(
+            status=MaterialisationStatus.EXTERNAL_RUNTIME_REQUIRED,
+            detail=(
+                f"selected {backend} runtime is reuse-only (ModelBench made no "
+                "managed placement decision) and the external endpoint at "
+                f"{request.endpoint} is not reusable; ModelBench never spawns "
+                "from a reuse-only resolution and does not fall back to a "
+                "managed launch"
+            ),
+        )
+
     if backend == "ollama":
         return ManagedMaterialisationOutcome(
             status=MaterialisationStatus.EXTERNAL_RUNTIME_REQUIRED,

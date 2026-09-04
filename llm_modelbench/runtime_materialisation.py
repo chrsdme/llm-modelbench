@@ -264,6 +264,7 @@ def _compose_resolve_and_materialise(
     model_primary_sha256: Optional[str] = None,
     backend_version: Optional[str] = None,
     runtime_overhead_bytes: Optional[int] = None,
+    owned_placement_required: bool = True,
     artifact_resolution: Optional[Mapping[str, Any]] = None,
     resolve_fn: Callable[..., RuntimeResolution] = resolve_runtime,
     materialise_fn: Callable[..., ManagedMaterialisationOutcome] = materialise,
@@ -303,6 +304,7 @@ def _compose_resolve_and_materialise(
         model_primary_sha256=model_primary_sha256,
         backend_version=backend_version,
         runtime_overhead_bytes=runtime_overhead_bytes,
+        owned_placement_required=owned_placement_required,
     )
     backend_echo = selected_backend or ""
 

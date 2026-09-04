@@ -324,6 +324,16 @@ def test_cli_resolves_artifact_for_single_model_llama_cpp(monkeypatch, gguf):
     assert cap["model_primary_sha256"] == _SHA
     assert cap["artifact_resolution"]["resolved_path"] == str(gguf)
     assert cap["artifact_resolution"]["blocked_managed_spawn"] is False
+    # Anvil Stage 3B.4: llama_cpp + resolved GGUF -> managed placement is
+    # possible; the cli seam asserts it and supplies the GGUF file size as
+    # weight_bytes (the conservative benchmark-required weight estimate).
+    assert cap["owned_placement_required"] is True
+    assert cap["weight_bytes"] == len(_BYTES)
+    ar = cap["artifact_resolution"]
+    assert ar["owned_placement"] is True
+    assert ar["reuse_only"] is False
+    assert ar["weight_bytes_source"] == "verified_local_gguf_file_size"
+    assert ar["workload_estimate_status"] == "supplied"
 
 
 def test_cli_does_not_resolve_artifact_for_multi_model(monkeypatch, gguf):
@@ -334,7 +344,13 @@ def test_cli_does_not_resolve_artifact_for_multi_model(monkeypatch, gguf):
     cli._resolve_and_materialise_for_run(args, cfg, inventory=[])
     assert cap["model_primary_sha256"] is None
     assert cap["artifact_resolution"]["status"] == "no_model_ref"
-    assert cap["artifact_resolution"]["blocked_managed_spawn"] is True
+    # Anvil Stage 3B.4: a multi-model llama_cpp run resolves no single GGUF,
+    # so ModelBench makes no managed placement decision -- the run is
+    # reuse-only (no fit gate, no spawn), NOT a blocked managed spawn.
+    assert cap["artifact_resolution"]["blocked_managed_spawn"] is False
+    assert cap["artifact_resolution"]["reuse_only"] is True
+    assert cap["owned_placement_required"] is False
+    assert cap["weight_bytes"] is None
 
 
 def test_cli_does_not_resolve_artifact_for_ollama(monkeypatch, gguf):
@@ -346,6 +362,10 @@ def test_cli_does_not_resolve_artifact_for_ollama(monkeypatch, gguf):
     assert cap["model_primary_sha256"] is None
     assert cap["artifact_resolution"]["status"] == "no_model_ref"
     assert cap["artifact_resolution"]["blocked_managed_spawn"] is False
+    # Anvil Stage 3B.4: Ollama is reuse-only (amendment §23) regardless of a
+    # configured GGUF -- the resolver makes no managed placement decision.
+    assert cap["artifact_resolution"]["reuse_only"] is True
+    assert cap["owned_placement_required"] is False
 
 
 def test_cli_never_passes_a_path_or_sha_when_artifact_unresolved(monkeypatch):
@@ -366,26 +386,30 @@ def test_cli_never_passes_a_path_or_sha_when_artifact_unresolved(monkeypatch):
     assert seams_cap["model_primary_sha256"] is None
 
 
-def test_cli_refusal_names_the_artifact_cause_when_managed_spawn_blocked(monkeypatch):
+def test_cli_llama_cpp_without_configured_gguf_is_reuse_only(monkeypatch):
+    """Anvil Stage 3B.4 (was: ...refusal_names_the_artifact_cause...): with no
+    configured GGUF, a llama_cpp run makes no managed placement decision. The
+    cli seam asserts owned_placement_required=False and supplies no
+    weight_bytes -- the resolver returns a reuse-only RESOLVED resolution, not
+    a RESOLVED_RECIPE_INCOMPLETE refusal blamed on the missing artifact."""
     cfg = Config()  # nothing configured
     cap = {}
     args = _wire_cli(monkeypatch, backend="llama_cpp", models="bench-model", cfg=cfg, capture=cap)
-    monkeypatch.setattr(
-        rm, "resolve_and_materialise_runtime",
-        lambda **k: rm.RuntimeMaterialisationOutcome(
-            ok=False, backend="llama_cpp", resolution_status="resolved",
-            materialisation_status="resolved_recipe_incomplete",
-            refusal_reason="runtime_not_materialised: resolved_recipe_incomplete: no sha",
-            artifact_resolution=k.get("artifact_resolution"),
-        ),
-    )
-    out = cli._resolve_and_materialise_for_run(args, cfg, inventory=[])
-    assert "local GGUF artifact unresolved: not_configured" in out.refusal_reason
+    cli._resolve_and_materialise_for_run(args, cfg, inventory=[])
+    assert cap["owned_placement_required"] is False
+    assert cap["weight_bytes"] is None
+    assert cap["model_primary_sha256"] is None
+    ar = cap["artifact_resolution"]
+    assert ar["status"] == "not_configured"
+    assert ar["reuse_only"] is True
+    assert ar["blocked_managed_spawn"] is False
+    assert ar["workload_estimate_status"] == "not_required_reuse_only"
 
 
 def test_cli_artifact_failure_does_not_short_circuit_reuse(monkeypatch):
     """No early SystemExit: an unresolved artifact still lets the composition
-    run (and reuse a healthy external server)."""
+    run (and reuse a healthy external server) -- now via the Stage 3B.4
+    reuse-only path rather than a blocked managed spawn."""
     cfg = Config()  # nothing configured
     cap = {}
     args = _wire_cli(monkeypatch, backend="llama_cpp", models="bench-model", cfg=cfg, capture=cap)
@@ -394,7 +418,8 @@ def test_cli_artifact_failure_does_not_short_circuit_reuse(monkeypatch):
     assert "selected_backend" in cap
     assert cap["model_primary_sha256"] is None
     assert cap["artifact_resolution"]["status"] == "not_configured"
-    assert cap["artifact_resolution"]["blocked_managed_spawn"] is True
+    assert cap["artifact_resolution"]["blocked_managed_spawn"] is False
+    assert cap["artifact_resolution"]["reuse_only"] is True
 
 
 # ===========================================================================
@@ -527,15 +552,22 @@ def test_config_accepts_valid_gguf_config(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# DEFECT-3B.3E-01 characterization: the production composition-seam kwargs
-# (`cli._resolve_and_materialise_for_run` supplies no weight_bytes /
-# kv_cache_bytes) resolve to FIT_UNKNOWN, so NO non-mock run -- managed
-# spawn, external llama_cpp reuse, or ollama reuse -- reaches materialise().
-# This is pre-existing at baseline e49ffe8 and out of 3B.3E scope; the test
-# pins it so a 3B.4 workload-estimate wiring change fails here loudly.
+# DEFECT-3B.3E-01 -> resolved in Stage 3B.4.
+#
+# The blocker was: `cli._resolve_and_materialise_for_run` supplied no
+# workload estimate, so `resolve_and_materialise_runtime` (which defaults
+# `owned_placement_required=True`) resolved to FIT_UNKNOWN and NO non-mock
+# run -- managed spawn, external llama_cpp reuse, or ollama reuse -- reached
+# materialise().
+#
+# Stage 3B.4: the composition default is unchanged (owned_placement_required
+# True + no weight_bytes still -> FIT_UNKNOWN -- pinned below, it is a real
+# property). The fix is at the cli seam: it now asserts
+# owned_placement_required=False for reuse-only backends (ollama per §23,
+# llama_cpp with no resolved GGUF), so the resolver skips the managed-
+# placement fit gate and the run reaches materialise() -> REUSED_EXTERNAL.
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("backend", ["llama_cpp", "ollama"])
-def test_production_composition_kwargs_refuse_at_fit_unknown(backend):
+def _char_helper(backend, *, use_production_seams=True, **extra):
     from llm_modelbench.topology_budget import topology_from_inventory
 
     cand = RuntimeCandidate(
@@ -545,22 +577,56 @@ def test_production_composition_kwargs_refuse_at_fit_unknown(backend):
         ),
         health="healthy", source=("saved_profile",), detail="fx",
     )
-    outcome = rm.resolve_and_materialise_runtime(
+    if use_production_seams:
+        seams = rm.production_seams(
+            executable_path=None, model_path=None, model_primary_sha256=None,
+            hardware_inventory=[], now_iso=lambda: "2026-09-04T00:00:00+00:00",
+        )
+    else:
+        # No refinement probe (external_still_healthy=None) -> trust the
+        # resolved candidate health; a spawn here is a test failure.
+        def _no_spawn(_r):
+            raise AssertionError("reuse-only composition must never spawn")
+
+        seams = rm.MaterialisationSeams(
+            spawn_managed=_no_spawn, external_still_healthy=None,
+        )
+    return rm.resolve_and_materialise_runtime(
         selected_backend=backend,
         discovered_candidates=[cand],
         topology=topology_from_inventory([]),
         host_meminfo={},
-        seams=rm.production_seams(
-            executable_path=None, model_path=None, model_primary_sha256=None,
-            hardware_inventory=[], now_iso=lambda: "2026-09-04T00:00:00+00:00",
-        ),
+        seams=seams,
         allow_ram_spill=False,
         requested_context=None,
         explicit_profile_name="p",
         backend_executables=None,
         model_primary_sha256=None,
-        # NB: no weight_bytes / kv_cache_bytes -- exactly cli's production shape
+        **extra,
     )
+
+
+@pytest.mark.parametrize("backend", ["llama_cpp", "ollama"])
+def test_composition_default_still_fit_unknown_without_estimate(backend):
+    """The composition default (owned_placement_required=True) with no
+    weight_bytes still fails closed at FIT_UNKNOWN -- a real property, not a
+    bug. Reuse-only is an explicit caller assertion, never a default."""
+    outcome = _char_helper(backend)  # no weight_bytes, no owned_placement flag
     assert not outcome.ok
     assert outcome.resolution_status == RuntimeResolutionStatus.FIT_UNKNOWN.value
     assert "fit_unknown" in (outcome.refusal_reason or "")
+
+
+@pytest.mark.parametrize("backend", ["llama_cpp", "ollama"])
+def test_reuse_only_composition_reaches_reused_external(backend):
+    """Stage 3B.4: with owned_placement_required=False (what the cli seam
+    now asserts for reuse-only backends), the composition skips the fit gate
+    and the healthy external endpoint is reused -- no FIT_UNKNOWN, no spawn."""
+    outcome = _char_helper(
+        backend, use_production_seams=False, owned_placement_required=False
+    )
+    assert outcome.ok, outcome.refusal_reason
+    assert outcome.resolution_status == RuntimeResolutionStatus.RESOLVED.value
+    assert outcome.materialisation_status == "reused_external"
+    assert outcome.resolution.resolved.owned_placement is False
+    assert outcome.resolution.resolved.placement_class is None

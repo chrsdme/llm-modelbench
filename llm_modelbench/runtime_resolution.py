@@ -163,7 +163,13 @@ class ResolvedRuntime:
     execution_settings: RuntimeExecutionSettings
     runtime_profile_identity: RuntimeProfileIdentity
     selected_physical_gpu_uuids: Tuple[str, ...]
-    placement_class: str  # one of ram_spill_preflight.PLACEMENT_LABELS
+    #: One of ram_spill_preflight.PLACEMENT_LABELS for an owned-placement
+    #: recipe; ``None`` only for a reuse-only recipe (``owned_placement is
+    #: False``) -- see Anvil Stage 3B.4. A reuse-only recipe carries no
+    #: placement because ModelBench does not choose what an already-running
+    #: endpoint has loaded; fabricating a label here would put a false
+    #: placement in evidence.
+    placement_class: Optional[str]
     requested_context: Optional[int]
     allow_ram_spill: bool
     estimated_ram_spill_bytes: Optional[int]
@@ -187,6 +193,14 @@ class ResolvedRuntime:
     #: placement (``full_gpu``). The materialiser reads this verbatim and
     #: cannot recompute it (it is never handed the topology).
     tensor_split_weights: Optional[Tuple[int, ...]] = None
+    #: Anvil Stage 3B.4 -- ``True`` for an owned-placement recipe (managed
+    #: llama-server spawn is possible; ``placement_class`` is a real
+    #: PLACEMENT_LABELS value). ``False`` for a reuse-only recipe: ModelBench
+    #: makes no placement decision, ``placement_class`` is ``None``,
+    #: ``selected_physical_gpu_uuids`` is empty, ``tensor_split_weights`` is
+    #: ``None``, and ``materialise`` may only reuse an already-running
+    #: external endpoint (never spawn).
+    owned_placement: bool = True
 
     def __post_init__(self) -> None:
         # Anvil Stage 3B.3D (carryover from the 3B.3C deferred list): the
@@ -195,7 +209,26 @@ class ResolvedRuntime:
         # downstream materialiser cannot interpret (e.g. "single_gpu",
         # "minimum_multi_gpu") can never be constructed. Narrow, additive: the
         # real resolver already only emits PLACEMENT_LABELS values.
-        if self.placement_class not in PLACEMENT_LABELS:
+        #
+        # Anvil Stage 3B.4: a reuse-only recipe (``owned_placement is False``)
+        # legitimately carries no placement -- ``placement_class`` is ``None``
+        # and the GPU-selection fields are empty. An owned-placement recipe
+        # still must carry a real label.
+        if not self.owned_placement:
+            if self.placement_class is not None:
+                raise ValueError(
+                    "ResolvedRuntime.placement_class must be None for a "
+                    f"reuse-only recipe, got {self.placement_class!r}"
+                )
+            if self.selected_physical_gpu_uuids:
+                raise ValueError(
+                    "a reuse-only ResolvedRuntime selects no physical GPU"
+                )
+            if self.tensor_split_weights is not None:
+                raise ValueError(
+                    "a reuse-only ResolvedRuntime carries no tensor split"
+                )
+        elif self.placement_class not in PLACEMENT_LABELS:
             raise ValueError(
                 f"ResolvedRuntime.placement_class must be one of "
                 f"{PLACEMENT_LABELS!r}, got {self.placement_class!r}"
@@ -211,6 +244,7 @@ class ResolvedRuntime:
             "runtime_profile_backend": self.runtime_profile_identity.backend,
             "selected_physical_gpu_uuids": list(self.selected_physical_gpu_uuids),
             "placement_class": self.placement_class,
+            "owned_placement": self.owned_placement,
             "requested_context": self.requested_context,
             "allow_ram_spill": self.allow_ram_spill,
             "estimated_ram_spill_bytes": self.estimated_ram_spill_bytes,
@@ -545,6 +579,7 @@ def resolve_runtime(
     model_primary_sha256: Optional[str] = None,
     backend_version: Optional[str] = None,
     runtime_overhead_bytes: Optional[int] = None,
+    owned_placement_required: bool = True,
 ) -> RuntimeResolution:
     """Deterministically resolve the minimum runtime configuration required
     to execute a benchmark protocol fairly, given already-collected inputs.
@@ -565,6 +600,22 @@ def resolve_runtime(
     self-enables; the resolver passes it straight through to
     :func:`topology_budget.evaluate_workload_fit` and
     :func:`ram_spill_preflight.resolve_spill_preflight`.
+
+    ``owned_placement_required`` (Anvil Stage 3B.4) is the caller's explicit
+    assertion about whether ModelBench makes a managed GPU-placement
+    decision for this invocation. Default ``True`` -- the historical
+    behaviour: §5 (fit) and §6 (placement recipe) run, and a missing
+    ``weight_bytes`` is :attr:`RuntimeResolutionStatus.FIT_UNKNOWN`. When
+    ``False`` (the production caller sets this for Ollama -- amendment §23
+    reuse-only -- and for ``llama_cpp`` with no resolved local GGUF
+    artifact), §5/§6 are **skipped**: §1-4 still run and still fail closed,
+    and a ``RESOLVED`` resolution is returned carrying a reuse-only recipe
+    (``ResolvedRuntime.owned_placement is False``, ``placement_class is
+    None``). The assertion wins over a supplied estimate -- a stray
+    ``weight_bytes`` cannot re-enable a placement decision the caller says
+    ModelBench is not making. ``materialise`` may then only reuse an
+    already-running external endpoint; it never spawns from a reuse-only
+    recipe.
     """
     candidates = list(discovered_candidates)
 
@@ -613,6 +664,62 @@ def resolve_runtime(
             status=capability_failure.status,
             reason=capability_failure.reason,
             detail=capability_failure.detail,
+            selected_candidate=candidate,
+            considered_candidate_endpoints=considered_endpoints,
+        )
+
+    # --- 4b. reuse-only short-circuit (Anvil Stage 3B.4) ---------------
+    # The caller has asserted ModelBench makes no managed placement decision
+    # for this invocation (Ollama reuse-only per §23, or llama_cpp with no
+    # resolved local GGUF). §1-4 above have run and passed; §5 (fit) and §6
+    # (placement recipe) are skipped -- there is nothing to place. The
+    # assertion wins over any supplied estimate.
+    if not owned_placement_required:
+        # The identity-bearing settings assert only what ModelBench itself
+        # sets. On a reuse-only path ModelBench launches nothing, so it sets
+        # no context: an external llama-server fixes ``--ctx-size`` at its own
+        # launch and does not honour a per-request override, and even where a
+        # backend does (Ollama ``num_ctx``) ModelBench has not verified it here.
+        # The operator's requested value is retained on ``requested_context``
+        # below as evidence, but it does not enter the runtime identity hash
+        # (which would otherwise trip ``context_changed`` campaign-compat on a
+        # context ModelBench neither set nor confirmed). See Anvil Stage 3B.4.
+        reuse_settings = RuntimeExecutionSettings(
+            strategy=None,
+            context_size=None,
+            allow_cpu_spill=True if allow_ram_spill else None,
+        )
+        reuse_settings.normalized(())
+        reuse_identity = resolve_runtime_profile_identity(
+            backend=selected_backend,
+            backend_version=backend_version,
+            execution_settings=reuse_settings,
+        )
+        reuse_recipe = ResolvedRuntime(
+            backend=selected_backend,
+            endpoint=candidate.profile.endpoint,
+            runtime_profile_name=candidate.profile.name,
+            execution_settings=reuse_settings,
+            runtime_profile_identity=reuse_identity,
+            selected_physical_gpu_uuids=(),
+            placement_class=None,
+            requested_context=requested_context,
+            allow_ram_spill=allow_ram_spill,
+            estimated_ram_spill_bytes=None,
+            model_primary_sha256=(model_primary_sha256.strip() if isinstance(model_primary_sha256, str) and model_primary_sha256.strip() else None),
+            tensor_split_weights=None,
+            owned_placement=False,
+        )
+        return RuntimeResolution(
+            status=RuntimeResolutionStatus.RESOLVED,
+            reason=RuntimeResolutionStatus.RESOLVED.value,
+            detail=(
+                f"resolved reuse-only {selected_backend} runtime at "
+                f"{candidate.profile.endpoint}; ModelBench makes no managed "
+                "placement decision (no owned GPU placement, no spawn) -- "
+                "reuse of the already-running endpoint only"
+            ),
+            resolved=reuse_recipe,
             selected_candidate=candidate,
             considered_candidate_endpoints=considered_endpoints,
         )

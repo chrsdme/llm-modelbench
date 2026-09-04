@@ -296,6 +296,13 @@ class MaterialisationRequest:
             # Recipe order -- NEVER sorted: a (7,5) and a (5,7) split over the
             # same ordered UUID set are different launch recipes.
             split_component = "split:" + ",".join(str(w) for w in r.tensor_split_weights)
+        # Anvil Stage 3B.4: a reuse-only recipe carries no placement -- key it
+        # on an explicit sentinel so a None placement_class produces a stable
+        # key that can never collide with an owned-placement recipe (whose
+        # placement_class is always one of PLACEMENT_LABELS).
+        placement_component = (
+            "reuse_only" if not r.owned_placement else str(r.placement_class)
+        )
         return "|".join(
             (
                 "materialisation_request_v2",
@@ -306,7 +313,7 @@ class MaterialisationRequest:
                 # which the launch command aligns CUDA_VISIBLE_DEVICES and
                 # --tensor-split to. Not sorted.
                 "gpus:" + ",".join(r.selected_physical_gpu_uuids),
-                r.placement_class,
+                placement_component,
                 "" if r.requested_context is None else str(r.requested_context),
                 "spill" if r.allow_ram_spill else "no_spill",
                 split_component,

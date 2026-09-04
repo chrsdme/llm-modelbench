@@ -195,13 +195,32 @@ def _resolve_and_materialise_for_run(args, cfg: Config, *, inventory=None):
     # and this runs before the client, so the only model reference available
     # is a single explicit `--models` entry (owner decision 3B.3E-OD1). Any
     # other shape -- multi-model, all-installed default, --select, a non-llama
-    # backend -- leaves the artifact unresolved; the managed spawn then stays
-    # fail-closed at RESOLVED_RECIPE_INCOMPLETE exactly as in 3B.3D. External
-    # reuse and Ollama reuse need no local artifact and are never blocked here.
+    # backend -- leaves the artifact unresolved.
     artifact = _resolve_managed_llama_artifact(args, cfg, selected_backend)
     model_path = artifact.resolved_path if artifact.ok else None
     model_sha = artifact.verified_sha256 if artifact.ok else None
-    artifact_snapshot = _artifact_resolution_snapshot(artifact, selected_backend)
+
+    # Anvil Stage 3B.4: ModelBench makes a managed GPU-placement decision only
+    # for `llama_cpp` with a resolved local GGUF -- the one path where an
+    # owned ephemeral llama-server can be spawned from the resolved recipe.
+    # Ollama (amendment §23 reuse-only) and `llama_cpp` with no resolved GGUF
+    # are reuse-only: the resolver skips fit/placement (there is nothing to
+    # place), returns a reuse-only RESOLVED resolution, and materialisation
+    # may only reuse an already-running external endpoint (never spawn). The
+    # workload estimate for the managed path is the verified GGUF file size --
+    # the conservative benchmark-required weight estimate for materialising
+    # exactly those bytes (owner decision 3B.3E-OD3 / WORKLOAD ESTIMATE
+    # POLICY); it comes from the same path whose content SHA was verified.
+    owned_placement = selected_backend == "llama_cpp" and artifact.ok
+    weight_bytes = artifact.size_bytes if owned_placement else None
+    weight_bytes_source = (
+        "verified_local_gguf_file_size" if owned_placement else None
+    )
+    artifact_snapshot = _artifact_resolution_snapshot(
+        artifact, selected_backend, owned_placement=owned_placement,
+        weight_bytes=weight_bytes, weight_bytes_source=weight_bytes_source,
+        requested_context=getattr(cfg, "ctx_override", None),
+    )
 
     seams = production_seams(
         executable_path=_llama_server_executable_path(backend_executables),
@@ -216,29 +235,15 @@ def _resolve_and_materialise_for_run(args, cfg: Config, *, inventory=None):
         topology=preflight.topology,
         host_meminfo=host_memory_snapshot() or {},
         seams=seams,
+        weight_bytes=weight_bytes,
         allow_ram_spill=bool(getattr(cfg, "allow_ram_spill", False)),
         requested_context=getattr(cfg, "ctx_override", None),
         explicit_profile_name=explicit_profile_name,
         backend_executables=backend_executables,
         model_primary_sha256=model_sha,
+        owned_placement_required=owned_placement,
         artifact_resolution=artifact_snapshot,
     )
-    # When a managed llama_cpp spawn was refused *and* the local artifact was
-    # unresolved, make the operator-visible refusal name the artifact cause --
-    # the generic RESOLVED_RECIPE_INCOMPLETE otherwise hides it (the full
-    # artifact-resolution status is always in materialisation_evidence.json's
-    # artifact_resolution block on the ok path; this covers the refusal path,
-    # which writes no evidence file).
-    if not outcome.ok and artifact_snapshot.get("blocked_managed_spawn"):
-        from dataclasses import replace as _dc_replace
-        outcome = _dc_replace(
-            outcome,
-            refusal_reason=(
-                f"{outcome.refusal_reason} "
-                f"[local GGUF artifact unresolved: {artifact_snapshot.get('status')} -- "
-                f"{artifact.detail}]"
-            ),
-        )
     return outcome
 
 
@@ -265,13 +270,41 @@ def _resolve_managed_llama_artifact(args, cfg: Config, selected_backend):
     )
 
 
-def _artifact_resolution_snapshot(artifact, selected_backend) -> dict:
+def _artifact_resolution_snapshot(
+    artifact, selected_backend, *, owned_placement, weight_bytes,
+    weight_bytes_source, requested_context,
+) -> dict:
     """A JSON-serialisable evidence snapshot of the Stage 3B.3E artifact
-    resolution, tagged with whether it blocked a managed llama_cpp spawn."""
+    resolution + the Stage 3B.4 workload-estimate decision.
+
+    ``owned_placement`` -- whether ModelBench makes a managed GPU-placement
+    decision for this run (``llama_cpp`` + resolved local GGUF). When
+    ``False`` the run is reuse-only: no fit gate, no spawn, no workload
+    estimate required."""
     snapshot = artifact.to_dict()
-    snapshot["blocked_managed_spawn"] = bool(
-        selected_backend == "llama_cpp" and not artifact.ok
-    )
+    snapshot["owned_placement"] = bool(owned_placement)
+    snapshot["reuse_only"] = not bool(owned_placement)
+    if owned_placement:
+        snapshot["workload_estimate_status"] = "supplied"
+        snapshot["weight_bytes"] = weight_bytes
+        snapshot["weight_bytes_source"] = weight_bytes_source
+        snapshot["kv_cache_bytes"] = None
+        snapshot["kv_cache_bytes_source"] = "unknown_component_not_a_gate"
+        snapshot["requested_context"] = requested_context
+        snapshot["requested_context_source"] = (
+            "operator_ctx_override" if requested_context is not None
+            else "model_metadata_default_fit_off"
+        )
+    else:
+        snapshot["workload_estimate_status"] = "not_required_reuse_only"
+        snapshot["compatibility_basis"] = (
+            "candidate_health + external_still_healthy"
+        )
+    # Stage 3B.4: a reuse-only run (Ollama, or llama_cpp with no resolved
+    # GGUF) is no longer a "blocked managed spawn" -- it reaches
+    # REUSED_EXTERNAL or a structured reuse refusal, never
+    # RESOLVED_RECIPE_INCOMPLETE for a missing artifact.
+    snapshot["blocked_managed_spawn"] = False
     return snapshot
 
 
