@@ -255,6 +255,9 @@ class MaterialisationStatus(str, Enum):
     #: The child exited before readiness was established, on its own merits
     #: (not an endpoint bind race).
     PROCESS_EXITED_BEFORE_READY = "process_exited_before_ready"
+    #: The child diagnostic unambiguously reports model/KV/CUDA allocation
+    #: failure. A different listener port cannot make this load succeed.
+    MODEL_LOAD_FAILED = "model_load_failed"
     #: Readiness was not established within the bounded monotonic window.
     READINESS_TIMEOUT = "readiness_timeout"
     #: Every candidate endpoint was occupied / conflicted (incl. a lost bind
@@ -472,10 +475,9 @@ def build_llama_server_command(
 
     Translation rules (faithful, no search):
 
-    * context: ``--ctx-size <requested_context>`` iff the recipe set one.
-      With ``--fit off`` (see below) an omitted ``--ctx-size`` means
-      llama-server takes the context from the model's own metadata -- a
-      deterministic value -- rather than adjusting it to fit live VRAM.
+    * context: every owned placement has a concrete resolved context and
+      emits it as ``--ctx-size <requested_context>``. The materialiser never
+      delegates an unbounded model-metadata/default context to llama-server.
     * GPU visibility: ``CUDA_VISIBLE_DEVICES=GPU-<uuid>,...`` over exactly
       the selected UUIDs, order preserved. Nothing else restricts device use
       (no ``--device``, which would pass transient ordinals).
@@ -546,20 +548,32 @@ def build_llama_server_command(
                 "drop GPUs the recipe selected (OWNER DECISION REQUIRED "
                 "3B.3C-OD1)",
             )
+        if recipe.requested_context is None:
+            return (
+                None,
+                MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE,
+                "a 'full_gpu' managed launch requires a concrete resolved "
+                "benchmark context (--ctx-size); ModelBench must not delegate "
+                "the model metadata/default context to llama-server",
+            )
         n_gpu_layers: Optional[str] = "all"
         fit: Optional[str] = "off"
         split_mode: Optional[str] = "none"
         tensor_split: Optional[str] = None
         main_gpu: Optional[int] = None
-        ctx_size: Optional[int] = (
-            int(recipe.requested_context)
-            if recipe.requested_context is not None
-            else None
-        )
+        ctx_size: Optional[int] = int(recipe.requested_context)
     elif placement == "multi_gpu":
         # OWNER DECISION 3B.3C-OD1: the resolver carries the deterministic
         # inter-GPU split. Emit it verbatim; ModelBench never derives, defers,
         # or rebalances it. --fit off / -ngl all keep placement pinned.
+        if recipe.requested_context is None:
+            return (
+                None,
+                MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE,
+                "a 'multi_gpu' managed launch requires a concrete resolved "
+                "benchmark context (--ctx-size); ModelBench must not delegate "
+                "the model metadata/default context to llama-server",
+            )
         split, reason = _resolved_layer_split_or_none(recipe, "multi_gpu")
         if reason is not None:
             return None, MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE, reason
@@ -568,11 +582,7 @@ def build_llama_server_command(
         split_mode = "layer"
         tensor_split = split
         main_gpu = 0
-        ctx_size = (
-            int(recipe.requested_context)
-            if recipe.requested_context is not None
-            else None
-        )
+        ctx_size = int(recipe.requested_context)
     elif placement == "ram_spill":
         # OWNER DECISION 3B.3C-OD2: 3B.2 has resolved placement_class=ram_spill
         # and RAM preflight passed. llama.cpp is permitted to choose ONLY the
@@ -1101,6 +1111,20 @@ def spawn_managed_llama_server(
     )
 
 
+def _is_model_load_failure(diagnostic_tail: str) -> bool:
+    """Return true only for child diagnostics a port change cannot repair."""
+    normalized = diagnostic_tail.lower()
+    markers = (
+        "cuda out of memory",
+        "cudamalloc failed",
+        "failed to allocate cuda",
+        "alloc_tensor_range: failed to allocate",
+        "failed to initialize the context",
+        "model loading error",
+    )
+    return any(marker in normalized for marker in markers)
+
+
 def _verify_and_own(
     *,
     request: MaterialisationRequest,
@@ -1124,6 +1148,21 @@ def _verify_and_own(
         (terminal). If the port is *no longer* bindable the child lost the
         race to a foreign binder; if it is bindable again the child died on
         its own merits."""
+        # The child has exited, so finish draining its bounded pipe before
+        # deciding whether this was a listener race or a model-load failure.
+        sink.close()
+        diagnostic_tail = sink.tail()
+        if _is_model_load_failure(diagnostic_tail):
+            return ManagedMaterialisationOutcome(
+                status=MaterialisationStatus.MODEL_LOAD_FAILED,
+                detail=(
+                    f"llama-server exited (rc={proc.returncode}) during model load: "
+                    "CUDA/KV/context allocation failure"
+                ),
+                diagnostic_tail=diagnostic_tail,
+                launched_argv=cmd.argv,
+                env_overlay=cmd.env_overlay,
+            )
         if not port_bindable(endpoint.host, endpoint.port):
             return ManagedMaterialisationOutcome(
                 status=MaterialisationStatus.ENDPOINT_CONFLICT,

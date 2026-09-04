@@ -55,8 +55,8 @@ def _free_port() -> int:
     return port
 
 
-def _recipe(*, requested_context=0, gpu_uuids=(U_A,), model_primary_sha256=SHA):
-    settings = RuntimeExecutionSettings(strategy="single_device", context_size=requested_context or None)
+def _recipe(*, requested_context=8192, gpu_uuids=(U_A,), model_primary_sha256=SHA):
+    settings = RuntimeExecutionSettings(strategy="single_device", context_size=requested_context)
     return ResolvedRuntime(
         backend="llama_cpp",
         endpoint="http://127.0.0.1:1",
@@ -67,7 +67,7 @@ def _recipe(*, requested_context=0, gpu_uuids=(U_A,), model_primary_sha256=SHA):
         ),
         selected_physical_gpu_uuids=tuple(gpu_uuids),
         placement_class="full_gpu",
-        requested_context=requested_context or None,
+        requested_context=requested_context,
         allow_ram_spill=False,
         estimated_ram_spill_bytes=None,
         model_primary_sha256=model_primary_sha256,

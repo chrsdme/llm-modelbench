@@ -640,7 +640,10 @@ def resolve_runtime(
     ``runtime_profiles._recommended`` / ``RuntimeCandidate.recommended``.
 
     ``weight_bytes`` / ``kv_cache_bytes`` are the workload estimate
-    **inputs** (§5 -- the resolver invents no formula). Absent, the fit is
+    **inputs** (§5 -- the resolver invents no formula). An owned managed
+    placement additionally requires a concrete ``requested_context`` and its
+    matching KV estimate; otherwise fit cannot safely predict the exact
+    ``--ctx-size`` launch. Missing required evidence is
     :attr:`RuntimeResolutionStatus.FIT_UNKNOWN`.
 
     ``allow_ram_spill`` is the explicit operator permission (§6). It never
@@ -798,10 +801,26 @@ def resolve_runtime(
         )
 
     # --- 5. fit / preflight (reuse the frozen machinery) ---------------
+    if requested_context is None:
+        return _unresolved(
+            RuntimeResolutionStatus.FIT_UNKNOWN,
+            "owned managed GPU placement requires a concrete requested context; "
+            "the resolver will not fit an unbounded llama-server default context",
+            selected_candidate=candidate,
+            considered_endpoints=considered_endpoints,
+        )
     if weight_bytes is None:
         return _unresolved(
             RuntimeResolutionStatus.FIT_UNKNOWN,
             "model weight estimate was not supplied; cannot resolve GPU placement",
+            selected_candidate=candidate,
+            considered_endpoints=considered_endpoints,
+        )
+    if kv_cache_bytes is None:
+        return _unresolved(
+            RuntimeResolutionStatus.FIT_UNKNOWN,
+            "owned managed GPU placement requires a KV/cache estimate for the "
+            f"resolved context {requested_context}; fit must not ignore cache allocation",
             selected_candidate=candidate,
             considered_endpoints=considered_endpoints,
         )

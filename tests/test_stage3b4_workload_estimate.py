@@ -81,7 +81,7 @@ def _resolve(**over):
         host_meminfo={"ram_total_mb": 128000, "ram_available_mb": 64000,
                       "swap_free_mb": 0, "swap_used_mb": 0},
         weight_bytes=None,
-        kv_cache_bytes=None,
+        kv_cache_bytes=1 * GB,
         requested_context=8192,
         allow_ram_spill=False,
     )
@@ -161,16 +161,42 @@ def test_reuse_only_still_runs_required_capability_gate():
     assert res.status is RuntimeResolutionStatus.CAPABILITY_EVIDENCE_INSUFFICIENT
 
 
-def test_managed_capable_with_weight_reaches_a_real_fit_outcome():
-    """weight_bytes alone (kv_cache_bytes None) -> candidate_single_gpu_fit ->
-    full_gpu -> RESOLVED. Not FIT_UNKNOWN."""
+def test_managed_capable_requires_kv_estimate_for_the_resolved_context():
+    """A weight-only fit cannot approve a launch whose emitted context allocates KV."""
     res = _resolve(selected_backend="llama_cpp",
                    discovered_candidates=[_candidate(backend="llama_cpp",
                                                      endpoint="http://127.0.0.1:8081")],
-                   weight_bytes=4 * GB, owned_placement_required=True)
+                   weight_bytes=4 * GB, kv_cache_bytes=None,
+                   owned_placement_required=True)
+    assert res.status is RuntimeResolutionStatus.FIT_UNKNOWN
+    assert "KV/cache" in res.detail
+
+
+def test_managed_fit_includes_kv_for_the_same_context_emitted_in_recipe():
+    res = _resolve(
+        selected_backend="llama_cpp",
+        discovered_candidates=[_candidate(backend="llama_cpp", endpoint="http://127.0.0.1:8081")],
+        weight_bytes=4 * GB,
+        kv_cache_bytes=2 * GB,
+        requested_context=4096,
+        owned_placement_required=True,
+    )
     assert res.status is RuntimeResolutionStatus.RESOLVED
-    assert res.resolved.owned_placement is True
-    assert res.resolved.placement_class == "full_gpu"
+    assert res.resolved.requested_context == 4096
+    assert "requested_context_kv" not in res.workload_fit.unknown_components
+
+
+def test_managed_fit_without_context_fails_before_any_unbounded_default_fit():
+    res = _resolve(
+        selected_backend="llama_cpp",
+        discovered_candidates=[_candidate(backend="llama_cpp", endpoint="http://127.0.0.1:8081")],
+        weight_bytes=4 * GB,
+        kv_cache_bytes=2 * GB,
+        requested_context=None,
+        owned_placement_required=True,
+    )
+    assert res.status is RuntimeResolutionStatus.FIT_UNKNOWN
+    assert "context" in res.detail.lower()
 
 
 def test_managed_capable_without_weight_is_still_fit_unknown():

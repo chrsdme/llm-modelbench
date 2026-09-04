@@ -7,6 +7,8 @@ model. The fake-process integration tests spawn a real
 """
 from __future__ import annotations
 
+import io
+
 import pytest
 
 from llm_modelbench.hardware import GPUDevice
@@ -169,14 +171,16 @@ def test_context_comes_from_the_resolved_recipe():
     assert cmd.argv[cmd.argv.index("--ctx-size") + 1] == "4096"
 
 
-def test_no_context_flag_when_recipe_sets_none():
-    cmd, _, _ = build_llama_server_command(
+def test_full_gpu_without_concrete_context_fails_closed_before_spawn():
+    cmd, status, detail = build_llama_server_command(
         _request(requested_context=None),
         executable_path="x",
         model_path="m.gguf",
         hardware_inventory=INVENTORY,
     )
-    assert "--ctx-size" not in cmd.argv
+    assert cmd is None
+    assert status is MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE
+    assert "context" in detail.lower()
 
 
 def test_single_gpu_selection_becomes_cuda_visible_devices_uuid_form():
@@ -272,6 +276,19 @@ def test_multi_gpu_emits_the_exact_resolved_tensor_split():
     assert cmd.env_overlay["CUDA_VISIBLE_DEVICES"] == (
         f"GPU-{U_A[4:].lower()},GPU-{U_B[4:].lower()}"
     )
+
+
+def test_multi_gpu_emits_the_exact_resolved_context():
+    cmd, status, _ = _multi_gpu_cmd(weights=(7, 5), requested_context=4096)
+    assert status is None
+    assert cmd.argv[cmd.argv.index("--ctx-size") + 1] == "4096"
+
+
+def test_multi_gpu_without_concrete_context_fails_closed_before_spawn():
+    cmd, status, detail = _multi_gpu_cmd(weights=(7, 5), requested_context=None)
+    assert cmd is None
+    assert status is MaterialisationStatus.RESOLVED_RECIPE_INCOMPLETE
+    assert "context" in detail.lower()
 
 
 def test_multi_gpu_three_way_split_is_emitted_verbatim():
@@ -621,6 +638,19 @@ class _FakePopen:
         if self.returncode is None:
             self.returncode = 0
         return self.returncode
+
+
+class _ModelLoadFailurePopen(_FakePopen):
+    """Exited fake whose merged child diagnostic is drained by DiagnosticSink."""
+
+    def __init__(self, argv, **kwargs):
+        super().__init__(argv, _exit_after_polls=1, **kwargs)
+        self.stdout = io.BytesIO(
+            b"cudaMalloc failed: out of memory\n"
+            b"alloc_tensor_range: failed to allocate CUDA0 buffer\n"
+            b"llama_init_from_model: failed to initialize the context\n"
+            b"llama_server: exiting due to model loading error\n"
+        )
 
 
 def test_correct_artifact_accepted():
@@ -1127,6 +1157,36 @@ def test_lost_bind_race_retries_next_candidate():
     out = _spawn(_request(), popen=_pf, port_bindable=_bindable)
     assert out.status is MaterialisationStatus.SPAWNED_READY
     assert out.endpoint == "http://127.0.0.1:18081"
+
+
+def test_model_load_oom_is_terminal_not_endpoint_conflict_and_preserves_attempt_evidence():
+    spawned = []
+
+    def _popen(argv, **kwargs):
+        proc = _ModelLoadFailurePopen(argv, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    bind_calls = {"n": 0}
+
+    def _bindable(host, port):
+        bind_calls["n"] += 1
+        return bind_calls["n"] == 1
+
+    out = _spawn(
+        _request(), popen=_popen, endpoint_window=64,
+        # This would normally make an immediate child exit look like a lost
+        # bind race. The CUDA/KV diagnostic must win before port taxonomy.
+        port_bindable=_bindable,
+    )
+    assert out.status is MaterialisationStatus.MODEL_LOAD_FAILED
+    assert len(spawned) == len(out.candidate_attempts) == 1
+    attempt = out.candidate_attempts[0]
+    assert attempt["endpoint"] == "http://127.0.0.1:18080"
+    assert "--ctx-size" in attempt["launched_argv"]
+    assert attempt["env_overlay"]["CUDA_VISIBLE_DEVICES"]
+    assert "cudaMalloc failed" in attempt["diagnostic_tail"]
+    assert attempt["reap"]["ok"] is True
 
 
 # ==========================================================================
