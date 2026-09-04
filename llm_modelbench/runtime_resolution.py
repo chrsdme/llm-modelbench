@@ -475,6 +475,46 @@ def _select_candidate(
     )
 
 
+def _managed_launch_candidate(
+    *,
+    failure: Optional[RuntimeResolution],
+    selected_backend: str,
+    owned_placement_required: bool,
+    backend_executables: Optional[Iterable[Any]],
+) -> Optional[RuntimeCandidate]:
+    """Anvil Stage 3B.4 managed-spawn reachability. Return the (non-healthy)
+    candidate to build an owned ``llama-server`` launch recipe from when no
+    healthy external runtime could be selected, or ``None`` when the failure
+    must stand as a structured refusal.
+
+    Eligible only when ALL hold:
+
+    * the caller asked for a managed placement decision
+      (``owned_placement_required``);
+    * the backend authority is ``llama_cpp`` (the only backend with a
+      managed launcher -- Ollama is reuse-only, amendment §23);
+    * ``_select_candidate`` found a candidate for the backend but it is not
+      healthy (``failure.selected_candidate`` is a non-healthy candidate) --
+      i.e. the operator configured a ``llama_cpp`` endpoint that is not
+      serving. A *missing* candidate (no configured ``llama_cpp`` profile at
+      all -- ``failure.selected_candidate is None``) is not eligible: there
+      is no authoritative endpoint to name and no declared intent;
+    * the ``llama-server`` launch executable is authoritatively installed.
+
+    No healthy endpoint is fabricated: the returned candidate carries its
+    real discovered (non-healthy) health, so ``materialise`` never reuses it.
+    """
+    if not owned_placement_required or selected_backend != "llama_cpp":
+        return None
+    candidate = failure.selected_candidate if failure is not None else None
+    if candidate is None or getattr(candidate, "health", None) == "healthy":
+        return None
+    exec_state = _backend_executable_state(backend_executables, "llama_cpp")
+    if exec_state != "installed":
+        return None
+    return candidate
+
+
 def _capability_block(required_capabilities: Sequence[RequiredCapability]) -> Optional[RuntimeResolution]:
     _supporting = MeasuredCapabilityState.MEASURED_SUPPORTED
     _incompatible = {
@@ -641,10 +681,36 @@ def resolve_runtime(
         backend_executables=backend_executables,
     )
     if failure is not None or candidate is None:
-        return failure if failure is not None else _unresolved(
-            RuntimeResolutionStatus.NO_USABLE_ENDPOINT,
-            f"no runtime candidate could be resolved for backend {selected_backend!r}",
+        # Anvil Stage 3B.4 managed-spawn reachability correction: a managed
+        # ``llama-server`` must be reachable WITHOUT an already-running
+        # external one. The operator declares ``llama_cpp`` intent by having
+        # a configured ``llama_cpp`` runtime profile; when its endpoint is
+        # not serving, discovery yields an UNHEALTHY ``llama_cpp`` candidate
+        # (``_select_candidate`` returns it on ``failure.selected_candidate``),
+        # NOT a missing one. When the caller asks for a managed placement
+        # decision (``owned_placement_required``), the backend is
+        # ``llama_cpp``, no healthy candidate could be selected, and the
+        # ``llama-server`` launch executable is authoritatively installed,
+        # this is a managed-launch-eligible resolution: §5/§6 place the
+        # workload and build an owned recipe. The unhealthy candidate is
+        # kept on the result for evidence -- ``materialise`` derives
+        # reuse-eligibility structurally from
+        # ``selected_candidate.health == "healthy"``, so a non-healthy
+        # candidate is never reused and the ``external_still_healthy``
+        # demotion probe is never consulted; the managed spawn does not
+        # depend on it. No healthy endpoint is fabricated.
+        managed_candidate = _managed_launch_candidate(
+            failure=failure,
+            selected_backend=selected_backend,
+            owned_placement_required=owned_placement_required,
+            backend_executables=backend_executables,
         )
+        if managed_candidate is None:
+            return failure if failure is not None else _unresolved(
+                RuntimeResolutionStatus.NO_USABLE_ENDPOINT,
+                f"no runtime candidate could be resolved for backend {selected_backend!r}",
+            )
+        candidate = managed_candidate
 
     # --- 3. identity / provenance sufficiency --------------------------
     if require_content_addressed_model_identity and not (
@@ -859,11 +925,25 @@ def resolve_runtime(
         ),
         tensor_split_weights=tensor_split_weights,
     )
+    _cand_healthy = getattr(candidate, "health", None) == "healthy"
+    detail = (
+        f"resolved {selected_backend} runtime at {candidate.profile.endpoint} "
+        f"({placement_class}, {len(selected_uuids)} GPU(s))"
+    )
+    if not _cand_healthy:
+        # Anvil Stage 3B.4 managed-spawn reachability: no healthy external
+        # runtime to reuse -- this recipe is for a managed (owned) launch
+        # from cold. Record what was considered and rejected.
+        detail += (
+            f"; no reusable external runtime (configured endpoint "
+            f"{candidate.profile.endpoint} is "
+            f"{getattr(candidate, 'health', 'unknown')}: "
+            f"{getattr(candidate, 'detail', '')}); managed llama-server launch"
+        )
     return RuntimeResolution(
         status=RuntimeResolutionStatus.RESOLVED,
         reason=RuntimeResolutionStatus.RESOLVED.value,
-        detail=f"resolved {selected_backend} runtime at {candidate.profile.endpoint} "
-        f"({placement_class}, {len(selected_uuids)} GPU(s))",
+        detail=detail,
         resolved=resolved,
         selected_candidate=candidate,
         workload_fit=fit,

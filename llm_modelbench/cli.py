@@ -159,15 +159,52 @@ def _resolve_and_materialise_for_run(args, cfg: Config, *, inventory=None):
         # with zero benchmark rows. `--mock` is unaffected (it never reaches
         # here). An explicit/saved/default profile keeps the earlier
         # RuntimeMaterialisationOutcome refusal shape below.
-        if blocker.reason != "no_healthy_candidates" or explicit or default or profiles:
-            from .runtime_materialisation import RuntimeMaterialisationOutcome
-            return RuntimeMaterialisationOutcome(
-                ok=False, backend="", resolution_status="no_usable_endpoint",
-                refusal_reason=f"runtime_not_resolved: no_usable_endpoint: {blocker.detail}",
+        # Anvil Stage 3B.4 managed-spawn reachability: an explicit/default
+        # `llama_cpp` runtime profile whose endpoint is not serving must not
+        # be a dead end. The operator declared `llama_cpp` intent; discovery
+        # yields an UNHEALTHY `llama_cpp` candidate for that profile. When a
+        # single explicit `--models` entry resolves to a local GGUF and the
+        # `llama-server` executable is installed, the run is managed-launch
+        # eligible: fall through to resolve_runtime with `selected_backend =
+        # "llama_cpp"` and the unhealthy candidate list -- the resolver's
+        # §2 managed-launch branch places the workload and builds an owned
+        # recipe, and materialise() spawns (never reuses the dead endpoint,
+        # never falls back). Any other shape keeps the structured refusal.
+        _target = explicit or default
+        _managed_profile = next(
+            (p for p in profiles if p.name == _target and p.backend == "llama_cpp"),
+            None,
+        ) if _target else None
+        _managed_eligible = False
+        if _managed_profile is not None:
+            _peek_artifact = _resolve_managed_llama_artifact(args, cfg, "llama_cpp")
+            _peek_exes = None
+            try:
+                _peek_exes = discover_backend_executables()
+            except Exception:  # noqa: BLE001 -- best-effort input
+                _peek_exes = None
+            _llama_installed = any(
+                getattr(e, "backend", None) == "llama_cpp"
+                and getattr(e, "state", None) == "installed"
+                for e in (_peek_exes or ())
             )
-        selected_backend = "ollama"
-        selected_endpoint_profile = implicit_ollama_profile(cfg)
-        explicit_profile_name = None
+            _managed_eligible = bool(
+                _peek_artifact.ok and _llama_installed and preflight.topology
+            )
+        if not _managed_eligible:
+            if blocker.reason != "no_healthy_candidates" or explicit or default or profiles:
+                from .runtime_materialisation import RuntimeMaterialisationOutcome
+                return RuntimeMaterialisationOutcome(
+                    ok=False, backend="", resolution_status="no_usable_endpoint",
+                    refusal_reason=f"runtime_not_resolved: no_usable_endpoint: {blocker.detail}",
+                )
+            selected_backend = "ollama"
+            selected_endpoint_profile = implicit_ollama_profile(cfg)
+            explicit_profile_name = None
+        else:
+            selected_backend = "llama_cpp"
+            selected_endpoint_profile = _managed_profile
+            explicit_profile_name = _managed_profile.name
     else:
         selected = preflight.selected_candidate
         selected_backend = selected.profile.backend
