@@ -30,7 +30,7 @@ real inference). Production wiring supplies the real adapters via
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 from .llama_server_materialisation import (
     ManagedMaterialisationOutcome,
@@ -413,6 +413,9 @@ def materialisation_evidence(
     cleanup_result: Optional[Any] = None,
     benchmark_completed: Optional[bool] = None,
     failure_stage: Optional[str] = None,
+    rss_bytes_launch_ready: Optional[int] = None,
+    rss_bytes_post_execution: Optional[int] = None,
+    runtime_telemetry_ref: Optional[Mapping[str, Any]] = None,
 ) -> dict:
     """Build the auditable, JSON-serialisable materialisation evidence record.
 
@@ -427,6 +430,30 @@ def materialisation_evidence(
     ``pid`` / ``process_start_time_ticks`` / ``endpoint`` are recorded as
     launch *evidence*, explicitly not as durable semantic identity: a managed
     runtime restarted later is not the same process merely because these match.
+
+    ``rss_bytes_launch_ready`` / ``rss_bytes_post_execution`` are the caller's
+    own bounded ``/proc/<pid>/status`` reads (see
+    ``runtime_process_linux.read_process_rss_bytes``), sampled by the caller
+    at the two safe inline points -- once the owned runtime is ready and
+    again immediately after ``runner.run()`` returns or raises, i.e. *before*
+    the lifecycle ``with`` block exits and the owned process is torn down.
+    This function never reads ``/proc`` itself: by the time evidence is
+    built the owned process may already be gone (``__exit__`` runs cleanup
+    before the caller's ``finally`` calls this), so a post-hoc read here
+    would silently and permanently be ``None``.
+
+    ``runtime_telemetry_ref`` is an optional cross-reference to the existing
+    ``runtime_telemetry.json`` artifact (Stage 6B, unrelated to this stage's
+    schema) -- pass ``{"artifact": "runtime_telemetry.json", "status": ...}``
+    from the caller's own capture-result if one exists for this run. That
+    artifact already carries real per-process GPU-memory attribution
+    (``telemetry.attribute_runtime_gpus``) but is captured **once, before
+    benchmark work** from inside ``runner.run()`` -- it never exists on a
+    pre-benchmark refusal and never reflects post-execution state. This
+    function does not re-collect it (a second collection would add
+    subprocess/procfs work inside the cleanup-sensitive lifecycle window);
+    it only records whether that artifact exists for this run and the
+    explicit ``pre_benchmark_only`` capture-window caveat.
 
     ``benchmark_completed`` is recorded verbatim on an ``ok`` record.
     ``failure_stage`` (e.g. ``"client_construction"`` / ``"pre_run_gates"``)
@@ -468,12 +495,25 @@ def materialisation_evidence(
                 ),
                 "attribution": outcome.materialisation.attribution,
             }
+        # Anvil Stage 3B.5: an actual-placement block is present on EVERY
+        # returned record, refusal included -- an additive block placed only
+        # on the ok branch would be silently omitted on every refusal path,
+        # which is indistinguishable from "we forgot to look". A refusal
+        # never owned a runtime, so every fact here is legitimately
+        # not-applicable, not merely not-observed.
+        record["actual_placement"] = _actual_placement_evidence(
+            owns_runtime=False,
+            rss_bytes_launch_ready=None,
+            rss_bytes_post_execution=None,
+            runtime_telemetry_ref=runtime_telemetry_ref,
+        )
         return record
 
     mat = outcome.materialisation
     assert mat is not None and mat.result is not None  # ok implies both
     result = mat.result
     owned = result.owned_runtime
+    owns_runtime = result.ownership is RuntimeOwnership.MODELBENCH_OWNED
     record["ok"] = True
     record["materialisation"] = {
         "status": mat.status.value,
@@ -485,7 +525,9 @@ def materialisation_evidence(
         "launched_argv": (
             list(mat.launched_argv) if mat.launched_argv is not None else None
         ),
-        "cuda_visible_devices": _cuda_visible_devices_from_argv(mat.launched_argv),
+        "cuda_visible_devices": _cuda_visible_devices_evidence(
+            mat.env_overlay, owns_runtime=owns_runtime
+        ),
         "launch_proof": (
             {
                 "pid": owned.launch_proof.pid,
@@ -495,6 +537,12 @@ def materialisation_evidence(
             else None
         ),
     }
+    record["actual_placement"] = _actual_placement_evidence(
+        owns_runtime=owns_runtime,
+        rss_bytes_launch_ready=rss_bytes_launch_ready,
+        rss_bytes_post_execution=rss_bytes_post_execution,
+        runtime_telemetry_ref=runtime_telemetry_ref,
+    )
     record["cleanup"] = _cleanup_evidence(cleanup_result)
     record["benchmark_completed"] = bool(benchmark_completed)
     if failure_stage is not None:
@@ -527,9 +575,94 @@ def materialisation_evidence(
         and owned_cleanup_failed
     ):
         warnings.append("cleanup_failed_before_benchmark")
+    # Anvil Stage 3B.5: a `ram_spill` placement is not full-GPU equivalent --
+    # part of the model resides in host RAM, with the throughput/latency
+    # consequences that implies. Persisting `placement_class: "ram_spill"`
+    # alone (already present in `resolution.resolved`) is not the same as an
+    # explicit, easy-to-grep operator marker; surface it as a warning too.
+    resolved = outcome.resolution.resolved if outcome.resolution is not None else None
+    if resolved is not None and resolved.placement_class == "ram_spill":
+        warnings.append("placement_ram_spill_not_full_gpu_equivalent")
     if warnings:
         record["warnings"] = warnings
     return record
+
+
+def _actual_placement_evidence(
+    *,
+    owns_runtime: bool,
+    rss_bytes_launch_ready: Optional[int],
+    rss_bytes_post_execution: Optional[int],
+    runtime_telemetry_ref: Optional[Mapping[str, Any]],
+) -> dict:
+    """Anvil Stage 3B.5: what was actually *observed* about where the
+    runtime executed, as opposed to what was *planned* (the resolved recipe,
+    already recorded verbatim elsewhere in this record).
+
+    Every fact here is either a real inline observation or an explicit
+    ``not_observed`` / ``not_applicable`` marker with a reason -- never a
+    silent omission (mutation battery MUT-13 exercises this). Nothing here
+    is a scoring input; it is evidence only.
+
+    * ``process_rss_bytes``: the caller's own bounded ``/proc`` reads,
+      passed in verbatim (see ``materialisation_evidence``'s docstring for
+      why this function cannot read them itself).
+    * ``gpu_memory_observed``: always ``False`` here -- this function does
+      not sample GPU memory (no new subprocess/procfs work inside the
+      lifecycle window; see DEFECT-3B.5-01). The real per-process GPU
+      attribution lives in the separate, pre-existing ``runtime_telemetry``
+      artifact, cross-referenced below, never re-collected.
+    * ``device_placement_observed``: always ``False`` -- llama-server
+      exposes no endpoint that reports actual device placement (verified by
+      reading ``llama_server_probe.py``; ``/props`` reports model/context,
+      not devices). Ollama likewise has no such reuse-time reporting used
+      here. Not a gap this stage can close without a new probe surface.
+    """
+    if not owns_runtime:
+        return {
+            "process_rss_bytes": {
+                "launch_ready": None,
+                "post_execution": None,
+                "reason": "no_owned_process",
+            },
+            "gpu_memory_observed": False,
+            "device_placement_observed": False,
+            "runtime_telemetry": _runtime_telemetry_cross_reference(runtime_telemetry_ref),
+        }
+    return {
+        "process_rss_bytes": {
+            "launch_ready": rss_bytes_launch_ready,
+            "post_execution": rss_bytes_post_execution,
+            "reason": (
+                "observed" if rss_bytes_launch_ready is not None or rss_bytes_post_execution is not None
+                else "not_observed"
+            ),
+        },
+        "gpu_memory_observed": False,
+        "device_placement_observed": False,
+        "runtime_telemetry": _runtime_telemetry_cross_reference(runtime_telemetry_ref),
+    }
+
+
+def _runtime_telemetry_cross_reference(
+    runtime_telemetry_ref: Optional[Mapping[str, Any]],
+) -> dict:
+    """Cross-reference (never re-collect) the separate, pre-existing
+    ``runtime_telemetry.json`` artifact -- see DEFECT-3B.5-01. That artifact
+    already carries real per-process GPU-memory attribution, but is captured
+    once, before benchmark work, from inside ``runner.run()``: it does not
+    exist at all on a pre-benchmark refusal, and never reflects
+    post-execution state. Both facts are recorded explicitly so a reader
+    cannot mistake a present cross-reference for a post-execution or
+    refusal-time observation."""
+    if runtime_telemetry_ref is None:
+        return {"present": False, "artifact": None, "captured": None}
+    return {
+        "present": True,
+        "artifact": runtime_telemetry_ref.get("artifact"),
+        "status": runtime_telemetry_ref.get("status"),
+        "captured": "pre_benchmark_only",
+    }
 
 
 def _cleanup_evidence(cleanup_result: Optional[Any]) -> dict:
@@ -546,9 +679,31 @@ def _cleanup_evidence(cleanup_result: Optional[Any]) -> dict:
     }
 
 
-def _cuda_visible_devices_from_argv(argv: Optional[Tuple[str, ...]]) -> Optional[str]:
-    # The managed launch passes CUDA_VISIBLE_DEVICES via the child env, not
-    # argv. The 3B.3C outcome does not surface the env overlay; deriving it
-    # here from the resolved UUID order is left to a later slice (residual
-    # debt). Return None rather than a guess.
-    return None
+def _cuda_visible_devices_evidence(
+    env_overlay: Optional[Mapping[str, str]], *, owns_runtime: bool
+) -> dict:
+    """Anvil Stage 3B.5: report the *real* ``CUDA_VISIBLE_DEVICES`` value the
+    managed spawn actually applied (``ManagedMaterialisationOutcome.env_overlay``,
+    plumbed from the real ``cmd.env_overlay`` used at launch) -- never
+    re-derived from the resolved GPU UUID order. Re-deriving would silently
+    fabricate a value on any placement where the spawn adapter legitimately
+    sets no override (e.g. no GPU pinning in the recipe): the real overlay is
+    the only truthful source.
+
+    Three distinct states, each with a machine-readable reason so a missing
+    value is never ambiguous with "not applicable":
+
+    * external/Ollama reuse (``owns_runtime`` false) -- ModelBench never
+      launched anything, so it never set an env overlay for the runtime.
+    * a managed launch that legitimately pinned no GPU (``env_overlay == {}``,
+      e.g. no GPU selected in the recipe).
+    * a managed launch whose overlay carried no ``CUDA_VISIBLE_DEVICES`` key.
+    """
+    if not owns_runtime:
+        return {"value": None, "reason": "reuse_only_no_managed_launch"}
+    if env_overlay is None:
+        return {"value": None, "reason": "no_env_overlay_recorded"}
+    value = env_overlay.get("CUDA_VISIBLE_DEVICES")
+    if value is None:
+        return {"value": None, "reason": "managed_launch_set_no_gpu_pinning"}
+    return {"value": value, "reason": "observed_at_launch"}

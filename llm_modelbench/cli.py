@@ -381,8 +381,48 @@ def _client_for_materialised_endpoint(endpoint: str, cfg: Config, *, backend: st
     )
 
 
+def _observed_rss_bytes(materialisation) -> "int | None":
+    """Anvil Stage 3B.5 -- a bounded, one-shot ``/proc/<pid>/status`` read of
+    the owned managed runtime's resident set, for evidence only. ``None`` for
+    external/Ollama reuse (no owned pid) or if the process cannot be read
+    (already gone, permission denied) -- never raises."""
+    controller = getattr(materialisation, "controller", None)
+    if controller is None or not getattr(controller, "owns_runtime", False):
+        return None
+    outcome = getattr(materialisation, "materialisation", None)
+    result = getattr(outcome, "result", None) if outcome is not None else None
+    owned = getattr(result, "owned_runtime", None) if result is not None else None
+    launch_proof = getattr(owned, "launch_proof", None) if owned is not None else None
+    pid = getattr(launch_proof, "pid", None) if launch_proof is not None else None
+    if pid is None:
+        return None
+    from . import runtime_process_linux as rpl
+
+    return rpl.read_process_rss_bytes(pid)
+
+
+def _runtime_telemetry_ref(out_dir: Path) -> "dict | None":
+    """Anvil Stage 3B.5 -- a plain file-existence + field read of the
+    separate, pre-existing ``runtime_telemetry.json`` artifact that
+    ``runner.run(capture_runtime_telemetry=True)`` already writes (see
+    DEFECT-3B.5-01). Never re-collects telemetry; a read failure or missing
+    file returns ``None`` (the artifact genuinely was not written, e.g. a
+    pre-benchmark refusal never reaches ``runner.run()`` at all)."""
+    path = out_dir / "runtime_telemetry.json"
+    try:
+        if not path.exists():
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    return {"artifact": "runtime_telemetry.json", "status": value.get("status")}
+
+
 def _persist_materialisation_evidence(
-    out_dir: Path, materialisation, *, benchmark_completed: bool, failure_stage: str | None = None
+    out_dir: Path, materialisation, *, benchmark_completed: bool, failure_stage: str | None = None,
+    rss_bytes_launch_ready: "int | None" = None, rss_bytes_post_execution: "int | None" = None,
 ) -> None:
     """Write ``materialisation_evidence.json`` after the lifecycle scope has
     exited. Observes the (structurally-recorded, never-raised) cleanup outcome
@@ -396,7 +436,13 @@ def _persist_materialisation_evidence(
     such a failure is never later mistaken for a model-quality failure. Only
     ``"client_construction"`` additionally arms a cleanup-failure warning today
     (the ``"pre_run_gates"`` cleanup-failure-warning gap is recorded as accepted
-    debt -- see ANVIL_PROGRESS DEFECT-3B.3D-03)."""
+    debt -- see ANVIL_PROGRESS DEFECT-3B.3D-03).
+
+    ``rss_bytes_launch_ready`` / ``rss_bytes_post_execution`` are the caller's
+    own inline ``/proc`` samples (Anvil Stage 3B.5) -- this function does not
+    read ``/proc`` itself; by the time it runs (the outer ``finally``, after
+    the lifecycle ``with`` block has already torn an owned process down) the
+    pid may no longer exist."""
     from .runtime_materialisation import materialisation_evidence
 
     controller = getattr(materialisation, "controller", None)
@@ -404,6 +450,9 @@ def _persist_materialisation_evidence(
     record = materialisation_evidence(
         materialisation, cleanup_result=cleanup_result,
         benchmark_completed=benchmark_completed, failure_stage=failure_stage,
+        rss_bytes_launch_ready=rss_bytes_launch_ready,
+        rss_bytes_post_execution=rss_bytes_post_execution,
+        runtime_telemetry_ref=_runtime_telemetry_ref(out_dir),
     )
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -928,6 +977,14 @@ def cmd_run(args, cfg):
     )
     _benchmark_completed = False
     _failure_stage: str | None = None
+    # Anvil Stage 3B.5 -- inline process RSS observation. Sampled by the CLI
+    # (never by materialisation_evidence() itself -- see that function's
+    # docstring): once the owned runtime is launch-ready, and again
+    # immediately after runner.run() returns/raises, both strictly *inside*
+    # `with _lifecycle:` -- __exit__ tears the owned process down on block
+    # exit, so a read attempted from the outer `finally` would always be None.
+    _rss_launch_ready: int | None = None
+    _rss_post_execution: int | None = None
     try:
         with _lifecycle:
             if materialisation is None:
@@ -940,6 +997,7 @@ def cmd_run(args, cfg):
                 client = _client_for_materialised_endpoint(
                     materialisation.endpoint, cfg, backend=materialisation.backend
                 )
+                _rss_launch_ready = _observed_rss_bytes(materialisation)
                 # Runtime-identity collection reads args._runtime_profile.endpoint;
                 # for a managed (owned) llama-server that endpoint is the
                 # *materialised* one, not the resolver's pre-launch endpoint, so
@@ -1022,6 +1080,13 @@ def cmd_run(args, cfg):
                     print(f"partial report rebuild failed: {exc}")
                     print(f"You can retry with: llm-modelbench report --out {out_dir}")
                 raise SystemExit(130)
+            finally:
+                # Anvil Stage 3B.5: sample post-execution RSS on every exit
+                # from runner.run() (success, ValueError->SystemExit,
+                # KeyboardInterrupt->SystemExit(130)) while still inside
+                # `with _lifecycle:` -- the owned process is still alive here;
+                # it is gone by the time the outer `finally` persists evidence.
+                _rss_post_execution = _observed_rss_bytes(materialisation)
             report.build(out_dir, cfg)
             validity = runner.assess_run_validity(out_dir)
             print(f"\ndone -> {out_dir}  validity={validity['status']}")
@@ -1039,6 +1104,8 @@ def cmd_run(args, cfg):
             _persist_materialisation_evidence(
                 out_dir, materialisation, benchmark_completed=_benchmark_completed,
                 failure_stage=_failure_stage,
+                rss_bytes_launch_ready=_rss_launch_ready,
+                rss_bytes_post_execution=_rss_post_execution,
             )
 
 

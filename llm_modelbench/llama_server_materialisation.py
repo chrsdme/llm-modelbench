@@ -758,6 +758,14 @@ class ManagedMaterialisationOutcome:
     diagnostic_tail: str = ""
     #: The argv actually launched (audit); None if nothing was launched.
     launched_argv: Optional[Tuple[str, ...]] = None
+    #: Anvil Stage 3B.5 -- the real env overlay applied over the parent
+    #: environment at spawn (``cmd.env_overlay``; e.g.
+    #: ``{"CUDA_VISIBLE_DEVICES": "GPU-<uuid>,..."}``), echoed verbatim for
+    #: evidence. Never re-derived downstream from the resolved GPU UUID
+    #: order -- the caller (``runtime_materialisation.materialisation_evidence``)
+    #: must read this field, not guess it. ``None`` only when nothing was
+    #: launched (no ``cmd`` existed yet, e.g. a pre-launch OSError).
+    env_overlay: Optional[Mapping[str, str]] = None
     #: Attribution verdict at readiness time ("ours"/"unestablished"); an
     #: owned+ready runtime never returns "foreign" (that is ENDPOINT_CONFLICT).
     attribution: Optional[str] = None
@@ -1015,6 +1023,7 @@ def spawn_managed_llama_server(
                 detail=f"llama-server launch failed: {type(exc).__name__}: {exc}",
                 diagnostic_tail=sink.tail(),
                 launched_argv=cmd.argv,
+                env_overlay=cmd.env_overlay,
             )
 
         outcome = _verify_and_own(
@@ -1088,12 +1097,14 @@ def _verify_and_own(
                 ),
                 diagnostic_tail=sink.tail(),
                 launched_argv=cmd.argv,
+                env_overlay=cmd.env_overlay,
             )
         return ManagedMaterialisationOutcome(
             status=MaterialisationStatus.PROCESS_EXITED_BEFORE_READY,
             detail=f"llama-server exited (rc={proc.returncode}) before readiness",
             diagnostic_tail=sink.tail(),
             launched_argv=cmd.argv,
+            env_overlay=cmd.env_overlay,
         )
 
     # --- ownership proof BEFORE declaring anything --------------------
@@ -1104,6 +1115,7 @@ def _verify_and_own(
             detail="launched process has no usable PID",
             diagnostic_tail=sink.tail(),
             launched_argv=cmd.argv,
+            env_overlay=cmd.env_overlay,
         )
     if proc.poll() is not None:
         return _exit_reason()
@@ -1114,6 +1126,7 @@ def _verify_and_own(
             detail="could not establish a process-identity proof for the launched pid",
             diagnostic_tail=sink.tail(),
             launched_argv=cmd.argv,
+            env_overlay=cmd.env_overlay,
         )
 
     # --- bounded monotonic readiness poll ----------------------------
@@ -1140,6 +1153,7 @@ def _verify_and_own(
                 detail=f"{endpoint.url} is answered by a non-llama-server; trying next",
                 diagnostic_tail=sink.tail(),
                 launched_argv=cmd.argv,
+                env_overlay=cmd.env_overlay,
             )
         if monotonic() >= deadline or attempts >= max_attempts:
             return ManagedMaterialisationOutcome(
@@ -1150,6 +1164,7 @@ def _verify_and_own(
                 ),
                 diagnostic_tail=sink.tail(),
                 launched_argv=cmd.argv,
+                env_overlay=cmd.env_overlay,
             )
         sleeper(interval)
 
@@ -1167,6 +1182,7 @@ def _verify_and_own(
             ),
             diagnostic_tail=sink.tail(),
             launched_argv=cmd.argv,
+            env_overlay=cmd.env_overlay,
         )
     # "ours" or "unestablished" -> proceed, preserving which it was.
 
@@ -1180,6 +1196,7 @@ def _verify_and_own(
             ),
             diagnostic_tail=sink.tail(),
             launched_argv=cmd.argv,
+            env_overlay=cmd.env_overlay,
         )
 
     result = materialise_owned_runtime(
@@ -1195,6 +1212,7 @@ def _verify_and_own(
         endpoint=endpoint.url,
         diagnostic_tail=sink.tail(),
         launched_argv=cmd.argv,
+        env_overlay=cmd.env_overlay,
         attribution=attribution,
         diagnostic_sink=sink,
     )

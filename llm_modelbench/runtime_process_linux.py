@@ -38,6 +38,7 @@ from .telemetry import parse_proc_stat
 __all__ = [
     "PROC_ROOT",
     "observe_process_identity",
+    "read_process_rss_bytes",
     "terminate_process",
     "TerminateOutcome",
 ]
@@ -125,6 +126,40 @@ def observe_process_identity(
         )
     except ValueError:
         return None
+
+
+def read_process_rss_bytes(pid: int, *, proc_root: Path = PROC_ROOT) -> Optional[int]:
+    """Anvil Stage 3B.5 -- a bounded, one-shot read of ``VmRSS`` from
+    ``/proc/<pid>/status`` for evidence (never a scoring input).
+
+    Same discipline as :func:`observe_process_identity`: bounded read, no
+    signal sent, no mutation, ``None`` on anything unreadable/unparsable
+    (process gone, permission denied, field absent, non-numeric) -- a
+    resident-set read failing is evidence of "not observed", never a reason
+    to fail the caller.
+    """
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    raw = _read_bounded(proc_root / str(pid) / "status", _MAX_PROC_FILE_BYTES)
+    if raw is None:
+        return None
+    try:
+        text = raw.decode("utf-8", "replace")
+    except UnicodeDecodeError:  # pragma: no cover -- decode("replace") never raises
+        return None
+    for line in text.splitlines():
+        if line.startswith("VmRSS:"):
+            parts = line.split()
+            if len(parts) != 3 or parts[2] != "kB":
+                return None
+            try:
+                kib = int(parts[1])
+            except ValueError:
+                return None
+            if kib < 0:
+                return None
+            return kib * 1024
+    return None
 
 
 class TerminateOutcome(str, Enum):
