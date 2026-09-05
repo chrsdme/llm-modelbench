@@ -264,10 +264,19 @@ def _resolve_and_materialise_for_run(args, cfg: Config, *, inventory=None):
     weight_bytes_source = (
         "verified_local_gguf_file_size" if owned_placement else None
     )
+    requested_context = getattr(cfg, "ctx_override", None)
+    kv_cache_bytes = None
+    kv_cache_bytes_source = "not_required_reuse_only"
+    if owned_placement:
+        kv_cache_bytes, kv_cache_bytes_source = _managed_kv_cache_estimate(
+            artifact.resolved_path, requested_context,
+        )
     artifact_snapshot = _artifact_resolution_snapshot(
         artifact, selected_backend, owned_placement=owned_placement,
         weight_bytes=weight_bytes, weight_bytes_source=weight_bytes_source,
-        requested_context=getattr(cfg, "ctx_override", None),
+        requested_context=requested_context,
+        kv_cache_bytes=kv_cache_bytes,
+        kv_cache_bytes_source=kv_cache_bytes_source,
     )
 
     seams = production_seams(
@@ -285,7 +294,8 @@ def _resolve_and_materialise_for_run(args, cfg: Config, *, inventory=None):
         seams=seams,
         weight_bytes=weight_bytes,
         allow_ram_spill=bool(getattr(cfg, "allow_ram_spill", False)),
-        requested_context=getattr(cfg, "ctx_override", None),
+        requested_context=requested_context,
+        kv_cache_bytes=kv_cache_bytes,
         explicit_profile_name=explicit_profile_name,
         backend_executables=backend_executables,
         model_primary_sha256=model_sha,
@@ -318,9 +328,50 @@ def _resolve_managed_llama_artifact(args, cfg: Config, selected_backend):
     )
 
 
+def _managed_kv_cache_estimate(resolved_path: "str | None", requested_context: "int | None") -> "tuple[int | None, str]":
+    """Anvil Stage 3B.4 corrective (third): a pre-spawn KV-cache byte
+    estimate for a managed llama_cpp launch, derived from the resolved
+    local GGUF file's own header -- never from a live backend, never
+    invented when no concrete context is set.
+
+    Returns ``(None, reason)`` for every case the managed resolver must
+    then refuse closed at :attr:`RuntimeResolutionStatus.FIT_UNKNOWN`
+    (Anvil Stage 3B.4 corrective #2): no resolved path, no concrete
+    ``requested_context`` (this function never substitutes a default), an
+    unreadable/malformed/unsupported-architecture GGUF header, or an
+    architecture whose declared inputs :func:`calculate_kv_cache_bytes`
+    itself rejects (e.g. the requested context exceeding the model's own
+    maximum). ``reason`` is always a short machine-stable string, recorded
+    verbatim as ``kv_cache_bytes_source`` evidence regardless of outcome.
+    """
+    if resolved_path is None:
+        return None, "no_resolved_gguf_artifact"
+    if requested_context is None:
+        return None, "no_concrete_requested_context"
+    from .gguf_metadata import resolve_gguf_architecture
+    from .runtime_fit import RuntimeFitModel, calculate_kv_cache_bytes
+
+    gguf_arch = resolve_gguf_architecture(resolved_path)
+    if not gguf_arch.ok:
+        return None, f"gguf_metadata_{gguf_arch.status.value}"
+    model = RuntimeFitModel(
+        name=gguf_arch.architecture_name or "unknown",
+        weight_bytes=None,
+        weight_provenance="not_evaluated_here",
+        requested_context=int(requested_context),
+        model_max_context=gguf_arch.model_max_context,
+        architecture=gguf_arch.architecture,
+    )
+    kv_cache_bytes, kv_reason = calculate_kv_cache_bytes(model)
+    if kv_cache_bytes is None:
+        return None, f"gguf_metadata_resolved_but_{kv_reason}"
+    return kv_cache_bytes, kv_reason
+
+
 def _artifact_resolution_snapshot(
     artifact, selected_backend, *, owned_placement, weight_bytes,
-    weight_bytes_source, requested_context,
+    weight_bytes_source, requested_context, kv_cache_bytes=None,
+    kv_cache_bytes_source="unknown_component_not_a_gate",
 ) -> dict:
     """A JSON-serialisable evidence snapshot of the Stage 3B.3E artifact
     resolution + the Stage 3B.4 workload-estimate decision.
@@ -336,8 +387,8 @@ def _artifact_resolution_snapshot(
         snapshot["workload_estimate_status"] = "supplied"
         snapshot["weight_bytes"] = weight_bytes
         snapshot["weight_bytes_source"] = weight_bytes_source
-        snapshot["kv_cache_bytes"] = None
-        snapshot["kv_cache_bytes_source"] = "unknown_component_not_a_gate"
+        snapshot["kv_cache_bytes"] = kv_cache_bytes
+        snapshot["kv_cache_bytes_source"] = kv_cache_bytes_source
         snapshot["requested_context"] = requested_context
         snapshot["requested_context_source"] = (
             "operator_ctx_override" if requested_context is not None
