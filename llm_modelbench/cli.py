@@ -647,6 +647,45 @@ def _resolve_model_selection(args, client):
     return None
 
 
+def _apply_managed_owned_model_selection(args, client, materialisation) -> None:
+    """For an owned managed llama_cpp run backed by a resolved local GGUF
+    artifact (Stage 3B.3E ``gguf_artifacts``/``gguf_root``), a managed
+    llama-server serves exactly one model and reports its own name/id
+    through ``/v1/models`` -- never the original ``--models`` ref (an HF/
+    Ollama-shaped string) used to pick the artifact file.
+    ``_resolve_model_selection`` -> ``resolve_exact_models`` requires an
+    exact/case-insensitive/fuzzy match against ``client.tags()``, so the
+    original ref is unconditionally rejected as "not an installed model"
+    even though materialisation just proved it resolves to exactly one
+    local artifact and that artifact is now being served.
+
+    This sets ``args._selected_models`` (the same pre-resolution seam used
+    by interactive/campaign selection, read at the top of ``cmd_run``) to
+    the single served name in that one case, so exact-selection semantics
+    are preserved end to end: one configured local artifact, one served
+    model, one selection -- resolved by identity (the artifact this exact
+    run just materialised), not by scanning or fuzzy-matching. Does not
+    touch Ollama or external llama-server reuse: it only fires when
+    ``artifact_resolution.owned_placement`` is true, which is exclusively
+    the managed local-GGUF spawn path."""
+    if getattr(args, "_selected_models", None) is not None:
+        return
+    snapshot = getattr(materialisation, "artifact_resolution", None) or {}
+    if not snapshot.get("owned_placement") or snapshot.get("status") != "resolved":
+        return
+    from .selection import parse_models_spec
+
+    try:
+        requested = parse_models_spec(getattr(args, "models", None))
+    except ValueError:
+        return
+    if not requested or len(requested) != 1 or requested[0] != snapshot.get("model_ref"):
+        return
+    served = [row.get("name") for row in client.tags() if row.get("name")]
+    if len(served) == 1:
+        args._selected_models = served
+
+
 def _confirm_destructive_compute(message: str, *, yes: bool) -> None:
     """Confirm operations that can consume substantial model time.
 
@@ -1070,6 +1109,7 @@ def cmd_run(args, cfg):
                                 _dc_replace(_existing, endpoint=materialisation.endpoint))
                     except TypeError:
                         pass  # not a dataclass profile -- leave as-is
+                _apply_managed_owned_model_selection(args, client, materialisation)
                 _failure_stage = "pre_run_gates"
             rankings_dir = _ranking_dir_for(args, run_id=out_dir.name)
             task_ids = _task_ids(args)
