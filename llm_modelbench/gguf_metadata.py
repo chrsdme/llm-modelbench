@@ -21,14 +21,27 @@ model?
   depth (:data:`_MAX_ARRAY_DEPTH`) -- so a real file's multi-hundred-
   thousand-entry tokenizer vocabulary does not itself exhaust the
   materialisation budget, while a hostile deeply-nested or oversized
-  declared length still cannot force unbounded work.
+  declared length still cannot force unbounded work. This bounds the
+  *work* the parser will do on a forged header; it does not itself prove
+  the file's tensor data actually begins where a forged metadata count or
+  length would place it. A valid GGUF file's metadata declarations do stop
+  before the tensor metadata/data sections by construction, so a
+  well-formed file is read correctly. A hostile file with forged
+  counts/lengths is bounded by the span and materialisation ceilings above
+  and fails closed (never reads into or past a fabricated boundary
+  further than those ceilings allow) -- but that is a bound on resource
+  use and read extent, not a cryptographic proof that any given byte
+  offset is the true tensor boundary.
 * No model loading, no ``llama-server``/``llama.cpp`` invocation, no
   subprocess, no network.
 * Every failure -- wrong magic, unsupported version, a declared length
-  that exceeds the remaining file size or a hard ceiling, nesting past the
-  depth ceiling, invalid UTF-8 in a decoded string, a missing or ambiguous
+  that exceeds the remaining file size (:attr:`GGUFMetadataStatus.TRUNCATED_OR_MALFORMED`),
+  a declared count/length/nesting depth that exceeds a hard policy ceiling
+  on a file that is otherwise complete (:attr:`GGUFMetadataStatus.HEADER_TOO_LARGE`),
+  invalid UTF-8 in a decoded string, a missing or ambiguous
   architecture-prefixed key, an unsupported architecture, a
-  non-finite/non-positive derived value -- is a structured, fail-closed
+  non-finite/non-positive derived value, or an I/O failure on any read/seek
+  after the file was opened -- is a structured, fail-closed
   :class:`GGUFArchitectureResolution`, never an exception and never a
   best-effort guess.
 * Key lookup is **exact** (``f"{architecture}.block_count"`` etc.), never
@@ -118,7 +131,9 @@ _MAX_ELEMENT_LEN = 1 * 1024 * 1024
 #: Hard ceiling on GGUF array nesting depth (array-of-array-of-...). GGUF
 #: metadata arrays are conventionally flat (array of scalars/strings); this
 #: refuses a crafted deeply-nested array before Python's own recursion
-#: limit could be hit.
+#: limit could be hit. Enforced exactly: nesting to depth
+#: ``_MAX_ARRAY_DEPTH`` (i.e. ``_MAX_ARRAY_DEPTH`` levels of ``_T_ARRAY``
+#: wrapping a scalar/string) is accepted; one level deeper is refused.
 _MAX_ARRAY_DEPTH = 8
 
 # GGUF metadata value type tags (ggml_type / gguf value type enum).
@@ -154,14 +169,19 @@ class GGUFMetadataStatus(str, Enum):
     NOT_A_GGUF_FILE = "not_a_gguf_file"
     #: The declared GGUF version is not one this reader decodes.
     UNSUPPORTED_VERSION = "unsupported_version"
-    #: The header ends, or a declared length exceeds the remaining file
-    #: size / the hard ceiling, before the metadata KV section could be
-    #: fully read.
+    #: The header ends, or a declared length exceeds the file's actual
+    #: remaining size, before the metadata KV section could be fully read.
+    #: This is real truncation/malformation, distinct from a complete file
+    #: whose declared sizes merely exceed this module's own policy
+    #: ceilings (see :attr:`HEADER_TOO_LARGE`).
     TRUNCATED_OR_MALFORMED = "truncated_or_malformed"
-    #: A declared metadata_kv_count or a string/array length exceeds this
-    #: module's hard safety ceiling.
+    #: A declared metadata_kv_count, string/array/element length, or array
+    #: nesting depth exceeds this module's hard safety ceiling, on a file
+    #: that is otherwise complete (not truncated). Distinguishes "this
+    #: parser refuses to do that much work" from actual EOF/truncation.
     HEADER_TOO_LARGE = "header_too_large"
-    #: The file could not be opened / read at the filesystem level.
+    #: The file could not be opened, or a read/seek failed at the
+    #: filesystem/OS level after opening (e.g. an I/O error mid-header).
     UNREADABLE = "unreadable"
     #: No ``general.architecture`` string key was present.
     ARCHITECTURE_UNKNOWN = "architecture_unknown"
@@ -214,11 +234,17 @@ class GGUFArchitectureResolution:
 
 
 class _Truncated(Exception):
-    """Internal: any bounded read/seek ran past EOF or the span ceiling."""
+    """Internal: any bounded read/seek ran past EOF, or a declared length
+    exceeds the file's actual remaining size."""
 
 
 class _HeaderTooLarge(Exception):
-    """Internal: a declared count/nesting depth exceeded a hard ceiling."""
+    """Internal: a declared count/length/nesting depth exceeded a hard
+    policy ceiling on an otherwise-complete file."""
+
+
+class _Unreadable(Exception):
+    """Internal: a read/seek on the open file handle raised OSError."""
 
 
 class _Reader:
@@ -241,17 +267,22 @@ class _Reader:
         self._span = 0
 
     def _advance_span(self, n: int) -> None:
-        if n < 0 or self._span + n > _MAX_SPAN_BYTES:
-            raise _Truncated("header span exceeded the safety ceiling")
+        if n < 0:
+            raise _Truncated("a declared length was negative")
         if self._pos + n > self._file_size:
             raise _Truncated("declared length exceeds the file's actual size")
+        if self._span + n > _MAX_SPAN_BYTES:
+            raise _HeaderTooLarge("header span exceeded the safety ceiling")
         self._span += n
 
     def read(self, n: int) -> bytes:
         if self._materialised + n > _MAX_MATERIALISED_BYTES:
-            raise _Truncated("materialised header bytes exceeded the safety ceiling")
+            raise _HeaderTooLarge("materialised header bytes exceeded the safety ceiling")
         self._advance_span(n)
-        data = self._handle.read(n)
+        try:
+            data = self._handle.read(n)
+        except OSError as exc:
+            raise _Unreadable(f"read failed: {type(exc).__name__}: {exc}") from exc
         if len(data) != n:
             raise _Truncated("file ended before the declared length was satisfied")
         self._pos += n
@@ -261,7 +292,10 @@ class _Reader:
     def skip(self, n: int) -> None:
         """Advance past ``n`` bytes without materialising them."""
         self._advance_span(n)
-        self._handle.seek(n, 1)
+        try:
+            self._handle.seek(n, 1)
+        except OSError as exc:
+            raise _Unreadable(f"seek failed: {type(exc).__name__}: {exc}") from exc
         self._pos += n
 
     def u32(self) -> int:
@@ -273,7 +307,7 @@ class _Reader:
     def gguf_string(self) -> str:
         length = self.u64()
         if length > _MAX_ELEMENT_LEN:
-            raise _Truncated("a GGUF string length exceeded the safety ceiling")
+            raise _HeaderTooLarge("a GGUF string length exceeded the safety ceiling")
         try:
             return self.read(length).decode("utf-8", errors="strict")
         except UnicodeDecodeError as exc:
@@ -282,7 +316,7 @@ class _Reader:
     def skip_string(self) -> None:
         length = self.u64()
         if length > _MAX_ELEMENT_LEN:
-            raise _Truncated("a GGUF string length exceeded the safety ceiling")
+            raise _HeaderTooLarge("a GGUF string length exceeded the safety ceiling")
         self.skip(length)
 
     def scalar(self, value_type: int):
@@ -297,7 +331,7 @@ class _Reader:
         materialising its content -- used for array/string payloads not
         needed for the KV estimate. Bounded array nesting depth guards
         against a crafted array-of-array-of-... value."""
-        if depth > _MAX_ARRAY_DEPTH:
+        if depth >= _MAX_ARRAY_DEPTH:
             raise _HeaderTooLarge("GGUF array nesting exceeded the safety ceiling")
         if value_type == _T_STRING:
             self.skip_string()
@@ -306,7 +340,7 @@ class _Reader:
             elem_type = self.u32()
             count = self.u64()
             if count > _MAX_ELEMENT_LEN:
-                raise _Truncated("a GGUF array length exceeded the safety ceiling")
+                raise _HeaderTooLarge("a GGUF array length exceeded the safety ceiling")
             fmt = _SCALAR_STRUCT.get(elem_type)
             if fmt is not None:
                 _, size = fmt
@@ -407,8 +441,16 @@ def resolve_gguf_architecture(path: str) -> GGUFArchitectureResolution:
                 status=GGUFMetadataStatus.HEADER_TOO_LARGE,
                 detail=f"{path!r} exceeded a GGUF header safety ceiling: {exc}",
             )
+        except _Unreadable as exc:
+            return GGUFArchitectureResolution(
+                status=GGUFMetadataStatus.UNREADABLE,
+                detail=f"{path!r} became unreadable while parsing GGUF metadata: {exc}",
+            )
     finally:
-        handle.close()
+        try:
+            handle.close()
+        except OSError:
+            pass
 
     arch_name = metadata.get("general.architecture")
     if not isinstance(arch_name, str) or not arch_name.strip():

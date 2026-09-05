@@ -191,10 +191,21 @@ def test_truncated_file_fails_closed_not_crash(tmp_path):
     assert res.status is GGUFMetadataStatus.TRUNCATED_OR_MALFORMED
 
 
-def test_declared_string_length_exceeding_file_size_fails_closed(tmp_path):
-    # A key claims a huge length the file cannot actually hold.
+def test_declared_key_length_over_element_ceiling_is_header_too_large(tmp_path):
+    # A key claims a length over _MAX_ELEMENT_LEN -- a policy ceiling, not
+    # truncation, even though the file also happens to be tiny.
     bogus_key_len = struct.pack("<Q", 10_000_000)
     body = bogus_key_len + b"x" * 8  # nowhere near 10,000,000 bytes
+    header = b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0) + struct.pack("<Q", 1)
+    res = resolve_gguf_architecture(_write(tmp_path, header + body))
+    assert res.status is GGUFMetadataStatus.HEADER_TOO_LARGE
+
+
+def test_declared_key_length_exceeding_file_size_under_ceiling_is_truncated(tmp_path):
+    # A key claims a length under _MAX_ELEMENT_LEN but still bigger than
+    # the file actually holds -- real truncation, not a policy ceiling.
+    bogus_key_len = struct.pack("<Q", 5000)
+    body = bogus_key_len + b"x" * 8
     header = b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0) + struct.pack("<Q", 1)
     res = resolve_gguf_architecture(_write(tmp_path, header + body))
     assert res.status is GGUFMetadataStatus.TRUNCATED_OR_MALFORMED
@@ -302,6 +313,138 @@ def test_shallow_nested_array_under_ceiling_still_resolves(tmp_path):
     data = _gguf_bytes(pairs)
     res = resolve_gguf_architecture(_write(tmp_path, data))
     assert res.ok
+
+
+def test_array_depth_at_advertised_max_is_accepted(tmp_path):
+    """Exactly _MAX_ARRAY_DEPTH levels of nesting is the documented boundary
+    and must be accepted, not refused."""
+    import llm_modelbench.gguf_metadata as gguf_metadata
+
+    pairs = [_kv_string("general.architecture", "llama"),
+             _nested_array_bytes(depth=gguf_metadata._MAX_ARRAY_DEPTH)]
+    data = _gguf_bytes(pairs)
+    res = resolve_gguf_architecture(_write(tmp_path, data))
+    assert res.status is not GGUFMetadataStatus.HEADER_TOO_LARGE
+
+
+def test_array_depth_one_past_advertised_max_is_rejected(tmp_path):
+    """One level deeper than _MAX_ARRAY_DEPTH must be rejected -- the
+    off-by-one regression this test guards against previously let this
+    through."""
+    import llm_modelbench.gguf_metadata as gguf_metadata
+
+    pairs = [_kv_string("general.architecture", "llama"),
+             _nested_array_bytes(depth=gguf_metadata._MAX_ARRAY_DEPTH + 1)]
+    data = _gguf_bytes(pairs)
+    res = resolve_gguf_architecture(_write(tmp_path, data))
+    assert res.status is GGUFMetadataStatus.HEADER_TOO_LARGE
+
+
+# --------------------------------------------------------------------------
+# E. I/O failures mid-parse must not leak as raw exceptions
+# --------------------------------------------------------------------------
+def test_injected_read_failure_returns_structured_unreadable(tmp_path, monkeypatch):
+    """An OSError raised from the underlying handle's read() mid-header must
+    surface as a structured UNREADABLE result, never escape as OSError."""
+    data = _gguf_bytes(_llama_kv_pairs(kv_heads=8, key_length=128, value_length=128))
+    path = _write(tmp_path, data)
+
+    import llm_modelbench.gguf_metadata as gguf_metadata
+
+    real_open = gguf_metadata.Path.open
+
+    class _FailingHandle:
+        def __init__(self, handle):
+            self._handle = handle
+            self._reads = 0
+
+        def read(self, n):
+            self._reads += 1
+            if self._reads > 1:
+                raise OSError("simulated I/O failure")
+            return self._handle.read(n)
+
+        def seek(self, *args):
+            return self._handle.seek(*args)
+
+        def close(self):
+            self._handle.close()
+
+    def _failing_open(self, mode="r"):
+        return _FailingHandle(real_open(self, mode))
+
+    monkeypatch.setattr(gguf_metadata.Path, "open", _failing_open)
+    res = resolve_gguf_architecture(path)
+    assert res.status is GGUFMetadataStatus.UNREADABLE
+    assert not res.ok
+
+
+def test_injected_seek_failure_returns_structured_unreadable(tmp_path, monkeypatch):
+    """An OSError raised from the underlying handle's seek() (used to skip
+    an array/string payload) must surface as a structured UNREADABLE
+    result, never escape as OSError."""
+    arch_pairs = _llama_kv_pairs(kv_heads=8, key_length=128, value_length=128)
+    vocab = _kv_array_string("tokenizer.ggml.tokens", ["a", "b", "c"])
+    data = _gguf_bytes(arch_pairs + [vocab])
+    path = _write(tmp_path, data)
+
+    import llm_modelbench.gguf_metadata as gguf_metadata
+
+    real_open = gguf_metadata.Path.open
+
+    class _FailingSeekHandle:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def read(self, n):
+            return self._handle.read(n)
+
+        def seek(self, *args):
+            raise OSError("simulated seek failure")
+
+        def close(self):
+            self._handle.close()
+
+    def _failing_open(self, mode="r"):
+        return _FailingSeekHandle(real_open(self, mode))
+
+    monkeypatch.setattr(gguf_metadata.Path, "open", _failing_open)
+    res = resolve_gguf_architecture(path)
+    assert res.status is GGUFMetadataStatus.UNREADABLE
+    assert not res.ok
+
+
+# --------------------------------------------------------------------------
+# F. policy ceilings on an otherwise-complete file must not read as truncation
+# --------------------------------------------------------------------------
+def test_complete_file_over_span_ceiling_is_header_too_large_not_truncated(tmp_path, monkeypatch):
+    """A complete (non-truncated) file whose skip payload exceeds a patched
+    (small) _MAX_SPAN_BYTES must report HEADER_TOO_LARGE, not
+    TRUNCATED_OR_MALFORMED."""
+    import llm_modelbench.gguf_metadata as gguf_metadata
+
+    arch_pairs = _llama_kv_pairs(kv_heads=8, key_length=128, value_length=128)
+    vocab = _kv_array_string("tokenizer.ggml.tokens", [f"tok{i}" for i in range(500)])
+    data = _gguf_bytes(arch_pairs + [vocab])
+    path = _write(tmp_path, data)
+
+    monkeypatch.setattr(gguf_metadata, "_MAX_SPAN_BYTES", 256)
+    res = resolve_gguf_architecture(path)
+    assert res.status is GGUFMetadataStatus.HEADER_TOO_LARGE
+
+
+def test_complete_file_over_materialisation_ceiling_is_header_too_large_not_truncated(tmp_path, monkeypatch):
+    """A complete (non-truncated) file whose materialised bytes exceed a
+    patched (small) _MAX_MATERIALISED_BYTES must report HEADER_TOO_LARGE,
+    not TRUNCATED_OR_MALFORMED."""
+    import llm_modelbench.gguf_metadata as gguf_metadata
+
+    data = _gguf_bytes(_llama_kv_pairs(kv_heads=8, key_length=128, value_length=128))
+    path = _write(tmp_path, data)
+
+    monkeypatch.setattr(gguf_metadata, "_MAX_MATERIALISED_BYTES", 8)
+    res = resolve_gguf_architecture(path)
+    assert res.status is GGUFMetadataStatus.HEADER_TOO_LARGE
 
 
 def test_large_vocab_shaped_arrays_after_architecture_keys_still_resolve(tmp_path):
